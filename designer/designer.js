@@ -1,14 +1,99 @@
 /*!
  * FlowChat Designer: visual editor for FlowChat flow definitions.
  * No dependencies. Produces the same JSON the engines run (plus "ui" positions, which engines ignore).
+ *
+ * Mounts into <div id="fcd-root"></div>. Load order: flowchat-engine.js, flowchat.js, designer.js.
  */
 (function () {
   'use strict';
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+
+  function boot() {
 
   // ======================================================================== constants
   const NODE_W = 230;
   const STORE_KEY = 'flowchat-designer:v1';
-  const SAMPLE_URL = '../flows/loan_application.json';
+
+  // The designer mounts into <div id="fcd-root" class="fcd"></div> (standalone page or APEX region).
+  const ROOT = document.getElementById('fcd-root');
+  if (!ROOT) { console.error('[FlowChat Designer] No element with id "fcd-root" found.'); return; }
+  const SAMPLE_URL = ROOT.dataset.sampleUrl || '../flows/loan_application.json';
+  const STANDALONE = document.body.classList.contains('fcd-page');
+
+  // Every <button> is type="button": inside APEX the page is one big <form>, and a default
+  // (type="submit") button would submit and reload the page.
+  const TEMPLATE = `
+  <header class="bar">
+    <span class="brand">FlowChat Designer</span>
+    <span class="flow-title" id="fcd-flowTitle"></span>
+    <button type="button" class="tb" id="fcd-btnNew" title="Start an empty flow">New</button>
+    <button type="button" class="tb" id="fcd-btnOpen" title="Open a flow .json file">Open…</button>
+    <button type="button" class="tb" id="fcd-btnSample" title="Load the loan application sample">Sample</button>
+    <span class="sep"></span>
+    <button type="button" class="tb" id="fcd-btnUndo" title="Undo (Ctrl+Z)">Undo</button>
+    <button type="button" class="tb" id="fcd-btnRedo" title="Redo (Ctrl+Y)">Redo</button>
+    <button type="button" class="tb" id="fcd-btnLayout" title="Arrange nodes top to bottom">Auto-layout</button>
+    <span class="sep"></span>
+    <button type="button" class="tb" id="fcd-btnExport" title="Download the flow definition">Export JSON</button>
+    <button type="button" class="tb primary" id="fcd-btnPublish" title="Download a SQL script that publishes this flow to Oracle">Publish SQL</button>
+    <input type="file" id="fcd-fileInput" accept=".json,application/json" hidden>
+  </header>
+  <div class="main">
+    <aside class="palette" id="fcd-palette"><h3>Add a step</h3></aside>
+    <section class="canvas" id="fcd-canvas" aria-label="Flow canvas">
+      <div class="world" id="fcd-world">
+        <svg class="edges" aria-hidden="true">
+          <defs>
+            <marker id="fcd-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" style="fill: var(--edge)"></path>
+            </marker>
+            <marker id="fcd-arrSel" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" style="fill: var(--accent)"></path>
+            </marker>
+          </defs>
+          <g id="fcd-edgeLayer"></g>
+        </svg>
+        <div id="fcd-nodes"></div>
+      </div>
+      <div class="zoom">
+        <button type="button" id="fcd-zoomOut" title="Zoom out">−</button>
+        <span id="fcd-zoomLabel">100%</span>
+        <button type="button" id="fcd-zoomIn" title="Zoom in">+</button>
+        <button type="button" id="fcd-zoomFit" title="Fit to screen">⤢</button>
+      </div>
+    </section>
+    <aside class="panel">
+      <nav class="tabs" role="tablist">
+        <button type="button" data-tab="props" class="active" role="tab">Properties</button>
+        <button type="button" data-tab="check" role="tab">Checklist <span class="badge" id="fcd-probBadge">0</span></button>
+        <button type="button" data-tab="test" role="tab">Test</button>
+        <button type="button" data-tab="json" role="tab">JSON</button>
+      </nav>
+      <div class="tab-body" id="fcd-tab-props"></div>
+      <div class="tab-body" id="fcd-tab-check" hidden></div>
+      <div class="tab-body" id="fcd-tab-test" hidden>
+        <div class="test-bar">
+          <button type="button" class="btn primary" id="fcd-btnRunTest">Restart test</button>
+          <span class="test-note" id="fcd-testNote">Runs the current draft in your browser. Connectors return the mock responses below.</span>
+        </div>
+        <flow-chat class="sim" id="fcd-simChat" manual-start adapter="none" heading="Test run" subheading="Simulating the current draft"></flow-chat>
+        <h4 class="sub">Captured answers</h4>
+        <pre class="state" id="fcd-simState">{}</pre>
+        <h4 class="sub">Connector mocks</h4>
+        <div id="fcd-mocks"></div>
+      </div>
+      <div class="tab-body" id="fcd-tab-json" hidden>
+        <p class="pdesc">This is the definition the engine runs. You can edit it directly; click Apply to load your changes.</p>
+        <textarea class="in mono" id="fcd-jsonText" spellcheck="false" style="min-height: 60vh; font-size: 12px;"></textarea>
+        <div class="actions">
+          <button type="button" class="btn primary" id="fcd-btnApplyJson">Apply</button>
+          <button type="button" class="btn" id="fcd-btnCopyJson">Copy</button>
+        </div>
+      </div>
+    </aside>
+  </div>
+  <div class="toast" id="fcd-toast" role="status" aria-live="polite"></div>`;
   const KINDS = [['text', 'Text'], ['email', 'Email'], ['number', 'Number'], ['date', 'Date'], ['choice', 'Choice (buttons)'], ['yesno', 'Yes / No']];
   const OPS = [['=', 'equals'], ['!=', 'not equal'], ['>', '>'], ['>=', '≥'], ['<', '<'], ['<=', '≤'], ['in', 'is one of'], ['empty', 'is empty'], ['notEmpty', 'is filled']];
 
@@ -41,9 +126,12 @@
   };
 
   // ======================================================================== dom helpers
-  const $ = (id) => document.getElementById(id);
+  // All designer element ids are prefixed "fcd-" so they can't collide with the host page (e.g. APEX).
+  const $ = (id) => document.getElementById('fcd-' + id);
   function h(tag, attrs) {
     const e = document.createElement(tag);
+    // Inside APEX the whole page is a <form>; a button without type="button" would submit (reload) it.
+    if (tag === 'button') e.type = 'button';
     if (attrs) {
       for (const k in attrs) {
         const v = attrs[k];
@@ -519,7 +607,7 @@
     const mk = (d, cls, marker) => {
       const p = document.createElementNS(ns, 'path');
       p.setAttribute('d', d); p.setAttribute('class', cls);
-      if (marker) p.setAttribute('marker-end', 'url(#' + marker + ')');
+      if (marker) p.setAttribute('marker-end', 'url(#fcd-' + marker + ')');
       return p;
     };
     S.flow.nodes.forEach((n) => {
@@ -961,9 +1049,9 @@
   }
 
   function connectorInput(get, set, key) {
-    const listId = 'connlist';
+    const listId = 'fcd-connlist';
     let dl = document.getElementById(listId);
-    if (!dl) { dl = h('datalist', { id: listId }); document.body.append(dl); }
+    if (!dl) { dl = h('datalist', { id: listId }); ROOT.append(dl); }
     dl.textContent = '';
     Object.keys(connectorUses()).forEach((c) => dl.append(h('option', { value: c })));
     const el = bound(get, set, { mono: true, key, placeholder: 'connector_id' });
@@ -1237,7 +1325,7 @@
   // ======================================================================== tabs / misc
   function setTab(tab) {
     S.tab = tab;
-    document.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+    ROOT.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
     ['props', 'check', 'test', 'json'].forEach((t) => { $('tab-' + t).hidden = t !== tab; });
     if (tab === 'check') renderCheck();
     if (tab === 'json') renderJson();
@@ -1246,7 +1334,7 @@
 
   function renderTitle() {
     $('flowTitle').textContent = (S.flow.name || 'Untitled flow') + '  ·  ' + (S.flow.flowId || '?');
-    document.title = (S.flow.name || 'Flow') + ' · FlowChat Designer';
+    if (STANDALONE) document.title = (S.flow.name || 'Flow') + ' · FlowChat Designer';
   }
 
   function renderAll() {
@@ -1306,7 +1394,7 @@
         toast('Run the downloaded script in SQLcl / SQL Workshop to publish');
       } catch (e) { toast(e.message); }
     };
-    document.querySelectorAll('.tabs button').forEach((b) => { b.onclick = () => setTab(b.dataset.tab); });
+    ROOT.querySelectorAll('.tabs button').forEach((b) => { b.onclick = () => setTab(b.dataset.tab); });
     $('btnRunTest').onclick = runTest;
     $('simChat').addEventListener('fc-turn', () => {
       const st = testEngine && testEngine.getState($('simChat').sessionId);
@@ -1320,8 +1408,22 @@
       navigator.clipboard.writeText($('jsonText').value).then(() => toast('Copied'), () => toast('Copy failed; select and copy manually'));
     };
 
+    // Enter in a text box would trigger the host form's implicit submit (an APEX page reload).
+    // Swallow it and commit the field instead.
+    ROOT.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' || e.isComposing) return;
+      const t = e.target;
+      if (t.tagName === 'INPUT' && t.type !== 'button' && t.type !== 'submit') {
+        e.preventDefault();
+        e.stopPropagation();
+        t.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    });
+
+    // Shortcuts apply only while focus is in the designer (or nowhere), never in other APEX regions.
     document.addEventListener('keydown', (e) => {
       const a = document.activeElement;
+      if (a && a !== document.body && !ROOT.contains(a)) return;
       const typing = a && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) || a.isContentEditable || a.shadowRoot);
       const mod = e.ctrlKey || e.metaKey;
       if (typing) return;
@@ -1352,6 +1454,8 @@
   }
 
   async function init() {
+    ROOT.classList.add('fcd');
+    ROOT.innerHTML = TEMPLATE;
     canvas = $('canvas'); world = $('world'); nodesEl = $('nodes'); edgeLayer = $('edgeLayer');
     buildPalette();
     bindCanvas();
@@ -1376,4 +1480,5 @@
   // Small debugging / automation handle.
   window.FlowChatDesigner = { get state() { return S; }, analyze, publishSql, select: (id) => select(id ? { kind: 'node', id } : null) };
   init();
+  } // boot
 })();

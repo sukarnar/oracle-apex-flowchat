@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>APEX Embed Test</title>
+<!--
+  Reproduces how APEX hosts the designer: the entire page is one <form> (like wwvFlowForm),
+  and the host has broad global styles. If any designer control submits the form, the URL
+  gains ?submitted=... and the banner turns red.
+-->
+<link rel="stylesheet" href="../designer/designer.css">
+<style>
+  body { margin: 0; font-family: Georgia, serif; background: #e9ecef; }
+  /* hostile host styles, similar in spirit to a theme's globals */
+  button { background: hotpink; text-transform: uppercase; letter-spacing: 3px; padding: 14px; }
+  input, select, textarea { border: 3px solid orange; height: 60px; }
+  * { box-sizing: content-box; }
+  .t-Header { background: #1f3a5f; color: #fff; padding: 12px 20px; font: 600 16px system-ui; }
+  .t-Region { margin: 16px; background: #fff; border: 1px solid #ccc; }
+  .t-Region-header { padding: 10px 14px; border-bottom: 1px solid #ccc; font: 600 14px system-ui; }
+  #status { padding: 8px 14px; font: 13px system-ui; }
+  #status.bad { background: #fdecea; color: #b42318; } #status.ok { background: #e7f6ee; color: #067647; }
+</style>
+</head>
+<body>
+<form id="wwvFlowForm" action="" method="get" novalidate>
+  <input type="hidden" name="submitted" value="yes">
+  <div class="t-Header">Fake APEX app</div>
+  <div id="status"></div>
+  <div class="t-Region">
+    <div class="t-Region-header">Flow designer region (Static Content)</div>
+    <div id="fcd-root" data-sample-url="../flows/loan_application.json" style="--fcd-height: 700px"></div>
+  </div>
+</form>
+<script>
+  const s = document.getElementById('status');
+  const submitted = new URLSearchParams(location.search).has('submitted');
+  s.className = submitted ? 'bad' : 'ok';
+  s.textContent = submitted ? 'FAIL: the page form was submitted (page reloaded).' : 'OK: no page submit so far.';
+</script>
+<script src="../widget/flowchat-engine.js"></script>
+<script src="../widget/flowchat.js"></script>
+<script src="../designer/designer.js"></script>
+</body>
+</html>

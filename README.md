@@ -51,6 +51,32 @@ With the same server running, open <http://localhost:8765/designer/>.
 
 Node positions are stored as `ui: {x, y}` on each node. Both engines ignore them.
 
+### Hosting the designer on an APEX page
+
+1. **Static Application Files:** upload `widget/flowchat-engine.js`, `widget/flowchat.js`,
+   `designer/designer.js` and `designer/designer.css`. Optionally upload `flows/loan_application.json` too.
+2. **Page > CSS > File URLs:** `#APP_FILES#designer.css`
+3. **Page > JavaScript > File URLs**, in this order:
+   ```
+   #APP_FILES#flowchat-engine.js
+   #APP_FILES#flowchat.js
+   #APP_FILES#designer.js
+   ```
+4. **A Static Content region** (template *Blank with Attributes* works best) whose source is just:
+   ```html
+   <div id="fcd-root" data-sample-url="#APP_FILES#loan_application.json"
+        style="--fcd-height: calc(100vh - 140px)"></div>
+   ```
+   The script draws the whole designer into that div. Don't paste the markup from
+   `designer/index.html`. Add `data-theme="light"` or `"dark"` to fix the colour scheme.
+
+How the designer stays out of APEX's way:
+- **No page submits:** APEX wraps the page in one `<form>`, so every designer button is
+  `type="button"`, and Enter inside designer fields commits the field instead of submitting the page.
+- **No style leaks:** all styles are scoped under `.fcd`, and all element ids start with `fcd-`.
+- **Shortcuts stay local:** keyboard shortcuts (Delete, Ctrl+Z) only act while focus is inside the designer.
+- **Test page:** `tests/apex-embed-test.html` reproduces these conditions with a page-wide form and aggressive host styles.
+
 ## 2. Install in Oracle
 
 Requirements: Oracle DB 19c+ (including Autonomous), APEX 20.2+, and execute on `DBMS_CRYPTO` for the session ids:
