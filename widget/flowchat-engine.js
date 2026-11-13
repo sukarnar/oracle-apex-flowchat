@@ -20,6 +20,14 @@
  *
  * Verify step (one-time code): the engine generates the code, keeps only a salted SHA-256 hash,
  * and calls the node's connector with {channel, to, code, ttlMinutes} to deliver it.
+ *
+ * Lookup lists (choice answers whose options come from the server): an input spec with
+ *   "optionsFrom": "<list id>", "optionsParams": { "<param>": "<slot or alias.field>" }
+ * takes its options from options.lovs = { id: fn(req) }, where
+ *   req = { lov, params: {param: value}, context, verified, sessionId, flowId }
+ *   fn returns (or resolves to) [{value, label}]   (at most 500 are used)
+ * Lists are fetched again on every turn (never cached across turns), so they are always current.
+ * A list whose parameters aren't all answered yet has no options.
  */
 (function (global) {
   'use strict';
@@ -27,6 +35,7 @@
   var MAX_STEPS = 200;
   var REQUIRED_MSG = 'This one is required. Please provide a value.';
   var AWAIT = { await: true };   // sentinel: a node stopped to wait for user input
+  var MAX_OPTIONS = 500;
 
   function pad(n) { return String(n).padStart(2, '0'); }
   function isoDate(d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); }
@@ -253,11 +262,13 @@
     var compiled = {};
     var connectors = Object.assign({}, options.connectors);
     var dataSources = Object.assign({}, options.dataSources);
+    var lovs = Object.assign({}, options.lovs);
     var sessions = new Map();
 
     function registerFlow(def) { flows[def.flowId] = clone(def); delete compiled[def.flowId]; }
     function registerConnector(name, fn) { connectors[name] = fn; }
     function registerDataSource(name, src) { dataSources[name] = src; }
+    function registerLov(name, fn) { lovs[name] = fn; }
     (options.flows || []).forEach(registerFlow);
 
     function compile(flowId) {
@@ -279,7 +290,58 @@
       st.records = st.records || {};
       st.results = st.results || {};
       return { sid: sid, st: st, flow: c.flow, nodes: c.nodes, slotNodes: c.slotNodes, changeNodes: c.changeNodes,
-               findNodes: c.findNodes, out: [], updates: [], replay: false, forceAsk: null };
+               findNodes: c.findNodes, out: [], updates: [], replay: false, forceAsk: null, lovCache: {} };
+    }
+
+    // ---- lookup lists
+    function lovParams(ctx, spec) {
+      var map = spec.optionsParams || {}, v = view(ctx), out = {}, ok = true;
+      Object.keys(map).forEach(function (k) {
+        var val = v[map[k]];
+        if (!isFilled(val)) ok = false;
+        out[k] = isFilled(val) ? val : null;
+      });
+      return ok ? out : null;
+    }
+    function lovKey(spec, params) { return spec.optionsFrom + '|' + JSON.stringify(params); }
+    async function loadLov(ctx, spec) {
+      var params = lovParams(ctx, spec);
+      if (!params) return;
+      var key = lovKey(spec, params);
+      if (ctx.lovCache[key]) return;
+      var fn = lovs[spec.optionsFrom];
+      if (!fn) throw new Error('Unknown lookup list "' + spec.optionsFrom + '"');
+      var res = await Promise.resolve(fn({ lov: spec.optionsFrom, params: params, context: clone(ctx.st.context),
+                                           verified: verifiedValue(ctx), sessionId: ctx.sid, flowId: ctx.flow.flowId }));
+      var list = Array.isArray(res) ? res : (res && res.options) || [];
+      ctx.lovCache[key] = list.slice(0, MAX_OPTIONS).filter(function (o) { return o && isFilled(o.value); })
+        .map(function (o) { return { value: String(o.value), label: isFilled(o.label) ? String(o.label) : String(o.value) }; });
+    }
+    // Fetch every lookup list this turn may show or check (once per list and parameters).
+    async function ensureOptions(ctx) {
+      var nodes = ctx.flow.nodes;
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (n.type === 'ask' && n.input && n.input.optionsFrom) await loadLov(ctx, n.input);
+        if (n.type === 'changeFields' && ctx.st.records[n.record]) {
+          for (var j = 0; j < (n.fields || []).length; j++) {
+            var f = n.fields[j];
+            if (f.input && f.input.optionsFrom) await loadLov(ctx, f.input);
+          }
+        }
+      }
+    }
+    async function stillOffered(ctx, node) {
+      await ensureOptions(ctx);
+      var v = String(ctx.st.slots[node.slot]);
+      return eff(ctx, node.input).options.some(function (o) { return o.value === v; });
+    }
+    // The spec as the user sees it: a lookup list's options filled in (none until its parameters are answered).
+    function eff(ctx, spec) {
+      if (!spec || !spec.optionsFrom) return spec;
+      var out = clone(spec), params = lovParams(ctx, spec);
+      out.options = (params && ctx.lovCache[lovKey(spec, params)]) || [];
+      return out;
     }
 
     function say(ctx, type, text) { if (text) ctx.out.push({ type: type, text: text }); }
@@ -334,10 +396,10 @@
       if (dot > 0) {
         var cn = ctx.changeNodes[name.slice(0, dot)];
         var f = cn && fieldDef(cn, name.slice(dot + 1));
-        return f ? f.input : null;
+        return f ? eff(ctx, f.input) : null;
       }
       var n = ctx.slotNodes[name];
-      return n ? n.input : null;
+      return n ? eff(ctx, n.input) : null;
     }
     function displayValue(ctx, name) { return displayFor(specFor(ctx, name), view(ctx)[name]); }
 
@@ -358,9 +420,14 @@
     }
 
     async function validate(ctx, node, value) {
-      var spec = node.input || {};
+      var spec = eff(ctx, node.input) || {};
       if (!isFilled(value)) return spec.required === false ? null : (spec.requiredMessage || REQUIRED_MSG);
-      if (spec.kind === 'number') {
+      if (spec.kind === 'choice') {
+        // Also catches an answer that a lookup list no longer offers (e.g. an earlier answer it depends on changed).
+        if (!(spec.options || []).some(function (o) { return String(o.value) === String(value); })) {
+          return spec.staleMessage || 'Please choose one of the options shown.';
+        }
+      } else if (spec.kind === 'number') {
         if (spec.min != null && value < spec.min) return spec.minMessage || 'Please enter at least ' + (spec.prefix || '') + formatNumber(spec.min) + '.';
         if (spec.max != null && value > spec.max) return spec.maxMessage || 'The maximum is ' + (spec.prefix || '') + formatNumber(spec.max) + '.';
       } else if (spec.kind === 'date') {
@@ -422,7 +489,7 @@
       var ch = recordChanges(rec);
       var items = Object.keys(ch).map(function (f) {
         var fd = cn && fieldDef(cn, f);
-        var spec = fd ? fd.input : null;
+        var spec = fd ? eff(ctx, fd.input) : null;
         return { slot: node.record + '.' + f, label: fd ? fieldLabel(fd) : f,
                  before: displayFor(spec, rec.original[f]), after: displayFor(spec, rec.current[f]), editable: !!fd };
       });
@@ -435,7 +502,7 @@
         type: 'record',
         text: interpolate(node.cardTitle || 'Current details', view(ctx)),
         items: (node.fields || []).map(function (f) {
-          return { slot: node.record + '.' + f.field, label: fieldLabel(f), display: displayFor(f.input, rec.current[f.field]) };
+          return { slot: node.record + '.' + f.field, label: fieldLabel(f), display: displayFor(eff(ctx, f.input), rec.current[f.field]) };
         })
       };
     }
@@ -519,7 +586,7 @@
       var rec = ctx.st.records[cn.record];
       ctx.st.current = cn.id;
       ctx.st.editingField = f.field;
-      var cur = displayFor(f.input, rec.current[f.field]);
+      var cur = displayFor(eff(ctx, f.input), rec.current[f.field]);
       say(ctx, 'text', interpolate(f.prompt || (fieldLabel(f) + (cur ? ' is currently ' + cur + '. What should it be?' : ' is empty. What should it be?')), view(ctx)));
     }
 
@@ -681,20 +748,33 @@
             if (r.message) say(ctx, 'text', r.message);
             id = r.found === false && node.onNotFound ? node.onNotFound : node.next;
             break;
-          case 'ask':
-            if ((ctx.replay || node.skipIfFilled) && isFilled(st.slots[node.slot]) && ctx.forceAsk !== id) { id = node.next; break; }
+          case 'ask': {
+            var stale = false;
+            if ((ctx.replay || node.skipIfFilled) && isFilled(st.slots[node.slot]) && ctx.forceAsk !== id) {
+              // A lookup answer the list no longer offers (an answer it depends on changed) is asked again.
+              if (!(node.input && node.input.optionsFrom) || await stillOffered(ctx, node)) { id = node.next; break; }
+              stale = true;
+            }
             // A question reached while replaying an edit keeps the replay going after it's answered.
             if (ctx.replay) st.editing = true;
             ctx.replay = false; ctx.forceAsk = null;
             st.current = id;
             say(ctx, 'text', interpolate(node.prompt, view(ctx)));
+            if (node.input && node.input.optionsFrom) {
+              await ensureOptions(ctx);
+              if (!eff(ctx, node.input).options.length) say(ctx, 'error', node.input.emptyMessage || "There's nothing to choose from here right now.");
+              else if (stale) say(ctx, 'error', node.input.staleMessage || 'Your earlier answer is no longer one of the options. Please choose again.');
+            }
             return;
+          }
           case 'summary':
+            await ensureOptions(ctx);
             ctx.replay = false;
             st.current = id;
             ctx.out.push(summaryMessage(ctx, node));
             return;
           case 'submit': {
+            await ensureOptions(ctx);
             var bad = await revalidate(ctx);
             if (bad) { say(ctx, 'error', bad.error); st.editing = true; ctx.forceAsk = bad.nodeId; id = bad.nodeId; break; }
             r = await callConnector(ctx, node.connector, { nodeId: node.id });
@@ -722,6 +802,7 @@
             break;
           case 'changeFields':
             if (!st.records[node.record]) throw new Error('Change fields "' + id + '" needs a loaded record "' + node.record + '".');
+            await ensureOptions(ctx);
             ctx.replay = false;
             st.current = id;
             st.editingField = null;
@@ -745,13 +826,20 @@
       if (st.status === 'in_progress') { st.status = 'completed'; st.current = null; }
     }
 
+    // Input spec sent to the browser: lookup options resolved, server-side details removed.
+    function turnInput(ctx, spec) {
+      var out = clone(eff(ctx, spec || { kind: 'text' }));
+      delete out.optionsFrom; delete out.optionsParams; delete out.staleMessage; delete out.emptyMessage;
+      return out;
+    }
+
     function buildTurn(ctx) {
       var st = ctx.st, aw = null, v = view(ctx);
       if (st.status === 'in_progress' && st.current) {
         var n = ctx.nodes[st.current];
         if (n.type === 'ask') {
           aw = { type: 'ask', nodeId: n.id, slot: n.slot, label: n.label || n.slot,
-                 input: clone(n.input || { kind: 'text' }),
+                 input: turnInput(ctx, n.input),
                  value: isFilled(st.slots[n.slot]) ? st.slots[n.slot] : null };
           if (!aw.input.kind) aw.input.kind = 'text';
         } else if (n.type === 'summary') {
@@ -771,13 +859,13 @@
           if (st.editingField) {
             var f = fieldDef(n, st.editingField);
             aw = { type: 'ask', nodeId: n.id, slot: n.record + '.' + f.field, label: fieldLabel(f),
-                   input: clone(f.input || { kind: 'text' }), value: isFilled(rec.current[f.field]) ? rec.current[f.field] : null, sub: true };
+                   input: turnInput(ctx, f.input), value: isFilled(rec.current[f.field]) ? rec.current[f.field] : null, sub: true };
             if (!aw.input.kind) aw.input.kind = 'text';
           } else {
             aw = { type: 'fieldMenu', nodeId: n.id, doneLabel: n.doneLabel || 'Done',
                    fields: (n.fields || []).map(function (fd) {
                      var ed = fieldEditable(ctx, n, fd);
-                     return { field: fd.field, label: fieldLabel(fd), display: displayFor(fd.input, rec.current[fd.field]),
+                     return { field: fd.field, label: fieldLabel(fd), display: displayFor(eff(ctx, fd.input), rec.current[fd.field]),
                               changed: !same(rec.current[fd.field], rec.original[fd.field]), editable: ed,
                               reason: ed ? null : (fd.lockedMessage || 'This field cannot be changed right now.') };
                    }) };
@@ -807,6 +895,7 @@
       var ctx = makeCtx(sid, st);
       seedContext(ctx);
       await run(ctx, flow.start);
+      await ensureOptions(ctx);
       return clone(buildTurn(ctx));
     }
 
@@ -818,6 +907,7 @@
       if (st.status !== 'in_progress') return clone(buildTurn(ctx));
       var cmd = String(payload.command || '').toLowerCase();
       var node = ctx.nodes[st.current];
+      await ensureOptions(ctx);
 
       if (cmd === 'restart') {
         Object.keys(view(ctx)).forEach(function (k) { touch(ctx, k); });
@@ -846,7 +936,7 @@
         else if (target) { st.editing = true; ctx.forceAsk = target.id; await run(ctx, target.id); }
         else say(ctx, 'error', 'There is no question for "' + slot + '".');
       } else if (node.type === 'ask') {
-        var parsed = parseValue(node.input, payload.value);
+        var parsed = parseValue(eff(ctx, node.input), payload.value);
         var err = parsed.error || await validate(ctx, node, parsed.value);
         if (err) say(ctx, 'error', err);
         else {
@@ -865,6 +955,7 @@
       } else if (node.type === 'changeFields') {
         await handleChange(ctx, node, payload, cmd);
       }
+      await ensureOptions(ctx);
       return clone(buildTurn(ctx));
     }
 
@@ -894,7 +985,7 @@
       var st = ctx.st, rec = st.records[node.record];
       if (st.editingField) {
         var f = fieldDef(node, st.editingField);
-        var parsed = parseValue(f.input, payload.value);
+        var parsed = parseValue(eff(ctx, f.input), payload.value);
         var err = parsed.error || await validate(ctx, fieldAsNode(node, f), parsed.value);
         if (err) { say(ctx, 'error', err); return; }
         rec.current[f.field] = parsed.value;
@@ -923,6 +1014,7 @@
       registerFlow: registerFlow,
       registerConnector: registerConnector,
       registerDataSource: registerDataSource,
+      registerLov: registerLov,
       getState: function (sid) { return clone(sessions.get(sid)); }
     };
   }

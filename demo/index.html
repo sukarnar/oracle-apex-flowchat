@@ -95,12 +95,13 @@
   <script src="../widget/flowchat-engine.js"></script>
   <script src="../widget/flowchat.js"></script>
   <script src="demo-connectors.js"></script>
+  <script src="demo-lovs.js"></script>
   <script>
     (async function () {
       const chat = document.getElementById('chat');
       try {
         const flow = await fetch('../flows/loan_application.json').then((r) => r.json());
-        const engine = FlowChatEngine.createEngine({ flows: [flow], connectors: FlowChatDemoConnectors });
+        const engine = FlowChatEngine.createEngine({ flows: [flow], connectors: FlowChatDemoConnectors, lovs: FlowChatDemoLovs });
         chat.configure({ transport: new FlowChat.LocalTransport(engine) });
         chat.addEventListener('fc-turn', (e) => {
           document.getElementById('turnJson').textContent = JSON.stringify(e.detail, null, 2);

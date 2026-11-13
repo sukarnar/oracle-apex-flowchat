@@ -157,6 +157,15 @@
           "items": { "type": "object", "required": ["value"],
                      "properties": { "value": { "type": "string" }, "label": { "type": "string" } } }
         },
+        "optionsFrom": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]{0,99}$",
+                         "description": "choice: id of a lookup list (FC_LOVS in APEX, options.lovs in JS). Replaces options." },
+        "optionsParams": { "type": "object", "description": "choice: {param: slot or alias.field} passed to the lookup list (bound as :PARAM)",
+                           "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,29}$" },
+                           "additionalProperties": { "type": "string" } },
+        "display": { "enum": ["auto", "buttons", "list"], "default": "auto",
+                     "description": "choice: buttons, or a searchable list. auto = list when there are more than 8 options" },
+        "staleMessage": { "type": "string", "description": "choice: shown when an earlier answer is no longer offered" },
+        "emptyMessage": { "type": "string", "description": "choice: shown when a lookup list has no options" },
         "requiredMessage": { "type": "string" }, "parseMessage": { "type": "string" },
         "minMessage": { "type": "string" }, "maxMessage": { "type": "string" }
       }

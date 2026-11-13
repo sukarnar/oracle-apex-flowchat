@@ -473,6 +473,53 @@ create or replace package body fc_designer as
     return ok(l_arr);
   end list_connectors;
 
+  -- Lookup lists, with the parameters each SQL list binds (:NAME other than :APP_USER / :FC_VERIFIED).
+  function list_lovs return clob is
+    l_arr   json_array_t := json_array_t();
+    l_o     json_object_t;
+    l_ps    json_array_t;
+    l_name  varchar2(128);
+    l_seen  varchar2(4000);
+    l_i     pls_integer;
+  begin
+    for c in (select lov_id, lov_type, query, target, description from fc_lovs where enabled = 'Y' order by lov_id) loop
+      l_o  := json_object_t();
+      l_ps := json_array_t();
+      l_o.put('id', c.lov_id);
+      l_o.put('type', c.lov_type);
+      l_o.put('description', c.description);
+      if c.lov_type = 'SQL' then
+        l_o.put('query', c.query);
+        l_seen := ',';
+        l_i := 1;
+        loop
+          l_name := lower(regexp_substr(c.query, ':([A-Za-z][A-Za-z0-9_]*)', 1, l_i, null, 1));
+          exit when l_name is null;
+          if l_name not in ('app_user', 'fc_verified') and instr(l_seen, ',' || l_name || ',') = 0 then
+            l_ps.append(l_name);
+            l_seen := l_seen || l_name || ',';
+          end if;
+          l_i := l_i + 1;
+        end loop;
+      else
+        l_o.put('target', c.target);
+      end if;
+      l_o.put('params', l_ps);
+      l_arr.append(l_o);
+    end loop;
+    return ok(l_arr);
+  end list_lovs;
+
+  -- Options of a lookup list for the designer's Test tab: {"id", "params": {...}}.
+  function lov_options (p_in in json_object_t) return clob is
+    l_params json_object_t;
+  begin
+    if p_in.has('params') and p_in.get('params').is_object then l_params := p_in.get_object('params');
+    else l_params := json_object_t();
+    end if;
+    return ok(fc_data.lov_options(jstr(p_in, 'id'), l_params));
+  end lov_options;
+
   ------------------------------------------------------------------------------
   function dispatch (p_action in varchar2, p_payload in clob) return clob is
     l_in json_object_t;
@@ -492,6 +539,8 @@ create or replace package body fc_designer as
       when 'describeTable'  then return describe_table(l_in);
       when 'sampleRows'     then return sample_rows(l_in);
       when 'listConnectors' then return list_connectors;
+      when 'listLovs'       then return list_lovs;
+      when 'lovOptions'     then return lov_options(l_in);
       else raise_application_error(-20055, 'Unknown designer action "' || p_action || '".');
     end case;
   end dispatch;

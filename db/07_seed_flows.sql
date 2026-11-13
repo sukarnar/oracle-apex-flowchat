@@ -159,6 +159,38 @@ begin
           }
         ]
       },
+      "next": "ask_country"
+    },
+    {
+      "id": "ask_country",
+      "type": "ask",
+      "slot": "country",
+      "label": "Country",
+      "prompt": "Which country do you live in?",
+      "input": {
+        "kind": "choice",
+        "optionsFrom": "countries",
+        "display": "list",
+        "placeholder": "Type to search countries..."
+      },
+      "next": "ask_branch"
+    },
+    {
+      "id": "ask_branch",
+      "type": "ask",
+      "slot": "branch",
+      "label": "Branch",
+      "prompt": "Which branch should handle your application?",
+      "input": {
+        "kind": "choice",
+        "optionsFrom": "branches",
+        "options~');
+  dbms_lob.append(l_def, q'~Params": {
+          "country": "country"
+        },
+        "staleMessage": "That branch isn't in the country you chose. Please pick a branch again.",
+        "emptyMessage": "We don't have a branch there yet. Go back to choose another country."
+      },
       "next": "is_large_loan"
     },
     {
@@ -186,8 +218,7 @@ begin
         "kind": "number",
         "min": 0,
         "prefix": "$",
-        "placeholde~');
-  dbms_lob.append(l_def, q'~r": "e.g. 85000"
+        "placeholder": "e.g. 85000"
       },
       "validators": [
         {

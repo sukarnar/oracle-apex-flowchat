@@ -50,6 +50,18 @@
         { "value": "EDU", "label": "Education" },
         { "value": "DEBT", "label": "Debt consolidation" },
         { "value": "OTHER", "label": "Something else" } ] },
+      "next": "ask_country" },
+
+    { "id": "ask_country", "type": "ask", "slot": "country", "label": "Country",
+      "prompt": "Which country do you live in?",
+      "input": { "kind": "choice", "optionsFrom": "countries", "display": "list", "placeholder": "Type to search countries..." },
+      "next": "ask_branch" },
+
+    { "id": "ask_branch", "type": "ask", "slot": "branch", "label": "Branch",
+      "prompt": "Which branch should handle your application?",
+      "input": { "kind": "choice", "optionsFrom": "branches", "optionsParams": { "country": "country" },
+                 "staleMessage": "That branch isn't in the country you chose. Please pick a branch again.",
+                 "emptyMessage": "We don't have a branch there yet. Go back to choose another country." },
       "next": "is_large_loan" },
 
     { "id": "is_large_loan", "type": "condition",

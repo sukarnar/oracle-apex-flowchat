@@ -49,6 +49,13 @@
           { id: 'lookup_customer', type: 'PLSQL', description: 'Prefills name for known customers' },
           { id: 'send_code', type: 'PLSQL', description: 'Verify step: delivers a one-time code (demo writes to FC_DEMO_OUTBOX)' }
         ],
+        // 12_lov_demo.sql (FC_LOVS); options come from demo/demo-lovs.js
+        lovs: [
+          { id: 'branches', type: 'SQL', description: 'Demo: branches in one country (parameter: country)', params: ['country'],
+            query: 'select branch_id, branch_name from fc_demo_branches where country_code = :COUNTRY order by branch_name' },
+          { id: 'countries', type: 'SQL', description: 'Demo: countries that have a branch', params: [],
+            query: 'select country_code, country_name from fc_demo_branches group by country_code, country_name order by 2' }
+        ],
         tables: {
           FC_DEMO_LOAN_APPS: { type: 'TABLE', pk: ['APP_ID'], columns: [
             ['APP_ID', 'NUMBER', false], ['REFERENCE', 'VARCHAR2', true], ['SESSION_ID', 'VARCHAR2', true], ['CUSTOMER_ID', 'NUMBER', true],
@@ -176,7 +183,14 @@
                columns: t.columns.map(function (c) { return { column: c[0], dataType: c[1], nullable: c[2], length: 100 }; }) };
     },
     sampleRows: function (db, p) { return clone(db.rows[p.id] || []).slice(0, p.limit || 20); },
-    listConnectors: function (db) { return clone(db.connectors); }
+    listConnectors: function (db) { return clone(db.connectors); },
+    listLovs: function (db) { return clone(db.lovs || []); },
+    lovOptions: function (db, p) {
+      var l = (db.lovs || []).find(function (x) { return x.id === p.id; });
+      if (!l) fail('error', 'Unknown or disabled lookup list "' + p.id + '".');
+      var fn = window.FlowChatDemoLovs && window.FlowChatDemoLovs[p.id];
+      return fn ? fn({ lov: p.id, params: p.params || {} }) : [];
+    }
   };
 
   function saveVersion(db, p, publish) {

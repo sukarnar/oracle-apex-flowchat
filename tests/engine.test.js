@@ -7,6 +7,7 @@ const flow = require('../flows/loan_application.json');
 global.window = global;
 require('../demo/demo-connectors.js');
 const connectors = global.FlowChatDemoConnectors;
+const lovs = require('../demo/demo-lovs.js');
 
 const last = (t) => t.messages[t.messages.length - 1];
 let passed = 0;
@@ -33,7 +34,7 @@ async function test(name, fn) {
   });
 
   console.log('engine');
-  const eng = createEngine({ flows: [flow], connectors });
+  const eng = createEngine({ flows: [flow], connectors, lovs });
 
   await test('new customer, big loan, phone path, submit', async () => {
     let t = await eng.start('loan_application');
@@ -54,6 +55,10 @@ async function test(name, fn) {
     assert.match(last(t).text, /Ann Lee/);
     t = await eng.input(t.sessionId, { value: '200k' });
     t = await eng.input(t.sessionId, { value: 'car' });
+    assert.strictEqual(t.await.slot, 'country');
+    t = await eng.input(t.sessionId, { value: 'canada' });
+    assert.strictEqual(t.await.slot, 'branch');
+    t = await eng.input(t.sessionId, { value: '2' });
     assert.strictEqual(t.await.slot, 'annual_income');            // branch taken
     t = await eng.input(t.sessionId, { value: '30000' });          // 5x = 150k < 200k
     assert.strictEqual(last(t).type, 'error');
@@ -72,6 +77,8 @@ async function test(name, fn) {
     assert.strictEqual(card.type, 'summary');
     assert.deepStrictEqual(card.items.find((i) => i.slot === 'amount').display, '$200,000');
     assert.deepStrictEqual(card.items.find((i) => i.slot === 'purpose').display, 'Car');
+    assert.deepStrictEqual(card.items.find((i) => i.slot === 'country').display, 'Canada');
+    assert.deepStrictEqual(card.items.find((i) => i.slot === 'branch').display, 'Toronto Bay St');
 
     t = await eng.input(t.sessionId, { value: 'confirm' });
     assert.strictEqual(t.status, 'completed');
@@ -91,7 +98,7 @@ async function test(name, fn) {
   await test('edit from summary replays branching (new question appears)', async () => {
     let t = await eng.start('loan_application');
     const sid = t.sessionId;
-    for (const v of ['raj.kumar@example.com', '50000', 'home', 'tomorrow', 'no']) t = await eng.input(sid, { value: v });
+    for (const v of ['raj.kumar@example.com', '50000', 'home', 'IN', 'Mumbai Fort', 'tomorrow', 'no']) t = await eng.input(sid, { value: v });
     assert.strictEqual(t.await.type, 'summary');
     t = await eng.input(sid, { command: 'edit', slot: 'amount' });
     assert.strictEqual(t.await.slot, 'amount');

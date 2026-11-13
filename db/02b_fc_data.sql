@@ -32,12 +32,18 @@ create or replace package fc_data authid definer as
   -- First rows of a TABLE source (row_filter applied, nothing masked) for the designer's Test tab:
   --   [{ "key": "...", "version": "...", "values": {...} }]. PLSQL sources return [].
   function sample_rows (p_source in varchar2, p_limit in pls_integer default 20) return json_array_t;
+
+  -- Options of a lookup list (FC_LOVS) for a choice answer: [{ "value": "...", "label": "..." }], at most 500.
+  -- p_params: {"country": "CA"} -> bound as :COUNTRY in a SQL list, passed as "params" to a PLSQL list.
+  function lov_options (p_lov in varchar2, p_params in json_object_t,
+                        p_context in json_object_t default null) return json_array_t;
 end fc_data;
 /
 
 create or replace package body fc_data as
 
   c_nls constant varchar2(40) := 'NLS_NUMERIC_CHARACTERS=''.,''';
+  c_max_options constant pls_integer := 500;
   g_verified varchar2(4000);
 
   type t_field is record (
@@ -281,6 +287,85 @@ create or replace package body fc_data as
     end;
     return l_out;
   end search_rows;
+
+  function lov_options (p_lov in varchar2, p_params in json_object_t,
+                        p_context in json_object_t default null) return json_array_t is
+    l_lov   fc_lovs%rowtype;
+    l_out   json_array_t := json_array_t();
+    l_item  json_object_t;
+    l_keys  json_key_list;
+    l_binds t_binds;
+    l_pl    json_object_t;
+    l_arr   json_array_t;
+    l_el    json_object_t;
+    l_cur   integer;
+    l_n     integer;
+    l_val   varchar2(4000);
+    l_lab   varchar2(4000);
+    l_cnt   pls_integer := 0;
+  begin
+    begin
+      select * into l_lov from fc_lovs where lov_id = p_lov and enabled = 'Y';
+    exception when no_data_found then
+      raise_application_error(-20041, 'Unknown or disabled lookup list "' || p_lov || '".');
+    end;
+    if p_params is not null then l_keys := p_params.get_keys; end if;
+
+    if l_lov.lov_type = 'PLSQL' then
+      l_pl := ctx_payload(p_context);
+      l_pl.put('lov', p_lov);
+      if p_params is not null then l_pl.put('params', p_params); else l_pl.put('params', json_object_t()); end if;
+      l_arr := json_array_t.parse(call_target(l_lov.target, l_pl.to_clob));
+      for i in 0 .. l_arr.get_size - 1 loop
+        exit when l_cnt >= c_max_options;
+        if l_arr.get(i).is_object then
+          l_el  := treat(l_arr.get(i) as json_object_t);
+          l_val := jstr(l_el, 'value');
+          if l_val is not null then
+            l_item := json_object_t();
+            l_item.put('value', l_val);
+            l_item.put('label', nvl(jstr(l_el, 'label'), l_val));
+            l_out.append(l_item);
+            l_cnt := l_cnt + 1;
+          end if;
+        end if;
+      end loop;
+      return l_out;
+    end if;
+
+    -- SQL list: bind only the parameters the query uses (:NAME, case-insensitive).
+    if l_keys is not null then
+      for i in 1 .. l_keys.count loop
+        if regexp_like(l_lov.query, ':' || l_keys(i) || '([^A-Za-z0-9_$#]|$)', 'i') then
+          add_bind(l_binds, upper(l_keys(i)), jstr(p_params, l_keys(i)));
+        end if;
+      end loop;
+    end if;
+    l_cur := dbms_sql.open_cursor;
+    begin
+      dbms_sql.parse(l_cur, l_lov.query, dbms_sql.native);
+      bind_all(l_cur, l_lov.query, l_binds);
+      dbms_sql.define_column(l_cur, 1, l_val, 4000);
+      dbms_sql.define_column(l_cur, 2, l_lab, 4000);
+      l_n := dbms_sql.execute(l_cur);
+      while l_cnt < c_max_options and dbms_sql.fetch_rows(l_cur) > 0 loop
+        dbms_sql.column_value(l_cur, 1, l_val);
+        dbms_sql.column_value(l_cur, 2, l_lab);
+        if l_val is not null then
+          l_item := json_object_t();
+          l_item.put('value', l_val);
+          l_item.put('label', nvl(l_lab, l_val));
+          l_out.append(l_item);
+          l_cnt := l_cnt + 1;
+        end if;
+      end loop;
+      dbms_sql.close_cursor(l_cur);
+    exception when others then
+      if dbms_sql.is_open(l_cur) then dbms_sql.close_cursor(l_cur); end if;
+      raise_application_error(-20042, 'Lookup list "' || p_lov || '" failed: ' || sqlerrm);
+    end;
+    return l_out;
+  end lov_options;
 
   function sample_rows (p_source in varchar2, p_limit in pls_integer default 20) return json_array_t is
     l_src    fc_data_sources%rowtype;

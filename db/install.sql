@@ -9,6 +9,8 @@ prompt == Repository and runtime tables
 @@01_tables.sql
 prompt == Data source registry
 @@02_data_sources.sql
+prompt == Lookup list registry (FC_LOVS)
+@@02c_lovs.sql
 prompt == FC_DATA (search / get / update)
 @@02b_fc_data.sql
 show errors package body fc_data
@@ -29,6 +31,8 @@ prompt == Verify step demo (send_code connector, loan_apps_public)
 @@10_verify_demo.sql
 prompt == Sample flow update_application_public
 @@11_seed_public_flow.sql
+prompt == Lookup list demo (countries, branches)
+@@12_lov_demo.sql
 -- Optional REST API for non-APEX pages:
 -- @@08_ords_module.sql
 prompt == Done

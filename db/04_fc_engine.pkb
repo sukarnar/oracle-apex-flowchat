@@ -23,6 +23,10 @@ create or replace package body fc_engine as
     force_ask     varchar2(200)
   );
 
+  -- Lookup list options fetched during this request: "<list>|<params json>" -> [{value, label}].
+  -- Reset on every request, so lists are always current.
+  g_lov_cache json_object_t;
+
   ------------------------------------------------------------------------------
   -- scalar helpers
   ------------------------------------------------------------------------------
@@ -197,6 +201,62 @@ create or replace package body fc_engine as
     end loop;
     c.updates.append(p_slot);
   end touch;
+
+  -- The input spec as the user sees it: a lookup list's options filled in from FC_LOVS
+  -- (no options until every parameter the list needs is answered).
+  function eff_spec (c in out nocopy t_ctx, p_spec in json_object_t) return json_object_t is
+    l_lov    varchar2(100);
+    l_map    json_object_t;
+    l_keys   json_key_list;
+    l_params json_object_t := json_object_t();
+    l_v      json_object_t;
+    l_val    varchar2(4000);
+    l_key    varchar2(32767);
+    l_out    json_object_t;
+    l_ok     boolean := true;
+  begin
+    l_lov := str(p_spec, 'optionsFrom');
+    if l_lov is null then return p_spec; end if;
+    l_out := copy(p_spec);
+    l_map := obj(p_spec, 'optionsParams');
+    if l_map is not null then
+      l_v    := vals(c);
+      l_keys := l_map.get_keys;
+      if l_keys is not null then
+        for i in 1 .. l_keys.count loop
+          l_val := str(l_v, str(l_map, l_keys(i)));
+          if l_val is null then
+            l_ok := false;
+            exit;
+          end if;
+          l_params.put(l_keys(i), l_val);
+        end loop;
+      end if;
+    end if;
+    if not l_ok then
+      l_out.put('options', json_array_t());
+      return l_out;
+    end if;
+    l_key := l_lov || '|' || l_params.to_string;
+    if g_lov_cache is null then g_lov_cache := json_object_t(); end if;
+    if not g_lov_cache.has(l_key) then
+      g_lov_cache.put(l_key, fc_data.lov_options(l_lov, l_params, obj(c.state, 'context')));
+    end if;
+    l_out.put('options', g_lov_cache.get_array(l_key));
+    return l_out;
+  end eff_spec;
+
+  -- Input spec sent to the browser: options resolved, server-side details removed.
+  function turn_input (c in out nocopy t_ctx, p_spec in json_object_t) return json_object_t is
+    l json_object_t;
+  begin
+    l := copy(eff_spec(c, p_spec));
+    l.remove('optionsFrom');
+    l.remove('optionsParams');
+    l.remove('staleMessage');
+    l.remove('emptyMessage');
+    return l;
+  end turn_input;
 
   procedure merge_slots (c in out nocopy t_ctx, p_res in json_object_t) is
     l_obj  json_object_t;
@@ -415,11 +475,11 @@ create or replace package body fc_engine as
       if l_cn is null then return null; end if;
       l_fd := field_def(l_cn, substr(p_name, l_dot + 1));
       if l_fd is null then return null; end if;
-      return input_spec(l_fd);
+      return eff_spec(c, input_spec(l_fd));
     end if;
     l_nid := str(c.slot_nodes, p_name);
     if l_nid is null then return null; end if;
-    return input_spec(get_node(c, l_nid));
+    return eff_spec(c, input_spec(get_node(c, l_nid)));
   end spec_for;
 
   function display_value (c in out nocopy t_ctx, p_name in varchar2) return varchar2 is
@@ -429,10 +489,12 @@ create or replace package body fc_engine as
 
   -- p_parsed = {"value": <typed value or null>}. Returns an error message or null.
   function validate (c in out nocopy t_ctx, p_node in json_object_t, p_parsed in json_object_t) return varchar2 is
-    l_spec   json_object_t := input_spec(p_node);
-    l_kind   varchar2(30)  := str(l_spec, 'kind');
+    l_spec   json_object_t;
+    l_kind   varchar2(30);
     l_val    varchar2(32767) := str(p_parsed, 'value');
-    l_prefix varchar2(20)  := str(l_spec, 'prefix');
+    l_prefix varchar2(20);
+    l_opts   json_array_t;
+    l_found  boolean := false;
     l_num    number;
     l_lo     varchar2(30);
     l_hi     varchar2(30);
@@ -440,12 +502,24 @@ create or replace package body fc_engine as
     l_v      json_object_t;
     l_res    json_object_t;
   begin
+    l_spec   := eff_spec(c, input_spec(p_node));
+    l_kind   := str(l_spec, 'kind');
+    l_prefix := str(l_spec, 'prefix');
     if l_val is null then
       if str(l_spec, 'required') = 'false' then return null; end if;
       return nvl(str(l_spec, 'requiredMessage'), c_required);
     end if;
 
-    if l_kind = 'number' then
+    if l_kind = 'choice' then
+      -- Also catches an answer a lookup list no longer offers (an answer it depends on changed).
+      l_opts := arr(l_spec, 'options');
+      for i in 0 .. l_opts.get_size - 1 loop
+        if str(treat(l_opts.get(i) as json_object_t), 'value') = l_val then l_found := true; exit; end if;
+      end loop;
+      if not l_found then
+        return nvl(str(l_spec, 'staleMessage'), 'Please choose one of the options shown.');
+      end if;
+    elsif l_kind = 'number' then
       l_num := to_num(l_val);
       if to_num(str(l_spec, 'min')) is not null and l_num < to_num(str(l_spec, 'min')) then
         return nvl(str(l_spec, 'minMessage'), 'Please enter at least ' || l_prefix || fmt_num(to_num(str(l_spec, 'min'))) || '.');
@@ -488,6 +562,18 @@ create or replace package body fc_engine as
     end loop;
     return null;
   end validate;
+
+  -- Is the saved answer of a lookup-list question still one of its options?
+  function still_offered (c in out nocopy t_ctx, p_node in json_object_t) return boolean is
+    l_opts json_array_t;
+    l_v    varchar2(4000) := str(c.slots, str(p_node, 'slot'));
+  begin
+    l_opts := arr(eff_spec(c, input_spec(p_node)), 'options');
+    for i in 0 .. l_opts.get_size - 1 loop
+      if str(treat(l_opts.get(i) as json_object_t), 'value') = l_v then return true; end if;
+    end loop;
+    return false;
+  end still_offered;
 
   -- A changeFields field validated like an Ask node.
   function field_as_node (p_change_node in json_object_t, p_fd in json_object_t) return json_object_t is
@@ -607,7 +693,7 @@ create or replace package body fc_engine as
   begin
     c.state.put('current', str(p_change_node, 'id'));
     c.state.put('editingField', str(p_fd, 'field'));
-    l_cur := display_for(input_spec(p_fd), str(obj(l_rec, 'current'), str(p_fd, 'field')));
+    l_cur := display_for(eff_spec(c, input_spec(p_fd)), str(obj(l_rec, 'current'), str(p_fd, 'field')));
     add_msg(c, 'text', interpolate(nvl(str(p_fd, 'prompt'),
       field_label(p_fd) || case when l_cur is not null then ' is currently ' || l_cur || '. What should it be?'
                                 else ' is empty. What should it be?' end), vals(c)));
@@ -956,7 +1042,7 @@ create or replace package body fc_engine as
         l_fd := null;
         l_spec := null;
         if l_cn is not null then l_fd := field_def(l_cn, l_keys(i)); end if;
-        if l_fd is not null then l_spec := input_spec(l_fd); end if;
+        if l_fd is not null then l_spec := eff_spec(c, input_spec(l_fd)); end if;
         l_item := json_object_t();
         l_item.put('slot', l_alias || '.' || l_keys(i));
         l_item.put('label', case when l_fd is not null then field_label(l_fd) else l_keys(i) end);
@@ -1029,7 +1115,7 @@ create or replace package body fc_engine as
       l_item := json_object_t();
       l_item.put('slot', str(p_node, 'record') || '.' || str(l_fd, 'field'));
       l_item.put('label', field_label(l_fd));
-      l_item.put('display', display_for(input_spec(l_fd), str(obj(l_rec, 'current'), str(l_fd, 'field'))));
+      l_item.put('display', display_for(eff_spec(c, input_spec(l_fd)), str(obj(l_rec, 'current'), str(l_fd, 'field'))));
       l_items.append(l_item);
     end loop;
     l_msg.put('type', 'record');
@@ -1106,6 +1192,9 @@ create or replace package body fc_engine as
     l_err     varchar2(4000);
     l_await   boolean;
     l_steps   pls_integer := 0;
+    l_skip    boolean;
+    l_stale   boolean;
+    l_spec    json_object_t;
   begin
     while l_id is not null loop
       l_steps := l_steps + 1;
@@ -1138,10 +1227,19 @@ create or replace package body fc_engine as
           end if;
 
         when 'ask' then
-          l_slot := str(l_node, 'slot');
-          if (c.replay or get_bool(l_node, 'skipIfFilled'))
-             and str(c.slots, l_slot) is not null
-             and nvl(c.force_ask, '~') <> l_id then
+          l_slot  := str(l_node, 'slot');
+          l_skip  := (c.replay or get_bool(l_node, 'skipIfFilled'))
+                     and str(c.slots, l_slot) is not null
+                     and nvl(c.force_ask, '~') <> l_id;
+          l_stale := false;
+          -- a lookup answer the list no longer offers (an answer it depends on changed) is asked again
+          if l_skip and str(input_spec(l_node), 'optionsFrom') is not null then
+            if not still_offered(c, l_node) then
+              l_skip  := false;
+              l_stale := true;
+            end if;
+          end if;
+          if l_skip then
             l_id := str(l_node, 'next');
           else
             -- a question reached while replaying an edit keeps the replay going after it's answered
@@ -1150,6 +1248,15 @@ create or replace package body fc_engine as
             c.force_ask := null;
             c.state.put('current', l_id);
             add_msg(c, 'text', interpolate(str(l_node, 'prompt'), vals(c)));
+            if str(input_spec(l_node), 'optionsFrom') is not null then
+              l_spec := eff_spec(c, input_spec(l_node));
+              if arr(l_spec, 'options').get_size = 0 then
+                add_msg(c, 'error', nvl(str(l_spec, 'emptyMessage'), 'There''s nothing to choose from here right now.'));
+              elsif l_stale then
+                add_msg(c, 'error', nvl(str(l_spec, 'staleMessage'),
+                        'Your earlier answer is no longer one of the options. Please choose again.'));
+              end if;
+            end if;
             return;
           end if;
 
@@ -1264,7 +1371,7 @@ create or replace package body fc_engine as
         l_aw.put('type', 'ask');
         l_aw.put('slot', l_slot);
         l_aw.put('label', nvl(str(l_node, 'label'), l_slot));
-        l_aw.put('input', input_spec(l_node));
+        l_aw.put('input', turn_input(c, input_spec(l_node)));
         if str(c.slots, l_slot) is not null then l_aw.put('value', c.slots.get(l_slot)); else l_aw.put_null('value'); end if;
 
       elsif l_type = 'summary' then
@@ -1316,7 +1423,7 @@ create or replace package body fc_engine as
           l_aw.put('type', 'ask');
           l_aw.put('slot', str(l_node, 'record') || '.' || l_field);
           l_aw.put('label', field_label(l_fd));
-          l_aw.put('input', input_spec(l_fd));
+          l_aw.put('input', turn_input(c, input_spec(l_fd)));
           if str(obj(l_rec, 'current'), l_field) is not null then
             l_aw.put('value', obj(l_rec, 'current').get(l_field));
           else
@@ -1334,7 +1441,7 @@ create or replace package body fc_engine as
             l_item := json_object_t();
             l_item.put('field', str(l_fd, 'field'));
             l_item.put('label', field_label(l_fd));
-            l_item.put('display', display_for(input_spec(l_fd), str(obj(l_rec, 'current'), str(l_fd, 'field'))));
+            l_item.put('display', display_for(eff_spec(c, input_spec(l_fd)), str(obj(l_rec, 'current'), str(l_fd, 'field'))));
             l_item.put('changed', not same(str(obj(l_rec, 'current'), str(l_fd, 'field')), str(obj(l_rec, 'original'), str(l_fd, 'field'))));
             l_item.put('editable', l_edit);
             if l_edit then l_item.put_null('reason');
@@ -1391,6 +1498,7 @@ create or replace package body fc_engine as
     c.results   := json_object_t();
     c.replay    := false;
     c.force_ask := null;
+    g_lov_cache := json_object_t();
   end init_ctx;
 
   procedure load_flow (c in out nocopy t_ctx, p_flow_id in varchar2, p_version in number) is
@@ -1634,7 +1742,7 @@ create or replace package body fc_engine as
   begin
     if l_field is not null then
       l_fd := field_def(p_node, l_field);
-      l_parsed := parse_value(input_spec(l_fd), str(p_in, 'value'));
+      l_parsed := parse_value(eff_spec(c, input_spec(l_fd)), str(p_in, 'value'));
       l_err := str(l_parsed, 'error');
       if l_err is null then l_err := validate(c, field_as_node(p_node, l_fd), l_parsed); end if;
       if l_err is not null then
@@ -1833,7 +1941,7 @@ create or replace package body fc_engine as
       end if;
 
     elsif l_type = 'ask' then
-      l_parsed := parse_value(input_spec(l_node), str(l_in, 'value'));
+      l_parsed := parse_value(eff_spec(c, input_spec(l_node)), str(l_in, 'value'));
       l_err := str(l_parsed, 'error');
       if l_err is null then l_err := validate(c, l_node, l_parsed); end if;
 

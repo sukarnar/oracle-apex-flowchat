@@ -8,6 +8,8 @@ drop package fc_engine;
 drop package fc_data;
 drop table fc_demo_loan_apps purge;
 drop table fc_demo_outbox purge;
+drop table fc_demo_branches purge;
+drop table fc_lovs purge;
 drop table fc_demo_customers purge;
 drop table fc_data_source_fields purge;
 drop table fc_data_sources purge;

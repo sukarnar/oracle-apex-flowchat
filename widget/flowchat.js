@@ -213,6 +213,10 @@
     '.pick-title{font-weight:600;font-size:14px}.pick-sub{font-size:12.5px;color:var(--fc-muted)}',
     '.chip.changed{background:color-mix(in srgb,var(--fc-accent) 12%,transparent)}',
     '.chip:disabled{border-color:var(--fc-border);color:var(--fc-muted);cursor:not-allowed;background:transparent}',
+    '.optlist{display:flex;flex-direction:column;max-height:200px;overflow-y:auto;border:1px solid var(--fc-border);border-radius:10px;margin-bottom:8px}',
+    '.opt{font:inherit;font-size:14px;text-align:left;padding:8px 12px;border:0;border-bottom:1px solid var(--fc-border);background:var(--fc-bg);color:var(--fc-text);cursor:pointer}',
+    '.opt:last-child{border-bottom:0}.opt:hover,.opt:focus-visible,.opt.cur{background:color-mix(in srgb,var(--fc-accent) 12%,var(--fc-bg));outline:none}',
+    '.opt.cur{font-weight:600}.optnone{padding:8px 12px;font-size:13px;color:var(--fc-muted)}',
     '@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}'
   ].join('');
 
@@ -441,6 +445,55 @@
       c.append(b);
     }
 
+    _renderOptionList(c, a, spec) {
+      var opts = spec.options || [];
+      var box = h('div', 'optlist'); box.setAttribute('role', 'listbox');
+      box.setAttribute('aria-label', a.label || a.slot);
+      var form = h('form');
+      var inp = h('input'); inp.type = 'text'; inp.autocomplete = 'off';
+      inp.setAttribute('aria-label', 'Search ' + (a.label || a.slot));
+      inp.placeholder = spec.placeholder || 'Type to search ' + opts.length + ' options...';
+      var shown = [];
+      var pick = (o) => this.send({ value: o.value }, o.label || o.value);
+      var draw = () => {
+        var t = inp.value.trim().toLowerCase();
+        box.textContent = '';
+        shown = opts.filter((o) => !t || String(o.label || o.value).toLowerCase().indexOf(t) >= 0 || String(o.value).toLowerCase() === t);
+        shown.slice(0, 200).forEach((o) => {
+          var b = h('button', 'opt' + (a.value !== null && a.value !== undefined && String(a.value) === String(o.value) ? ' cur' : ''), o.label || o.value);
+          b.type = 'button'; b.setAttribute('role', 'option');
+          b.addEventListener('click', () => pick(o));
+          box.append(b);
+        });
+        if (!shown.length) box.append(h('div', 'optnone', opts.length ? 'No match. Try fewer letters.' : 'Nothing to choose from.'));
+        else if (shown.length > 200) box.append(h('div', 'optnone', (shown.length - 200) + ' more: keep typing to narrow it down.'));
+      };
+      inp.addEventListener('input', draw);
+      inp.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowDown' && box.firstChild && box.firstChild.focus) { e.preventDefault(); box.firstChild.focus(); }
+      });
+      box.addEventListener('keydown', (e) => {
+        var el = e.target;
+        if (e.key === 'ArrowDown' && el.nextSibling && el.nextSibling.focus) { e.preventDefault(); el.nextSibling.focus(); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); (el.previousSibling && el.previousSibling.focus ? el.previousSibling : inp).focus(); }
+      });
+      var send = h('button', 'btn primary send'); send.type = 'submit'; send.innerHTML = ICON_SEND;
+      send.setAttribute('aria-label', 'Send');
+      form.append(inp, send);
+      form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        // Enter picks the only (or an exact) match; otherwise the server explains what it expects.
+        var t = inp.value.trim().toLowerCase();
+        var exact = shown.find((o) => String(o.label || o.value).toLowerCase() === t || String(o.value).toLowerCase() === t);
+        if (exact || shown.length === 1) pick(exact || shown[0]);
+        else if (t) this.send({ value: inp.value.trim() }, inp.value.trim());
+        else inp.focus();
+      });
+      draw();
+      c.append(box, form);
+      return inp;
+    }
+
     _renderComposer(turn) {
       var c = this._composer; c.textContent = '';
       if (turn.status !== 'in_progress' || !turn['await']) {
@@ -479,6 +532,9 @@
         var done = h('button', 'btn primary', a.doneLabel || 'Done'); done.type = 'button';
         done.addEventListener('click', () => this.send({ command: 'done' }, a.doneLabel || 'Done'));
         c.append(fchips, done);
+      } else if (spec.kind === 'choice' && (spec.display === 'list' || (spec.display !== 'buttons' && (spec.options || []).length > 8))) {
+        // Long lists (usually lookup lists from the server): type to filter, then pick.
+        focusEl = this._renderOptionList(c, a, spec);
       } else if (spec.kind === 'choice' || spec.kind === 'yesno') {
         var chips = h('div', 'chips');
         var opts = spec.kind === 'yesno' ? [{ value: 'yes', label: 'Yes' }, { value: 'no', label: 'No' }] : (spec.options || []);

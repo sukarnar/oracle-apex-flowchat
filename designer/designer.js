@@ -12,7 +12,7 @@
   function boot() {
 
   // ======================================================================== constants
-  const VERSION = '1.4.0 (phase D: verify step)';
+  const VERSION = '1.5.0 (phase D: verify step, lookup lists)';
   const NODE_W = 230;
   const STORE_KEY = 'flowchat-designer:v1';
 
@@ -108,7 +108,7 @@
     </aside>
   </div>
   <div class="toast" id="fcd-toast" role="status" aria-live="polite"></div>`;
-  const KINDS = [['text', 'Text'], ['email', 'Email'], ['number', 'Number'], ['date', 'Date'], ['choice', 'Choice (buttons)'], ['yesno', 'Yes / No']];
+  const KINDS = [['text', 'Text'], ['email', 'Email'], ['number', 'Number'], ['date', 'Date'], ['choice', 'Choice'], ['yesno', 'Yes / No']];
   const OPS = [['=', 'equals'], ['!=', 'not equal'], ['>', '>'], ['>=', '≥'], ['<', '<'], ['<=', '≤'], ['in', 'is one of'], ['empty', 'is empty'], ['notEmpty', 'is filled']];
 
   const TYPES = {
@@ -183,6 +183,22 @@
   // Public-page variant (db/10_verify_demo.sql): same table, rows limited to the verified email.
   DEFAULT_CATALOG.loan_apps_public = Object.assign(JSON.parse(JSON.stringify(DEFAULT_CATALOG.loan_apps)),
     { rowFilter: 'upper(t.email) = upper(:FC_VERIFIED)' });
+  // Test options for the sample lookup lists (db/12_lov_demo.sql), so the Test tab works without a database.
+  // A row field named like a parameter ("country") filters the rows by that parameter.
+  const DEFAULT_LOV_ROWS = (function () {
+    const b = [['AU', 'Australia', 101, 'Sydney CBD'], ['AU', 'Australia', 102, 'Melbourne Collins St'], ['BR', 'Brazil', 111, 'São Paulo Paulista'],
+      ['CA', 'Canada', 121, 'Toronto Bay St'], ['CA', 'Canada', 122, 'Vancouver Burrard'], ['CA', 'Canada', 123, 'Montréal Centre-Ville'],
+      ['DE', 'Germany', 131, 'Berlin Mitte'], ['DE', 'Germany', 132, 'Frankfurt Zeil'], ['FR', 'France', 141, 'Paris Opéra'],
+      ['IN', 'India', 151, 'Mumbai Fort'], ['IN', 'India', 152, 'Bengaluru MG Road'], ['IN', 'India', 153, 'Delhi Connaught Place'],
+      ['IE', 'Ireland', 161, 'Dublin Grafton St'], ['JP', 'Japan', 171, 'Tokyo Marunouchi'], ['MX', 'Mexico', 181, 'Mexico City Reforma'],
+      ['NZ', 'New Zealand', 191, 'Auckland Queen St'], ['SG', 'Singapore', 201, 'Singapore Raffles Place'],
+      ['GB', 'United Kingdom', 211, 'London City'], ['GB', 'United Kingdom', 212, 'Manchester Spinningfields'],
+      ['US', 'United States', 221, 'New York Midtown'], ['US', 'United States', 222, 'Chicago Loop'], ['US', 'United States', 223, 'San Francisco FiDi']];
+    const countries = [];
+    b.forEach((r) => { if (!countries.some((c) => c.value === r[0])) countries.push({ value: r[0], label: r[1] }); });
+    countries.sort((x, y) => x.label.localeCompare(y.label));
+    return { countries, branches: b.map((r) => ({ value: String(r[2]), label: r[3], country: r[0] })) };
+  })();
   const SEARCH_OPS = [['eq', 'equals'], ['starts', 'starts with'], ['contains', 'contains'], ['gte', '≥'], ['lte', '≤']];
   const FIELD_TYPES = ['VARCHAR2', 'NUMBER', 'DATE'];
 
@@ -193,6 +209,7 @@
     db: { flowId: null, version: null, status: null, dirty: false, savedAt: null },
     dbCatalog: null,      // source id -> signature of the definition last read from / saved to the database
     dbConnectors: null,   // [{id, type, description}] registered in FC_CONNECTORS
+    dbLovs: null,         // [{id, type, description, query, params}] registered in FC_LOVS (null: unknown)
     undo: [], redo: [], lastKey: null, lastTime: 0, tab: 'props', drag: null, testStale: false
   };
 
@@ -394,6 +411,20 @@
     while (used.indexOf(base + '_' + i) >= 0) i++;
     return base + '_' + i;
   }
+  // Lookup lists used by choice answers: id -> [{ where: node id, spec }]
+  function lovUses() {
+    const out = {};
+    const add = (spec, where) => {
+      if (spec && spec.kind === 'choice' && 'optionsFrom' in spec && spec.optionsFrom) (out[spec.optionsFrom] = out[spec.optionsFrom] || []).push({ where, spec });
+    };
+    S.flow.nodes.forEach((n) => {
+      if (n.type === 'ask') add(n.input, n.id);
+      if (n.type === 'changeFields') (n.fields || []).forEach((f) => add(f.input, n.id));
+    });
+    return out;
+  }
+  function dbLov(id) { return (S.dbLovs || []).find((l) => l.id === id) || null; }
+
   function connectorUses() {
     const map = {};
     S.flow.nodes.forEach((n) => {
@@ -621,6 +652,29 @@
         if (v.type === 'server' && !v.connector) add('error', 'Server check has no connector.', nodeId);
       });
     };
+    // Choice answers: fixed options, or a lookup list with its parameters.
+    const checkChoice = (spec, nodeId, what) => {
+      if (spec.kind !== 'choice') return;
+      if (!('optionsFrom' in spec)) {
+        if (!(spec.options || []).length) add('error', what + ' has no options.', nodeId);
+        return;
+      }
+      if (!spec.optionsFrom) { add('error', what + ' has no lookup list selected.', nodeId); return; }
+      if (!/^[A-Za-z][A-Za-z0-9_]{0,99}$/.test(spec.optionsFrom)) add('error', 'Lookup list id "' + spec.optionsFrom + '" must be letters, digits and _.', nodeId);
+      const params = spec.optionsParams || {};
+      Object.keys(params).forEach((k) => {
+        if (!/^[a-z][a-z0-9_]{0,29}$/.test(k)) add('error', 'Parameter name "' + k + '" must be lowercase letters, digits and _ (up to 30).', nodeId);
+        if (!params[k]) add('error', 'Parameter "' + k + '" of ' + spec.optionsFrom + ' has no answer selected.', nodeId);
+        else if (slots.indexOf(params[k]) < 0) add('warning', 'Parameter "' + k + '" uses "' + params[k] + '", which is never asked or loaded.', nodeId);
+      });
+      const reg = dbLov(spec.optionsFrom);
+      if (reg) {
+        (reg.params || []).forEach((p) => { if (!(p in params)) add('error', 'Lookup list "' + spec.optionsFrom + '" needs the parameter :' + p.toUpperCase() + '.', nodeId); });
+        Object.keys(params).forEach((k) => {
+          if (reg.type === 'SQL' && (reg.params || []).indexOf(k) < 0) add('warning', 'Lookup list "' + spec.optionsFrom + '" doesn\'t use :' + k.toUpperCase() + '.', nodeId);
+        });
+      }
+    };
     const checkCond = (c, nodeId) => {
       if (!c) { add('error', 'A branch has no condition.', nodeId); return; }
       if (c.all || c.any) { (c.all || c.any).forEach((x) => checkCond(x, nodeId)); return; }
@@ -642,7 +696,7 @@
           else if (!/^[a-z][a-z0-9_]{0,99}$/.test(n.slot)) add('error', 'Field name "' + n.slot + '" must be lowercase letters, digits and _.', n.id);
           if (!n.prompt) add('error', 'Ask has no question text.', n.id);
           placeholders(n.prompt, n.id);
-          if (spec.kind === 'choice' && !(spec.options || []).length) add('error', 'Choice question has no options.', n.id);
+          checkChoice(spec, n.id, 'Choice question');
           if (spec.kind === 'number' && isFilled(spec.min) && isFilled(spec.max) && spec.min > spec.max) add('error', 'Minimum is greater than maximum.', n.id);
           checkValidators(n.validators, n.id);
           break;
@@ -727,7 +781,7 @@
             if (sourceDef(srcId) && !sf) add('error', '"' + fd.field + '" is not a field of ' + srcId + '.', n.id);
             else if (sf && !sf.updatable) add('error', '"' + fd.field + '" is not updatable in ' + srcId + '; the server would refuse the change.', n.id);
             const spec = fd.input || {};
-            if (spec.kind === 'choice' && !(spec.options || []).length) add('error', 'Choice field "' + fd.field + '" has no options.', n.id);
+            checkChoice(spec, n.id, 'Choice field "' + fd.field + '"');
             checkValidators(fd.validators, n.id);
             if (fd.editableWhen) checkCond(fd.editableWhen, n.id);
             placeholders(fd.prompt, n.id);
@@ -765,6 +819,12 @@
       const registered = S.dbConnectors.map((c) => c.id);
       Object.keys(connectorUses()).forEach((c) => {
         if (registered.indexOf(c) < 0) add('warning', 'Connector "' + c + '" is not registered in FC_CONNECTORS on the server.');
+      });
+    }
+    if (BACKEND && S.dbLovs) {
+      const lu = lovUses();
+      Object.keys(lu).forEach((id) => {
+        if (!dbLov(id)) add('error', 'Lookup list "' + id + '" is not in FC_LOVS on the server.', lu[id][0].where);
       });
     }
     if (BACKEND && S.dbCatalog) {
@@ -1306,9 +1366,90 @@
         F('Min length', bound(() => spec.minLength, (v) => setIn('minLength', numOrNull(v)), { type: 'number', key: kp + '.minl' })),
         F('Max length', bound(() => spec.maxLength, (v) => setIn('maxLength', numOrNull(v)), { type: 'number', key: kp + '.maxl' }))));
     } else if (kind === 'choice') {
-      box.append(optionsEditor(o, kp));
+      box.append(choiceEditor(o, kp));
     }
     return box;
+  }
+
+  // Where a choice's options come from: a fixed list, or a lookup list (FC_LOVS) with parameters.
+  function choiceEditor(o, kp) {
+    const spec = o.input;
+    const fromList = 'optionsFrom' in spec;
+    const wrap = h('div');
+    wrap.append(h('div', { class: 'grid2' },
+      F('Options come from', sel([['fixed', 'A fixed list'], ['lov', 'A lookup list (database)']], fromList ? 'lov' : 'fixed', (v) => mutate(() => {
+        if (v === 'lov') { o.input.optionsFrom = ''; delete o.input.options; }
+        else {
+          delete o.input.optionsFrom; delete o.input.optionsParams; delete o.input.staleMessage; delete o.input.emptyMessage;
+          o.input.options = [{ value: 'A', label: 'Option A' }, { value: 'B', label: 'Option B' }];
+        }
+      }, { panel: true }))),
+      F('Show as', sel([['auto', 'Automatic'], ['buttons', 'Buttons'], ['list', 'Searchable list']], spec.display || 'auto',
+        (v) => mutate(() => { if (v === 'auto') delete o.input.display; else o.input.display = v; })),
+        'Automatic: buttons for up to 8 options, a searchable list above that.')));
+    if (!fromList) { wrap.append(optionsEditor(o, kp)); return wrap; }
+
+    const reg = dbLov(spec.optionsFrom);
+    const hint = !spec.optionsFrom ? 'The id of a list registered in FC_LOVS on the server.'
+      : reg ? (reg.description ? reg.description + ' · ' : '') + (reg.type === 'SQL' ? reg.query : 'PL/SQL ' + reg.target)
+      : BACKEND && S.dbLovs ? 'Not registered in FC_LOVS on the server.'
+      : 'Registered in FC_LOVS on the server. In the Test tab you can set test options for it.';
+    wrap.append(F('Lookup list', lovInput(() => spec.optionsFrom, (v) => { o.input.optionsFrom = v.trim(); }, kp + '.lov'), hint));
+
+    const params = spec.optionsParams || {};
+    const names = Object.keys(params);
+    ((reg && reg.params) || []).forEach((p) => { if (names.indexOf(p) < 0) names.push(p); });
+    const slots = knownSlots();
+    const setParam = (p, v) => {
+      o.input.optionsParams = o.input.optionsParams || {};
+      o.input.optionsParams[p] = v;
+    };
+    const card = h('div', { class: 'card' }, h('div', { class: 'card-h' }, h('span', { class: 'grow', text: 'Parameters' }),
+      h('span', { class: 'hint', text: 'earlier answers, bound as :NAME' })));
+    if (!names.length) card.append(h('p', { class: 'hint', style: 'margin:0 0 6px', text: 'None. Add one when the list depends on an earlier answer (for example the country).' }));
+    names.forEach((p) => {
+      const opts = [['', '— choose an answer —']].concat(slots.map((x) => [x, x]));
+      if (params[p] && slots.indexOf(params[p]) < 0) opts.push([params[p], params[p] + ' (unknown)']);
+      card.append(h('div', { class: 'rowx' },
+        h('span', { class: 'mono', style: 'min-width:90px', text: ':' + p.toUpperCase() }),
+        sel(opts, params[p] || '', (v) => mutate(() => setParam(p, v), { panel: true }), { mono: true }),
+        h('button', { class: 'x', title: 'Remove', text: '×', onclick: () => mutate(() => {
+          if (!o.input.optionsParams) return;
+          delete o.input.optionsParams[p];
+          if (!Object.keys(o.input.optionsParams).length) delete o.input.optionsParams;
+        }, { panel: true }) })));
+    });
+    const nameIn = h('input', { class: 'in mono', placeholder: 'parameter_name' });
+    card.append(h('div', { class: 'rowx' }, nameIn, h('button', { class: 'lnk', text: '+ Add parameter', onclick: () => {
+      const v = nameIn.value.trim().toLowerCase();
+      if (!/^[a-z][a-z0-9_]{0,29}$/.test(v)) { toast('Use lowercase letters, digits and _ (up to 30), starting with a letter.'); return; }
+      mutate(() => setParam(v, (o.input.optionsParams || {})[v] || ''), { panel: true });
+    } })));
+    wrap.append(card);
+    wrap.append(h('div', { class: 'grid2' },
+      F('If an earlier answer changed', bound(() => spec.staleMessage, (v) => setOrDelete(o.input, 'staleMessage', v),
+        { key: kp + '.stale', placeholder: 'Your earlier answer is no longer one of the options. Please choose again.' })),
+      F('If the list is empty', bound(() => spec.emptyMessage, (v) => setOrDelete(o.input, 'emptyMessage', v),
+        { key: kp + '.empty', placeholder: "There's nothing to choose from here right now." }))));
+    return wrap;
+  }
+
+  function lovInput(get, set, key) {
+    const listId = 'fcd-lovlist';
+    let dl = document.getElementById(listId);
+    if (!dl) { dl = h('datalist', { id: listId }); ROOT.append(dl); }
+    dl.textContent = '';
+    const ids = Object.keys(lovUses());
+    (S.dbLovs || []).forEach((l) => { if (ids.indexOf(l.id) < 0) ids.push(l.id); });
+    if (!BACKEND) Object.keys(DEFAULT_LOV_ROWS).forEach((l) => { if (ids.indexOf(l) < 0) ids.push(l); });
+    ids.forEach((id) => {
+      const reg = dbLov(id);
+      dl.append(h('option', { value: id, label: reg ? (reg.description || reg.type) : DEFAULT_LOV_ROWS[id] ? 'sample list' : 'used in this flow' }));
+    });
+    const el = bound(get, set, { mono: true, key, placeholder: 'list_id', panel: false });
+    el.setAttribute('list', listId);
+    el.addEventListener('change', () => renderProps());
+    return el;
   }
 
   function optionsEditor(n, keyPrefix) {
@@ -1869,7 +2010,27 @@
     const uses = connectorUses();
     const ids = Object.keys(uses);
     const srcs = sourceUses();
-    if (!ids.length && !srcs.length) { box.append(h('p', { class: 'hint', text: 'This flow calls no connectors or data sources.' })); return; }
+    const lvs = Object.keys(lovUses());
+    if (!ids.length && !srcs.length && !lvs.length) { box.append(h('p', { class: 'hint', text: 'This flow calls no connectors, data sources or lookup lists.' })); return; }
+    lvs.forEach((id) => {
+      const card = h('div', { class: 'card mock' },
+        h('div', { class: 'card-h' }, h('span', { class: 'mono grow', text: id }), h('span', { class: 'chip', text: 'lookup list' })));
+      if (lovLive(id)) {
+        card.append(h('p', { class: 'hint', text: 'Options come from FC_LOVS in the database (read only).' }));
+      } else {
+        const ta = h('textarea', { class: 'in', rows: 5, spellcheck: 'false' });
+        ta.value = lovMockText(id);
+        const check = () => {
+          let okay = true;
+          try { okay = Array.isArray(JSON.parse(ta.value)); } catch (e) { okay = false; }
+          ta.classList.toggle('bad', !okay);
+        };
+        ta.addEventListener('input', () => { S.mocks[lovMockKey(id)] = ta.value; check(); save(); });
+        check();
+        card.append(h('p', { class: 'hint', text: 'Test options: [{"value", "label"}]. A field named like a parameter (e.g. "country") limits a row to that value. Restart the test to apply changes.' }), ta);
+      }
+      box.append(card);
+    });
     ids.forEach((id) => {
       const role = uses[id];
       const ta = h('textarea', { class: 'in', rows: 4, spellcheck: 'false' });
@@ -1967,6 +2128,30 @@
     return testSources;
   }
 
+  // Database mode with the list registered: real options from FC_LOVS. Otherwise the test rows below.
+  const lovMockKey = (id) => 'lov:' + id;
+  function lovMockText(id) {
+    const k = lovMockKey(id);
+    if (S.mocks[k] !== undefined) return S.mocks[k];
+    const rows = DEFAULT_LOV_ROWS[id] || [{ value: 'A', label: 'Option A' }, { value: 'B', label: 'Option B' }];
+    return '[\n' + rows.map((r) => '  ' + JSON.stringify(r)).join(',\n') + '\n]';
+  }
+  function lovLive(id) { return !!(BACKEND && dbLov(id)); }
+  function buildTestLovs() {
+    const out = {};
+    Object.keys(lovUses()).forEach((id) => {
+      out[id] = (req) => {
+        if (lovLive(id)) return BACKEND.call('lovOptions', { id, params: req.params });
+        let rows;
+        try { rows = JSON.parse(lovMockText(id)); } catch (e) { throw new Error('The test options for "' + id + '" are not valid JSON.'); }
+        if (!Array.isArray(rows)) throw new Error('The test options for "' + id + '" must be a JSON array.');
+        // A row field named like a parameter filters by it (e.g. "country" for :COUNTRY).
+        return rows.filter((r) => Object.keys(req.params || {}).every((p) => !(p in r) || String(r[p]) === String(req.params[p])));
+      };
+    });
+    return out;
+  }
+
   function runTest() {
     const flow = clone(S.flow);
     const uses = connectorUses();
@@ -1981,7 +2166,7 @@
         return res;
       };
     });
-    testEngine = FlowChatEngine.createEngine({ flows: [flow], connectors, dataSources: buildTestSources() });
+    testEngine = FlowChatEngine.createEngine({ flows: [flow], connectors, dataSources: buildTestSources(), lovs: buildTestLovs() });
     const chat = $('simChat');
     chat.setAttribute('flow', flow.flowId || 'draft');
     chat.configure({ transport: new FlowChat.LocalTransport(testEngine), adapter: new FlowChat.NoneAdapter() });
@@ -2145,6 +2330,8 @@
         if (!localEdited) cat[id] = Object.assign(clone(dbDef), { sampleRows: (local && local.sampleRows) || [] });
       });
       S.dbConnectors = res[1] || [];
+      // Older FC_DESIGNER packages have no listLovs: then lookup lists simply aren't checked.
+      try { S.dbLovs = (await BACKEND.call('listLovs')) || []; } catch (e) { S.dbLovs = null; }
       save();
       renderCanvas();
       renderCheck();

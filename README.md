@@ -13,11 +13,12 @@ flows/      loan_application.json    sample "create" flow (collect answers, subm
 designer/   index.html               visual flow designer (no dependencies)
 widget/     flowchat.js              <flow-chat> Web Component + transports + adapters (no dependencies)
             flowchat-engine.js       reference engine in JS (demo, simulator, Node backends)
-db/         install.sql              first-time install: runs 01..07, 09, 10, 11 in order (08 ORDS is optional)
-            upgrade_phase_d.sql      upgrades an existing install with the Verify step (keeps your data)
+db/         install.sql              first-time install: runs 01..07, 09..12 in order (08 ORDS is optional)
+            upgrade_phase_d.sql      upgrades an existing install with Phase D: Verify step, lookup lists (keeps your data)
             reinstall_packages.sql   re-creates FC_DATA, FC_ENGINE, FC_DESIGNER only (upgrades, compile fixes)
             01_tables.sql            FC_FLOWS, FC_FLOW_VERSIONS, FC_CONNECTORS, FC_SESSIONS, FC_EVENTS
             02_data_sources.sql      FC_DATA_SOURCES (+ fields) registry tables
+            02c_lovs.sql             FC_LOVS: lookup lists for choice answers (SQL or PL/SQL)
             02b_fc_data.sql          FC_DATA package (search / get / update); re-runnable
             03/04_fc_engine.*        PL/SQL engine (server-authoritative)
             05_demo_connectors.sql   sample lookup / validator / submit connectors + demo tables
@@ -27,12 +28,16 @@ db/         install.sql              first-time install: runs 01..07, 09, 10, 11
             09_fc_designer.sql       FC_DESIGNER: back end for the designer hosted in APEX
             10_verify_demo.sql       send_code connector, FC_DEMO_OUTBOX, "loan_apps_public" data source
             11_seed_public_flow.sql  generated: publishes update_application_public
+            12_lov_demo.sql          FC_DEMO_BRANCHES and the lookup lists "countries" and "branches"
+            13_seed_loan_flow.sql    generated: publishes loan_application (used by the upgrade only)
 demo/       index.html               create demo (runs in the browser using the JS engine)
             update.html              search and update demo, with a live table and a conflict button
             verify.html              public-page demo: one-time code first, with an in-page outbox
+            demo-lovs.js             in-browser stand-ins for the "countries" and "branches" lookup lists
 tests/      engine.test.js           node tests/engine.test.js
             update.test.js           node tests/update.test.js
             verify.test.js           node tests/verify.test.js
+            lov.test.js              node tests/lov.test.js
             apex-embed-test.html     designer inside a page-wide form, like APEX
             apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
             fake-apex-backend.js     emulates the FC_DESIGNER Ajax protocol in the browser (testing only)
@@ -240,6 +245,9 @@ reference is in `flows/flow.schema.json`, and `flows/loan_application.json` uses
   Constraints: `required` (on by default), `min`, `max`, `minLength`, `maxLength`, `minDate`, `maxDate`.
   `validators`: `{type:"regex", pattern, message}` or `{type:"server", connector}`. Write regex
   patterns that work in both JavaScript and Oracle (avoid lookaheads).
+- **choice** options are either fixed (`options: [{value, label}]`) or come from a **lookup list**
+  in the database (`optionsFrom`). See *Lookup lists* below. `display` is `auto` (buttons for up to
+  8 options, a searchable list above that), `buttons` or `list`.
 - **condition** `when`: `{slot, op, value}` where op is `= != > >= < <= in empty notEmpty`, combined
   with `all`, `any` or `not`. Conditions are structured JSON rather than expressions, so there is
   no expression evaluator to secure.
@@ -249,6 +257,52 @@ reference is in `flows/flow.schema.json`, and `flows/loan_application.json` uses
   payload to a URL.
 - **Context:** values passed at start (the `context` attribute) whose names match a slot
   pre-fill that slot.
+
+### Lookup lists (choice options from the database)
+
+Instead of typing the options into the flow, point a choice at a list registered in `FC_LOVS`:
+
+```json
+{ "id": "ask_country", "type": "ask", "slot": "country", "prompt": "Which country do you live in?",
+  "input": { "kind": "choice", "optionsFrom": "countries", "display": "list" }, "next": "ask_branch" },
+{ "id": "ask_branch", "type": "ask", "slot": "branch", "prompt": "Which branch should handle your application?",
+  "input": { "kind": "choice", "optionsFrom": "branches", "optionsParams": { "country": "country" } }, "next": "..." }
+```
+
+Register each list once, on the server:
+
+```sql
+insert into fc_lovs (lov_id, lov_type, query, description)
+values ('branches', 'SQL',
+        'select branch_id, branch_name from fc_demo_branches where country_code = :COUNTRY order by branch_name',
+        'Branches in one country');
+```
+
+- **SQL lists:** the first two columns are the value and the label; at most 500 rows are used.
+  Binds: `:APP_USER`, `:FC_VERIFIED`, and one `:NAME` per entry in `optionsParams`
+  (`{"country": "country"}` binds the answer `country` as `:COUNTRY`). The value of a parameter can be
+  any answer or a loaded record field (`app.country`).
+  **PLSQL lists:** `lov_type = 'PLSQL'`, `target` = `function f(p_payload clob) return clob`, which receives
+  `{"lov", "params", "appUser", "verified", "context"}` and returns `[{"value", "label"}]`.
+- The flow only names the list. The SQL never reaches the browser, and parameters are always bound,
+  never concatenated.
+- Lists are read again on every turn, so they are always current. A list whose parameters aren't all
+  answered yet has no options.
+- The server checks every answer against the list, and checks again before submit.
+- **Depends on an earlier answer:** if that answer changes (Back, or Edit from the summary) and the
+  saved choice is no longer offered, the question is asked again with `staleMessage`.
+  `emptyMessage` is shown when a list has no options.
+- Works the same for **Change fields** fields (`fields[].input.optionsFrom`). Record fields show their label.
+- **In the designer:** set the answer type to *Choice*, then *Options come from: A lookup list*. Pick
+  the list and map each parameter to an earlier answer. In database mode the designer reads `FC_LOVS`,
+  so it lists the parameters each SQL list needs and flags unknown lists or missing parameters. The
+  Test tab then uses the real options. In the standalone designer, the Test tab uses test options that
+  you can edit (a row field named like a parameter, for example `"country"`, filters by it).
+- **JavaScript engine / Node:** pass `lovs: { id: (req) => [{value, label}] }` to `createEngine`
+  (`req` = `{lov, params, context, verified}`; it may return a Promise). See `demo/demo-lovs.js`.
+
+The `loan_application` sample now asks for a country, using a searchable list of 13 countries, and then
+a branch in that country, filtered by `:COUNTRY`.
 
 Built-in conversation behaviour:
 - **Back:** returns to the previous question.
@@ -336,9 +390,11 @@ between the question that captures the email (or phone) and **Find record**.
   Data sources whose row filter uses `:FC_VERIFIED` return no sample rows in the Data tab, because
   nothing is verified there.
 
-**Upgrading an existing install:** from the `db` folder run `@upgrade_phase_d.sql`. It re-creates the
-packages, adds the demo connector and data source, and publishes the sample flow. Tables and data are kept.
-Then upload the new `flowchat.js` and `designer.js` (APEX static files), and add
+**Upgrading an existing install:** from the `db` folder run `@upgrade_phase_d.sql`. It creates
+`FC_LOVS` (and the demo table `FC_DEMO_BRANCHES`), re-creates the packages, adds the demo connector,
+data source and lookup lists, and publishes `update_application_public` and a new version of
+`loan_application`, which now asks for a country and a branch. Tables and data are kept, and the
+script is safe to re-run. Then upload the new `flowchat.js` and `designer.js` (APEX static files), and add
 `update_application_public` to a page without authentication the same way as the other flows.
 
 **Security:** record keys never reach the browser. Search results are sent as opaque tokens
@@ -350,6 +406,9 @@ Turn-protocol additions:
   (`fields: [{field, label, display, changed, editable, reason}]`). When editing a single field it's an
   `ask` with `sub: true`.
 - New input payloads: `{"pick": "r1"}`, `{"pick": null}`, `{"field": "phone"}` and `{"command": "done"}`.
+- Choice inputs arrive with their `options` already resolved (lookup lists included); `optionsFrom` and
+  `optionsParams` are not sent. `display: "list"` (or more than 8 options) makes the widget show a
+  searchable list instead of buttons.
 - Verify step: an `ask` with `secret: true` (the widget echoes dots instead of the code), input hints
   (`inputMode`, `autocomplete: "one-time-code"`, `maxLength`) and `actions: [{command: "resend", label}]`,
   which the widget shows as links. Input `{"command": "resend"}` sends a new code.
@@ -371,11 +430,11 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 26 unit tests (`tests/engine.test.js`,
-  `tests/update.test.js`, `tests/verify.test.js`), plus manual end-to-end runs of the demos.
-- **The Phase D Verify step in PL/SQL (`FC_ENGINE`, `FC_DATA`, `10_verify_demo.sql`) has not been
-  compiled yet.** It mirrors the JavaScript engine, which is tested. Expect possible small compile
-  fixes when you run `upgrade_phase_d.sql`.
+- The JavaScript engine and widget are tested: 35 unit tests (`tests/engine.test.js`,
+  `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`), plus manual end-to-end runs of the demos.
+- **The Phase D PL/SQL (Verify step and lookup lists in `FC_ENGINE`, `FC_DATA`, `FC_DESIGNER`,
+  `02c_lovs.sql`, `10_verify_demo.sql`, `12_lov_demo.sql`) has not been compiled yet.** It mirrors the
+  JavaScript engine, which is tested. Expect possible small compile fixes when you run `upgrade_phase_d.sql`.
 - Phases 1 to C (`FC_ENGINE`, `FC_DATA`, `FC_DESIGNER`) have been installed and run on Oracle with APEX,
   including the designer's database mode.
 - **Standalone designer:** without `data-backend="apex"`, the data source catalog is local. Keep it
