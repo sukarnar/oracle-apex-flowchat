@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Designer DB Test</title>
+<!--
+  The designer in database mode (data-backend="apex") against tests/fake-apex-backend.js, which
+  emulates the FC_DESIGNER Ajax Callback. Like APEX, the whole page is one <form>.
+  Console helpers: FakeApex.reset(), FakeApex.otherDesignerSaves('loan_application'), FakeApex.db
+-->
+<link rel="stylesheet" href="../designer/designer.css">
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; background: #e9ecef; }
+  .t-Header { background: #1f3a5f; color: #fff; padding: 10px 20px; font-weight: 600; display: flex; gap: 12px; align-items: center; }
+  .t-Header small { font-weight: 400; opacity: .8; }
+  .t-Header button { margin-left: auto; font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 6px; border: 0; cursor: pointer; }
+  .t-Region { margin: 12px; background: #fff; border: 1px solid #ccc; }
+  #status { padding: 6px 14px; font-size: 13px; }
+  #status.bad { background: #fdecea; color: #b42318; } #status.ok { background: #e7f6ee; color: #067647; }
+</style>
+</head>
+<body>
+<form id="wwvFlowForm" action="" method="get" novalidate>
+  <input type="hidden" name="submitted" value="yes">
+  <div class="t-Header">Fake APEX app <small>designer page with FC_DESIGNER callback (simulated)</small>
+    <button type="button" onclick="FakeApex.reset().then(() => { localStorage.removeItem('flowchat-designer:v1'); location.reload(); })">Reset fake database</button>
+  </div>
+  <div id="status"></div>
+  <div class="t-Region">
+    <div id="fcd-root" data-backend="apex" data-process="FC_DESIGNER" data-flows-base="../flows/" style="--fcd-height: calc(100vh - 90px)"></div>
+  </div>
+</form>
+<script>
+  (function () {
+    var s = document.getElementById('status');
+    var submitted = new URLSearchParams(location.search).has('submitted');
+    s.className = submitted ? 'bad' : 'ok';
+    s.textContent = submitted ? 'FAIL: the page form was submitted (page reloaded).' : 'OK: no page submit so far.';
+  })();
+</script>
+<script src="fake-apex-backend.js"></script>
+<script src="../widget/flowchat-engine.js"></script>
+<script src="../widget/flowchat.js"></script>
+<script src="../designer/designer.js"></script>
+</body>
+</html>

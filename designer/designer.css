@@ -183,6 +183,28 @@
 .fcd .mock pre.state { margin-top: 8px; max-height: 140px; font-size: 11px; }
 .fcd .mock textarea { font-family: var(--mono); font-size: 12px; min-height: 70px; }
 
+/* database status, dialogs */
+.fcd .db-status { font-size: 12px; padding: 3px 9px; border-radius: 999px; white-space: nowrap; background: var(--chip); color: var(--muted); }
+.fcd .db-status.dirty { background: var(--warn-bg); color: var(--warn); }
+.fcd .db-status.pub { background: var(--ok-bg); color: var(--ok); }
+.fcd .db-status.saved { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); color: var(--accent); }
+.fcd .db-status[hidden] { display: none; }
+.fcd .modal-back { position: fixed; inset: 0; background: rgba(10, 15, 25, .45); display: grid; place-items: center; z-index: 900; padding: 16px; }
+.fcd .modal { width: min(560px, 94vw); max-height: 86vh; display: flex; flex-direction: column; background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 20px 60px rgba(0, 0, 0, .3); }
+.fcd .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px 10px; border-bottom: 1px solid var(--border); }
+.fcd .modal-body { padding: 14px 16px; overflow: auto; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+.fcd .modal-foot { padding: 10px 16px 14px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
+.fcd .modal-foot:empty { display: none; }
+.fcd .flow-list { display: flex; flex-direction: column; gap: 6px; max-height: 46vh; overflow: auto; }
+.fcd .flow-row { display: flex; align-items: center; gap: 10px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); text-align: left; }
+.fcd .flow-row.current { border-color: var(--accent); }
+.fcd .flow-row .grow { flex: 1; min-width: 0; }
+.fcd .flow-row .badges { display: flex; gap: 5px; margin-top: 4px; flex-wrap: wrap; }
+.fcd button.pick-row { cursor: pointer; width: 100%; font: inherit; color: var(--text); }
+.fcd button.pick-row:hover { border-color: var(--accent); }
+.fcd .cols { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 2px 12px; }
+.fcd .cols .check { margin-bottom: 4px; }
 .fcd .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px); background: var(--text); color: var(--bg);
   padding: 8px 14px; border-radius: 9px; font-size: 13px; opacity: 0; transition: .25s; pointer-events: none; z-index: 1000; }
 .fcd .toast.show { opacity: 1; transform: translateX(-50%); }

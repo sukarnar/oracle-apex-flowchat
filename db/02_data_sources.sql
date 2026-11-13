@@ -68,6 +68,10 @@ create or replace package fc_data authid definer as
                         p_original in json_object_t, p_changes in json_object_t,
                         p_context in json_object_t default null) return json_object_t;
   function is_updatable (p_source in varchar2, p_field in varchar2) return boolean;
+
+  -- First rows of a TABLE source (row_filter applied, nothing masked) for the designer's Test tab:
+  --   [{ "key": "...", "version": "...", "values": {...} }]. PLSQL sources return [].
+  function sample_rows (p_source in varchar2, p_limit in pls_integer default 20) return json_array_t;
 end fc_data;
 /
 
@@ -307,6 +311,55 @@ create or replace package body fc_data as
     end;
     return l_out;
   end search_rows;
+
+  function sample_rows (p_source in varchar2, p_limit in pls_integer default 20) return json_array_t is
+    l_src    fc_data_sources%rowtype;
+    l_fields t_fields;
+    l_binds  t_binds;
+    l_sql    varchar2(32767);
+    l_cur    integer;
+    l_n      integer;
+    l_key    varchar2(4000);
+    l_ver    varchar2(4000);
+    l_vals   clob;
+    l_row    json_object_t;
+    l_out    json_array_t := json_array_t();
+  begin
+    load_source(p_source, l_src, l_fields);
+    if l_src.source_type <> 'TABLE' then return l_out; end if;
+
+    l_sql := 'select to_char(t.' || dbms_assert.simple_sql_name(l_src.key_column) || '), ' ||
+             case when l_src.version_column is not null
+                  then 'to_char(t.' || dbms_assert.simple_sql_name(l_src.version_column) || ')' else 'null' end || ', ' ||
+             values_expr(l_fields) ||
+             ' from ' || dbms_assert.qualified_sql_name(l_src.object_name) || ' t where 1 = 1' || filter_sql(l_src) ||
+             ' fetch first ' || to_char(greatest(1, least(nvl(p_limit, 20), 100))) || ' rows only';
+
+    l_cur := dbms_sql.open_cursor;
+    begin
+      dbms_sql.parse(l_cur, l_sql, dbms_sql.native);
+      bind_all(l_cur, l_sql, l_binds);
+      dbms_sql.define_column(l_cur, 1, l_key, 4000);
+      dbms_sql.define_column(l_cur, 2, l_ver, 4000);
+      dbms_sql.define_column(l_cur, 3, l_vals);
+      l_n := dbms_sql.execute(l_cur);
+      while dbms_sql.fetch_rows(l_cur) > 0 loop
+        dbms_sql.column_value(l_cur, 1, l_key);
+        dbms_sql.column_value(l_cur, 2, l_ver);
+        dbms_sql.column_value(l_cur, 3, l_vals);
+        l_row := json_object_t();
+        l_row.put('key', l_key);
+        if l_ver is not null then l_row.put('version', l_ver); else l_row.put_null('version'); end if;
+        l_row.put('values', json_object_t.parse(l_vals));
+        l_out.append(l_row);
+      end loop;
+      dbms_sql.close_cursor(l_cur);
+    exception when others then
+      if dbms_sql.is_open(l_cur) then dbms_sql.close_cursor(l_cur); end if;
+      raise;
+    end;
+    return l_out;
+  end sample_rows;
 
   function get_row (p_source in varchar2, p_key in varchar2,
                     p_context in json_object_t default null) return json_object_t is

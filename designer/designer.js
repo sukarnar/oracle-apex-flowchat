@@ -34,6 +34,7 @@
   <header class="bar">
     <span class="brand">FlowChat Designer</span>
     <span class="flow-title" id="fcd-flowTitle"></span>
+    <span class="db-status" id="fcd-dbStatus" hidden></span>
     <button type="button" class="tb" id="fcd-btnNew" title="Start an empty flow">New</button>
     <button type="button" class="tb" id="fcd-btnOpen" title="Open a flow .json file">Open…</button>
     <button type="button" class="tb" id="fcd-btnSample" title="Load a sample flow">Samples ▾</button>
@@ -44,6 +45,8 @@
     <span class="sep"></span>
     <button type="button" class="tb" id="fcd-btnExport" title="Download the flow definition">Export JSON</button>
     <button type="button" class="tb primary" id="fcd-btnPublish" title="Download a SQL script that publishes this flow to Oracle">Publish SQL</button>
+    <button type="button" class="tb" id="fcd-btnSaveDb" title="Save to the database as a draft (not used by conversations yet)" hidden>Save draft</button>
+    <button type="button" class="tb primary" id="fcd-btnPublishDb" title="Publish to the database: new conversations use this version" hidden>Publish</button>
     <input type="file" id="fcd-fileInput" accept=".json,application/json" hidden>
   </header>
   <div class="main">
@@ -176,6 +179,10 @@
   // ======================================================================== state
   const S = {
     flow: null, sel: null, view: { x: 60, y: 50, z: 1 }, mocks: {}, catalog: null, dataSel: null,
+    // database state (APEX back end only)
+    db: { flowId: null, version: null, status: null, dirty: false, savedAt: null },
+    dbCatalog: null,      // source id -> signature of the definition last read from / saved to the database
+    dbConnectors: null,   // [{id, type, description}] registered in FC_CONNECTORS
     undo: [], redo: [], lastKey: null, lastTime: 0, tab: 'props', drag: null, testStale: false
   };
 
@@ -210,16 +217,59 @@
   const isFilled = (v) => !(v === undefined || v === null || v === '');
 
   let toastTimer;
-  function toast(msg) {
+  function toast(msg, ms) {
     const t = $('toast');
     t.textContent = msg; t.classList.add('show');
-    clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), ms || 2600);
   }
 
   function download(name, text, type) {
     const a = h('a', { href: URL.createObjectURL(new Blob([text], { type })), download: name });
     document.body.append(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  }
+
+  // ======================================================================== back end (APEX)
+  // <div id="fcd-root" data-backend="apex" data-process="FC_DESIGNER"> talks to db/09_fc_designer.sql
+  // through one page-level Ajax Callback. Without data-backend the designer works on files only.
+  const BACKEND = (function () {
+    if (ROOT.dataset.backend !== 'apex') return null;
+    const proc = ROOT.dataset.process || 'FC_DESIGNER';
+    return {
+      call(action, payload) {
+        if (!window.apex || !apex.server) return Promise.reject(new Error('The APEX JavaScript API is not on this page.'));
+        return new Promise((resolve, reject) => {
+          apex.server.process(proc, { x01: action, p_clob_01: JSON.stringify(payload || {}) }, { dataType: 'text' })
+            .done((txt) => {
+              let j;
+              try { j = typeof txt === 'string' ? JSON.parse(txt) : txt; } catch (e) { reject(new Error('The server returned something that is not JSON.')); return; }
+              if (!j || j.error) {
+                const err = new Error((j && j.error) || 'Empty response from the server.');
+                err.code = (j && j.code) || 'error';
+                reject(err);
+              } else resolve(j.data);
+            })
+            .fail((xhr, status, err) => reject(new Error(err || status || 'The request failed.')));
+        });
+      }
+    };
+  })();
+
+  // Small modal dialog: returns { body, foot, close }.
+  function modal(title, opts) {
+    opts = opts || {};
+    const back = h('div', { class: 'modal-back' });
+    const box = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': title, style: opts.width ? 'width:' + opts.width : null });
+    const body = h('div', { class: 'modal-body' });
+    const foot = h('div', { class: 'modal-foot' });
+    const close = () => { back.remove(); document.removeEventListener('keydown', onKey, true); };
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+    box.append(h('div', { class: 'modal-head' }, h('b', { text: title }), h('button', { class: 'x', text: '×', title: 'Close', onclick: close })), body, foot);
+    back.append(box);
+    back.addEventListener('pointerdown', (e) => { if (e.target === back) close(); });
+    document.addEventListener('keydown', onKey, true);
+    ROOT.append(back);
+    return { body, foot, close };
   }
 
   // ======================================================================== model helpers
@@ -415,13 +465,19 @@
     updateTestNote();
     if (S.tab === 'json' && document.activeElement !== $('jsonText')) renderJson();
     updateUndoButtons();
+    markDirty();
     save();
   }
+  function markDirty() { if (BACKEND && !S.db.dirty) { S.db.dirty = true; renderDbStatus(); } }
 
-  function replaceFlow(f, msg) {
+  // dbInfo: {flowId, version, status} when the flow came from the database; otherwise it's a new/local flow.
+  function replaceFlow(f, msg, dbInfo) {
     S.undo.push(JSON.stringify(S.flow));
     S.redo = [];
     S.flow = f;
+    S.db = dbInfo ? { flowId: dbInfo.flowId, version: dbInfo.version, status: dbInfo.status, dirty: false, savedAt: null }
+                  : { flowId: null, version: null, status: null, dirty: !!BACKEND, savedAt: null };
+    renderDbStatus();
     normalize();
     S.sel = null;
     renderAll();
@@ -437,6 +493,7 @@
     S.lastKey = null;
     fixSelection();
     renderAll();
+    markDirty();
     save();
   }
   function redo() {
@@ -446,6 +503,7 @@
     S.lastKey = null;
     fixSelection();
     renderAll();
+    markDirty();
     save();
   }
   function fixSelection() {
@@ -462,7 +520,7 @@
   function save() {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
-      try { localStorage.setItem(STORE_KEY, JSON.stringify({ flow: S.flow, mocks: S.mocks, catalog: S.catalog })); } catch (e) { /* storage unavailable */ }
+      try { localStorage.setItem(STORE_KEY, JSON.stringify({ flow: S.flow, mocks: S.mocks, catalog: S.catalog, db: S.db, dbCatalog: S.dbCatalog })); } catch (e) { /* storage unavailable */ }
     }, 300);
   }
   function loadSaved() {
@@ -664,6 +722,21 @@
         add('warning', 'Required form field "' + s + '" is not asked on every path to ' + cv.goal + '.');
       }
     });
+
+    if (BACKEND && S.dbConnectors) {
+      const registered = S.dbConnectors.map((c) => c.id);
+      Object.keys(connectorUses()).forEach((c) => {
+        if (registered.indexOf(c) < 0) add('warning', 'Connector "' + c + '" is not registered in FC_CONNECTORS on the server.');
+      });
+    }
+    if (BACKEND && S.dbCatalog) {
+      sourceUses().forEach((id) => {
+        const st = dbSourceState(id);
+        const where = (findNodes().find((n) => n.source === id) || {}).id;
+        if (st === 'local' && catalog()[id]) add('error', 'Data source "' + id + '" is not in the database yet. Save it from the Data tab.', where);
+        else if (st === 'modified') add('warning', 'Data source "' + id + '" has changes that are not saved to the database.', where);
+      });
+    }
 
     list.sort((a, b) => (a.level === b.level ? 0 : a.level === 'error' ? -1 : 1));
     return { list, byNode, coverage: cv };
@@ -1248,7 +1321,12 @@
     let dl = document.getElementById(listId);
     if (!dl) { dl = h('datalist', { id: listId }); ROOT.append(dl); }
     dl.textContent = '';
-    Object.keys(connectorUses()).forEach((c) => dl.append(h('option', { value: c })));
+    const ids = Object.keys(connectorUses());
+    (S.dbConnectors || []).forEach((c) => { if (ids.indexOf(c.id) < 0) ids.push(c.id); });
+    ids.forEach((c) => {
+      const reg = (S.dbConnectors || []).find((x) => x.id === c);
+      dl.append(h('option', { value: c, label: reg ? reg.type + (reg.description ? ' · ' + reg.description : '') : 'used in this flow' }));
+    });
     const el = bound(get, set, { mono: true, key, placeholder: 'connector_id' });
     el.setAttribute('list', listId);
     return el;
@@ -1852,16 +1930,312 @@
     if (tab === 'test') { renderMocks(); if (!testEngine) runTest(); }
   }
 
+  // ======================================================================== database integration
+  function clockTime() { const t = new Date(); return String(t.getHours()).padStart(2, '0') + ':' + String(t.getMinutes()).padStart(2, '0'); }
+
+  function renderDbStatus() {
+    const el = $('dbStatus');
+    if (!el || !BACKEND) return;
+    el.hidden = false;
+    const d = S.db;
+    const label = (st) => (st === 'PUBLISHED' ? 'Published' : st === 'RETIRED' ? 'Retired' : 'Draft');
+    let text, cls;
+    if (!d.flowId) { text = 'Not in database'; cls = 'local'; }
+    else if (d.dirty) { text = 'Unsaved changes (' + label(d.status).toLowerCase() + ' v' + d.version + ')'; cls = 'dirty'; }
+    else { text = label(d.status) + ' v' + d.version + (d.savedAt ? ' · saved ' + d.savedAt : ''); cls = d.status === 'PUBLISHED' ? 'pub' : 'saved'; }
+    if (d.flowId && S.flow && d.flowId !== S.flow.flowId) { text += ' · id changed'; cls = 'dirty'; }
+    el.textContent = text;
+    el.className = 'db-status ' + cls;
+    el.title = d.flowId ? 'Database: ' + d.flowId + ' version ' + d.version + ' (' + d.status + ')' : 'This flow has not been saved to the database yet.';
+  }
+
+  async function saveToDb(publish, force) {
+    if (publish) {
+      const errs = analyze().list.filter((p) => p.level === 'error').length;
+      if (errs) { toast('Fix the ' + errs + ' error(s) in the Checklist before publishing.', 4000); setTab('check'); return; }
+    }
+    const sameFlow = S.db.flowId && S.db.flowId === S.flow.flowId;
+    const btns = [$('btnSaveDb'), $('btnPublishDb')];
+    btns.forEach((b) => { b.disabled = true; });
+    let retry = false;
+    try {
+      const res = await BACKEND.call(publish ? 'publish' : 'saveDraft',
+        { definition: S.flow, baseVersion: sameFlow ? S.db.version : null, force: !!force });
+      S.flow.version = res.version;
+      S.db = { flowId: res.flowId, version: res.version, status: res.status, dirty: false, savedAt: clockTime() };
+      save();
+      renderDbStatus();
+      toast(publish ? 'Published version ' + res.version + '. New conversations use it now.' : 'Draft saved as version ' + res.version + '.', 3500);
+    } catch (e) {
+      if (e.code === 'conflict' || e.code === 'exists') {
+        retry = window.confirm(e.message + '\n\nSave your copy anyway? It becomes the newest version' +
+          (e.code === 'conflict' ? ' (a newer draft by someone else would be replaced).' : '.'));
+      } else {
+        toast((publish ? 'Publish' : 'Save') + ' failed: ' + e.message, 8000);
+      }
+    } finally {
+      btns.forEach((b) => { b.disabled = false; });
+    }
+    if (retry) await saveToDb(publish, true);
+  }
+
+  async function openDialog() {
+    const m = modal('Open a flow', { width: 'min(660px, 94vw)' });
+    const filter = h('input', { class: 'in', placeholder: 'Filter by name or id…' });
+    const list = h('div', { class: 'flow-list' }, h('p', { class: 'hint', text: 'Loading flows from the database…' }));
+    m.body.append(filter, list);
+    m.foot.append(
+      h('button', { class: 'btn', text: 'Open a file instead…', onclick: () => { m.close(); $('fileInput').click(); } }),
+      h('button', { class: 'btn', text: 'Cancel', onclick: m.close }));
+    let flows;
+    try { flows = await BACKEND.call('listFlows'); }
+    catch (e) { list.textContent = ''; list.append(h('div', { class: 'prob error', text: 'Could not load flows: ' + e.message })); return; }
+    const draw = () => {
+      list.textContent = '';
+      const q = filter.value.trim().toLowerCase();
+      const shown = flows.filter((f) => !q || (f.flowId + ' ' + (f.name || '')).toLowerCase().indexOf(q) >= 0);
+      if (!shown.length) list.append(h('p', { class: 'hint', text: flows.length ? 'No flow matches.' : 'No flows in the database yet. Design one and click Save draft.' }));
+      shown.forEach((f) => {
+        const vs = f.versions || [];
+        const live = vs.find((v) => v.status === 'PUBLISHED');
+        const latest = vs[0];
+        const vsel = sel(vs.map((v) => [String(v.version), 'v' + v.version + ' · ' + String(v.status).toLowerCase() + ' · ' + (v.createdBy || '') + ' ' + (v.createdAt || '')]),
+          latest ? String(latest.version) : '', () => {});
+        vsel.style.maxWidth = '230px';
+        const current = S.db.flowId === f.flowId;
+        list.append(h('div', { class: 'flow-row' + (current ? ' current' : '') },
+          h('div', { class: 'grow' },
+            h('b', { text: f.name || f.flowId }), current ? h('span', { class: 'hint', text: '  (open now)' }) : null,
+            h('div', { class: 'hint mono', text: f.flowId }),
+            h('div', { class: 'badges' },
+              live ? h('span', { class: 'pill always', text: 'live v' + live.version }) : h('span', { class: 'pill never', text: 'not published' }),
+              latest && latest.status === 'DRAFT' ? h('span', { class: 'pill sometimes', text: 'draft v' + latest.version }) : null)),
+          vsel,
+          h('button', { class: 'btn primary', text: 'Open', onclick: () => openFromDb(f.flowId, Number(vsel.value), m) })));
+      });
+    };
+    filter.addEventListener('input', draw);
+    draw();
+    filter.focus();
+  }
+
+  async function openFromDb(flowId, version, m) {
+    if (S.db.dirty && !window.confirm('The current flow has unsaved changes. Open "' + flowId + '" anyway? (Undo brings the current flow back.)')) return;
+    try {
+      const r = await BACKEND.call('loadFlow', { flowId, version });
+      if (m) m.close();
+      testEngine = null;
+      replaceFlow(checkShape(r.definition), 'Opened ' + flowId + ' v' + r.version + ' (' + String(r.status).toLowerCase() + ')',
+        { flowId, version: r.version, status: r.status });
+    } catch (e) { toast('Could not open: ' + e.message, 6000); }
+  }
+
+  // ---- data sources & connectors from the database
+  function sourceSig(src) {
+    return JSON.stringify({
+      o: String(src.objectName || '').toUpperCase(), k: String(src.keyColumn || '').toUpperCase(),
+      v: String(src.versionColumn || '').toUpperCase(), r: src.rowFilter || '',
+      f: (src.fields || []).map((f) => [f.field, String(f.column || f.field).toUpperCase(), f.type || 'VARCHAR2',
+        !!f.searchable, String(f.ops || 'eq').replace(/\s/g, ''), !!f.updatable, f.mask || ''])
+        .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    });
+  }
+  // 'saved' | 'modified' | 'local' (not in the database) | null (no back end)
+  function dbSourceState(id) {
+    if (!BACKEND || !S.dbCatalog) return null;
+    if (!(id in S.dbCatalog)) return 'local';
+    return catalog()[id] && S.dbCatalog[id] === sourceSig(catalog()[id]) ? 'saved' : 'modified';
+  }
+
+  async function loadDbMeta(opts) {
+    if (!BACKEND) return;
+    opts = opts || {};
+    try {
+      const res = await Promise.all([BACKEND.call('listSources'), BACKEND.call('listConnectors')]);
+      const sources = res[0] || {}, cat = catalog(), prev = S.dbCatalog || {};
+      S.dbCatalog = {};
+      Object.keys(sources).forEach((id) => {
+        const dbDef = sources[id], local = cat[id];
+        S.dbCatalog[id] = sourceSig(dbDef);
+        // Keep unsaved local edits (they show as "modified"); otherwise the database definition wins.
+        const localEdited = local && !opts.overwrite && prev[id] !== undefined && sourceSig(local) !== prev[id];
+        if (!localEdited) cat[id] = Object.assign(clone(dbDef), { sampleRows: (local && local.sampleRows) || [] });
+      });
+      S.dbConnectors = res[1] || [];
+      save();
+      renderCanvas();
+      renderCheck();
+      if (S.tab === 'data') renderData();
+      if (opts.toast) toast('Reloaded ' + Object.keys(sources).length + ' data source(s) from the database.');
+    } catch (e) {
+      toast('Could not load data sources from the database: ' + e.message, 7000);
+    }
+  }
+
+  async function saveSourceToDb(id) {
+    const src = catalog()[id];
+    if (!src.objectName || !src.keyColumn) { toast('Set the table and key column first.'); return; }
+    try {
+      const def = { objectName: src.objectName, keyColumn: src.keyColumn, versionColumn: src.versionColumn || null,
+                    rowFilter: src.rowFilter || null, fields: src.fields || [] };
+      const r = await BACKEND.call('saveSource', { id, def });
+      S.dbCatalog = S.dbCatalog || {};
+      S.dbCatalog[id] = sourceSig(src);
+      save(); renderCheck(); renderData();
+      if (r && r.warnings && r.warnings.length) toast('Saved "' + id + '" with warnings: ' + r.warnings.join(' '), 9000);
+      else toast('Saved "' + id + '" to the database.');
+    } catch (e) { toast('Could not save "' + id + '": ' + e.message, 7000); }
+  }
+
+  async function revertSource(id) {
+    try {
+      const sources = await BACKEND.call('listSources');
+      if (!sources[id]) { toast('"' + id + '" is not in the database.'); return; }
+      const cat = catalog();
+      cat[id] = Object.assign(clone(sources[id]), { sampleRows: (cat[id] && cat[id].sampleRows) || [] });
+      S.dbCatalog[id] = sourceSig(sources[id]);
+      catalogChanged(true);
+      toast('Reverted "' + id + '" to the database version.');
+    } catch (e) { toast('Could not revert: ' + e.message, 6000); }
+  }
+
+  async function loadRowsFromDb(id) {
+    try {
+      const rows = await BACKEND.call('sampleRows', { id, limit: 20 });
+      const src = catalog()[id];
+      src.sampleRows = (rows || []).map((r) => Object.assign({ _key: r.key }, src.versionColumn ? { _version: r.version } : {}, r.values));
+      catalogChanged(true);
+      toast('Loaded ' + src.sampleRows.length + ' row(s) from the database for testing.');
+    } catch (e) { toast('Could not load rows: ' + e.message, 6000); }
+  }
+
+  async function deleteSourceEverywhere(id) {
+    const inDb = dbSourceState(id) && dbSourceState(id) !== 'local';
+    const used = sourceUses().indexOf(id) >= 0;
+    const msg = inDb ? 'Delete data source "' + id + '" from the DATABASE and the catalog? Published flows that use it are protected; drafts would break.'
+                     : 'Delete "' + id + '" from the catalog?' + (used ? ' This flow uses it.' : '');
+    if (!window.confirm(msg)) return;
+    if (inDb) {
+      try { await BACKEND.call('deleteSource', { id }); delete S.dbCatalog[id]; }
+      catch (e) { toast('Not deleted: ' + e.message, 8000); return; }
+    }
+    delete catalog()[id];
+    S.dataSel = null;
+    catalogChanged(true);
+  }
+
+  function mapColumnType(dt) {
+    const t = String(dt || '').toUpperCase();
+    if (/^(NUMBER|FLOAT|INTEGER|BINARY_FLOAT|BINARY_DOUBLE)/.test(t)) return 'NUMBER';
+    if (/^(DATE|TIMESTAMP)/.test(t)) return 'DATE';
+    if (/^(VARCHAR2|NVARCHAR2|CHAR|NCHAR)/.test(t)) return 'VARCHAR2';
+    return null;   // CLOB, BLOB, RAW, XMLTYPE ... are not supported by FC_DATA
+  }
+
+  async function createFromTable() {
+    const m = modal('Create a data source from a table', { width: 'min(620px, 94vw)' });
+    const q = h('input', { class: 'in', placeholder: 'Search tables and views…' });
+    const list = h('div', { class: 'flow-list' });
+    const detail = h('div');
+    m.body.append(q, list, detail);
+    m.foot.append(h('button', { class: 'btn', text: 'Cancel', onclick: m.close }));
+    let timer;
+    const search = async () => {
+      list.textContent = '';
+      list.append(h('p', { class: 'hint', text: 'Searching…' }));
+      try {
+        const tables = await BACKEND.call('listTables', { q: q.value.trim() });
+        list.textContent = '';
+        if (!tables.length) list.append(h('p', { class: 'hint', text: 'No tables or views match.' }));
+        tables.forEach((t) => list.append(h('button', { class: 'flow-row pick-row', onclick: () => describe(t.name) },
+          h('span', { class: 'grow mono', text: t.name }), h('span', { class: 'chip', text: t.type.toLowerCase() }))));
+      } catch (e) { list.textContent = ''; list.append(h('div', { class: 'prob error', text: e.message })); }
+    };
+    const describe = async (name) => {
+      detail.textContent = '';
+      detail.append(h('p', { class: 'hint', text: 'Reading ' + name + '…' }));
+      let t;
+      try { t = await BACKEND.call('describeTable', { name }); }
+      catch (e) { detail.textContent = ''; detail.append(h('div', { class: 'prob error', text: e.message })); return; }
+      list.textContent = '';
+      const cols = t.columns || [];
+      const verGuess = cols.find((c) => /^(VERSION|ROW_VERSION|OBJECT_VERSION_NUMBER|REC_VERSION)$/.test(c.column) && mapColumnType(c.dataType) === 'NUMBER');
+      const key = (t.pk && t.pk[0]) || (cols[0] && cols[0].column);
+      let id = name.toLowerCase().replace(/[^a-z0-9_]/g, '_').replace(/^[^a-z]+/, '');
+      while (catalog()[id]) id += '_2';
+      const idIn = h('input', { class: 'in mono', value: id });
+      const keySel = sel(cols.map((c) => [c.column, c.column]), key, () => {});
+      const verSel = sel([['', '(none)']].concat(cols.filter((c) => mapColumnType(c.dataType) === 'NUMBER').map((c) => [c.column, c.column])), verGuess ? verGuess.column : '', () => {});
+      const picks = cols.map((c) => {
+        const type = mapColumnType(c.dataType);
+        const cb = h('input', { type: 'checkbox', checked: !!type, disabled: !type });
+        return { c, type, cb };
+      });
+      const syncVersion = () => picks.forEach((p) => {
+        const isVer = p.c.column === verSel.value;
+        if (isVer) p.cb.checked = false;
+        p.cb.disabled = !p.type || isVer;
+        p.cb.title = isVer ? 'Used as the version column' : '';
+      });
+      verSel.addEventListener('change', syncVersion);
+      syncVersion();
+      detail.textContent = '';
+      detail.append(
+        h('h4', { class: 'sub', text: name + (t.pk && t.pk.length ? '  ·  primary key ' + t.pk.join(', ') : '  ·  no primary key') }),
+        h('div', { class: 'grid2' }, F('Data source id', idIn), F('Key column', keySel)),
+        F('Version column', verSel, verGuess ? 'Guessed from the column name.' : 'Optional NUMBER column. Without it, conflicts are detected by comparing the original values.'),
+        h('h4', { class: 'sub', text: 'Columns to expose as fields' }),
+        h('div', { class: 'cols' }, picks.map((p) => h('label', { class: 'check', title: p.type ? '' : 'Type ' + p.c.dataType + ' is not supported' },
+          p.cb, h('span', { class: 'mono', text: p.c.column }), h('span', { class: 'hint', text: ' ' + (p.type || p.c.dataType + ' (unsupported)') })))),
+        h('p', { class: 'hint', text: 'Fields start as not searchable and not updatable. Choose those next in the Data tab, then Save to database.' }));
+      const create = h('button', { class: 'btn primary', text: 'Create', onclick: () => {
+        const sid = idIn.value.trim();
+        if (!/^[a-z][a-z0-9_]{0,99}$/.test(sid)) { toast('Id: lowercase letters, digits and _, starting with a letter.'); return; }
+        if (catalog()[sid]) { toast('"' + sid + '" already exists in the catalog.'); return; }
+        const ver = verSel.value;
+        catalog()[sid] = {
+          objectName: name, keyColumn: keySel.value, versionColumn: ver, rowFilter: '',
+          fields: picks.filter((p) => p.cb.checked && p.c.column !== ver).map((p) => ({
+            field: p.c.column.toLowerCase(), column: p.c.column, type: p.type, searchable: false, ops: 'eq', updatable: false })),
+          sampleRows: []
+        };
+        S.dataSel = sid;
+        m.close();
+        setTab('data');
+        catalogChanged(true);
+        toast('Created "' + sid + '". Mark searchable / updatable fields, then Save to database.', 5000);
+      } });
+      m.foot.textContent = '';
+      m.foot.append(h('button', { class: 'btn', text: 'Back', onclick: () => { detail.textContent = ''; m.foot.textContent = ''; m.foot.append(h('button', { class: 'btn', text: 'Cancel', onclick: m.close })); search(); } }),
+        create);
+    };
+    q.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(search, 250); });
+    search();
+    q.focus();
+  }
+
   // ======================================================================== data tab (catalog)
   // The designer's copy of the server registry (FC_DATA_SOURCES / FC_DATA_SOURCE_FIELDS). Catalog edits
   // are saved with the draft but are not part of the flow, so they aren't in undo history.
   function catalogChanged(rerender) {
     save();
+    if (!rerender) refreshDataState();
     renderCanvas();
     renderCheck();
     S.testStale = true;
     updateTestNote();
     if (rerender) renderData();
+  }
+
+  // Keep the Data tab's database pill and Save button current without re-rendering (keeps input focus).
+  function refreshDataState() {
+    if (S.tab !== 'data' || !S.dataSel) return;
+    const st = dbSourceState(S.dataSel);
+    const pill = $('srcState'), btn = $('btnSaveSource');
+    const info = { saved: ['always', 'Saved in the database'], modified: ['sometimes', 'Changed here, not saved to the database'],
+                   local: ['never', 'Only in this designer, not in the database'] }[st];
+    if (pill && info) { pill.className = 'pill ' + info[0]; pill.textContent = info[1]; }
+    if (btn) btn.disabled = st === 'saved';
   }
 
   function registrationSql(id, src) {
@@ -1909,7 +2283,7 @@
       }).catch((e) => toast('Could not import: ' + e.message));
     });
     body.append(fileIn, h('div', { class: 'rowx' },
-      sel(ids.length ? ids.map((i) => [i, i + (used.indexOf(i) >= 0 ? '  (used in flow)' : '')]) : [['', '(none)']],
+      sel(ids.length ? ids.map((i) => [i, i + (used.indexOf(i) >= 0 ? '  (used in flow)' : '') + ({ local: '  · not in database', modified: '  · modified' }[dbSourceState(i)] || '')]) : [['', '(none)']],
         S.dataSel || '', (v) => { S.dataSel = v; renderData(); }, { mono: true }),
       h('button', { class: 'btn', text: '+ New', onclick: () => {
         const id = (window.prompt('Data source id (lowercase letters, digits, _):', 'my_source') || '').trim();
@@ -1923,11 +2297,27 @@
       } })),
       h('div', { class: 'rowx', style: 'margin-top:4px' },
         h('button', { class: 'lnk', text: 'Import…', onclick: () => fileIn.click() }), h('span', { class: 'hint', text: '·' }),
-        h('button', { class: 'lnk', text: 'Export catalog', onclick: () => download('flowchat-data-sources.json', JSON.stringify(cat, null, 2), 'application/json') })));
+        h('button', { class: 'lnk', text: 'Export catalog', onclick: () => download('flowchat-data-sources.json', JSON.stringify(cat, null, 2), 'application/json') }),
+        BACKEND ? h('span', { class: 'hint', text: '·' }) : null,
+        BACKEND ? h('button', { class: 'lnk', text: 'Create from table…', onclick: createFromTable }) : null,
+        BACKEND ? h('span', { class: 'hint', text: '·' }) : null,
+        BACKEND ? h('button', { class: 'lnk', text: 'Reload from database', onclick: () => loadDbMeta({ toast: true }) }) : null));
 
     if (!S.dataSel) { body.append(h('p', { class: 'hint', text: 'No data sources yet.' })); return; }
     const id = S.dataSel, src = cat[id];
     const set = (k) => (v) => { src[k] = v; catalogChanged(false); };
+    const dbState = dbSourceState(id);
+    if (dbState) {
+      const info = { saved: ['always', 'Saved in the database'], modified: ['sometimes', 'Changed here, not saved to the database'],
+                     local: ['never', 'Only in this designer, not in the database'] }[dbState];
+      body.append(h('div', { class: 'rowx', style: 'margin-top:10px' }, h('span', { class: 'pill ' + info[0], text: info[1], id: 'fcd-srcState' }),
+        dbState === 'modified' ? h('button', { class: 'lnk', text: 'Revert to database', onclick: () => revertSource(id) }) : null));
+    }
+    if (src.sourceType === 'PLSQL') {
+      body.append(h('div', { class: 'card' }, h('div', { class: 'hint', style: 'margin:0',
+        text: 'PL/SQL data source (' + [src.searchTarget, src.getTarget, src.updateTarget].filter(Boolean).join(', ') +
+              '). Its functions are managed in the database; the fields below only drive the designer pickers and checks.' })));
+    }
     const txt = (k, ph, mono) => {
       const el = h('input', { class: 'in' + (mono ? ' mono' : ''), placeholder: ph || '' });
       el.value = src[k] || '';
@@ -1981,6 +2371,9 @@
     } }));
 
     body.append(h('h4', { class: 'sub', text: 'Sample rows (Test tab)' }));
+    if (BACKEND && dbState && dbState !== 'local' && src.sourceType !== 'PLSQL') {
+      body.append(h('button', { class: 'lnk', text: 'Load 20 rows from the database', onclick: () => loadRowsFromDb(id) }));
+    }
     const rows = h('textarea', { class: 'in mono', rows: 8, spellcheck: 'false', style: 'font-size:11.5px' });
     rows.value = JSON.stringify(src.sampleRows || [], null, 1);
     rows.addEventListener('change', () => {
@@ -1993,14 +2386,13 @@
     body.append(rows, h('p', { class: 'hint', text: 'Objects keyed by field name. Optional "_key" (record key) and "_version". These are only for testing in the designer.' }));
 
     body.append(h('div', { class: 'actions' },
-      h('button', { class: 'btn primary', text: 'Registration SQL', onclick: () => {
+      BACKEND && src.sourceType !== 'PLSQL'
+        ? h('button', { class: 'btn primary', id: 'fcd-btnSaveSource', text: 'Save to database', disabled: dbState === 'saved', onclick: () => saveSourceToDb(id) }) : null,
+      h('button', { class: 'btn' + (BACKEND ? '' : ' primary'), text: 'Registration SQL', onclick: () => {
         if (!src.objectName || !src.keyColumn) { toast('Set the table and key column first.'); return; }
         download(id + '_data_source.sql', registrationSql(id, src), 'text/plain');
       } }),
-      h('button', { class: 'btn danger', text: 'Delete source', onclick: () => {
-        if (used.indexOf(id) >= 0 && !window.confirm('"' + id + '" is used by this flow. Delete it from the catalog anyway?')) return;
-        delete cat[id]; S.dataSel = null; catalogChanged(true);
-      } })));
+      h('button', { class: 'btn danger', text: 'Delete source', onclick: () => deleteSourceEverywhere(id) })));
   }
 
   // Samples menu
@@ -2069,7 +2461,18 @@
     $('btnNew').onclick = () => {
       if (confirm('Start a new, empty flow? The current draft is replaced (Undo brings it back).')) replaceFlow(blankFlow(), 'New flow created');
     };
-    $('btnOpen').onclick = () => $('fileInput').click();
+    $('btnOpen').onclick = () => (BACKEND ? openDialog() : $('fileInput').click());
+    if (BACKEND) {
+      // Database mode: Save draft / Publish replace the SQL download as the main actions.
+      $('btnSaveDb').hidden = false;
+      $('btnPublishDb').hidden = false;
+      $('btnPublish').textContent = 'SQL';
+      $('btnPublish').classList.remove('primary');
+      $('btnPublish').title = 'Download a SQL script that publishes this flow (for another environment)';
+      $('btnOpen').title = 'Open a flow from the database (or a file)';
+      $('btnSaveDb').onclick = () => saveToDb(false);
+      $('btnPublishDb').onclick = () => saveToDb(true);
+    }
     $('fileInput').onchange = (e) => {
       const file = e.target.files[0];
       e.target.value = '';
@@ -2094,7 +2497,11 @@
     $('btnRunTest').onclick = runTest;
     $('simChat').addEventListener('fc-turn', refreshTestPanels);
     $('btnApplyJson').onclick = () => {
-      try { replaceFlow(checkShape(JSON.parse($('jsonText').value)), 'JSON applied'); }
+      try {
+        const keep = S.db.flowId ? Object.assign({}, S.db) : null;   // stay linked to the same database flow
+        replaceFlow(checkShape(JSON.parse($('jsonText').value)), 'JSON applied', keep);
+        if (keep) markDirty();
+      }
       catch (e) { toast('Not applied: ' + e.message); }
     };
     $('btnCopyJson').onclick = () => {
@@ -2119,6 +2526,12 @@
       if (a && a !== document.body && !ROOT.contains(a)) return;
       const typing = a && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) || a.isContentEditable || a.shadowRoot);
       const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key.toLowerCase() === 's' && BACKEND) {   // Ctrl+S saves a draft, even while typing
+        e.preventDefault();
+        if (a && a.tagName === 'INPUT') a.dispatchEvent(new Event('change', { bubbles: true }));
+        saveToDb(false);
+        return;
+      }
       if (typing) return;
       if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); if (e.shiftKey) redo(); else undo(); }
       else if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); }
@@ -2164,6 +2577,8 @@
       try {
         S.flow = checkShape(saved.flow); S.mocks = saved.mocks || {};
         S.catalog = saved.catalog || null;
+        if (BACKEND && saved.db) S.db = saved.db;
+        if (BACKEND && saved.dbCatalog) S.dbCatalog = saved.dbCatalog;   // last known database signatures
         restored = true;
       } catch (e) { S.flow = null; }
     }
@@ -2176,6 +2591,11 @@
     renderAll();
     fitView();
     if (restored) toast('Restored your last draft');
+    if (BACKEND) {
+      renderDbStatus();
+      await loadDbMeta();
+      if (!restored) openDialog();
+    }
     window.addEventListener('resize', () => drawEdges());
   }
 

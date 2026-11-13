@@ -12,7 +12,7 @@ flows/      loan_application.json    sample "create" flow (collect answers, subm
 designer/   index.html               visual flow designer (no dependencies)
 widget/     flowchat.js              <flow-chat> Web Component + transports + adapters (no dependencies)
             flowchat-engine.js       reference engine in JS (demo, simulator, Node backends)
-db/         install.sql              runs 01..07 in order (08 ORDS is optional)
+db/         install.sql              runs 01..07 and 09 in order (08 ORDS is optional)
             01_tables.sql            FC_FLOWS, FC_FLOW_VERSIONS, FC_CONNECTORS, FC_SESSIONS, FC_EVENTS
             02_data_sources.sql      FC_DATA_SOURCES (+ fields) registry and the FC_DATA package
             03/04_fc_engine.*        PL/SQL engine (server-authoritative)
@@ -20,11 +20,14 @@ db/         install.sql              runs 01..07 in order (08 ORDS is optional)
             06_demo_data_source.sql  exposes the demo table as the "loan_apps" data source
             07_seed_flows.sql        generated: publishes both sample flows
             08_ords_module.sql       REST API for non-APEX hosts
+            09_fc_designer.sql       FC_DESIGNER: back end for the designer hosted in APEX
 demo/       index.html               create demo (runs in the browser using the JS engine)
             update.html              search and update demo, with a live table and a conflict button
 tests/      engine.test.js           node tests/engine.test.js
             update.test.js           node tests/update.test.js
             apex-embed-test.html     designer inside a page-wide form, like APEX
+            apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
+            fake-apex-backend.js     emulates the FC_DESIGNER Ajax protocol in the browser (testing only)
 tools/      build-seed.js            flow JSON -> SQL publish script
 ```
 
@@ -93,20 +96,57 @@ Node positions are stored as `ui: {x, y}` on each node. Both engines ignore them
    #APP_FILES#flowchat.js
    #APP_FILES#designer.js
    ```
-4. **A Static Content region** (template *Blank with Attributes* works best) whose source is just:
+4. **A page-level Ajax Callback process** named `FC_DESIGNER` with the PL/SQL `fc_designer.ajax;`
+   (from `db/09_fc_designer.sql`). Make it a page process, not an application process, so only this page can call it.
+5. **Protect the page with an authorization scheme.** Anyone who can open the designer page can
+   publish flows and change data source definitions.
+6. **A Static Content region** (template *Blank with Attributes* works best) whose source is just:
    ```html
-   <div id="fcd-root" data-flows-base="#APP_FILES#"
+   <div id="fcd-root" data-backend="apex" data-flows-base="#APP_FILES#"
         style="--fcd-height: calc(100vh - 140px)"></div>
    ```
    The script draws the whole designer into that div. Don't paste the markup from
    `designer/index.html`. Add `data-theme="light"` or `"dark"` to fix the colour scheme.
+   Without `data-backend="apex"`, the designer works on files only, like the standalone page.
+
+With `data-backend="apex"` the designer works directly against the database:
+
+- **Open…** lists the flows in `FC_FLOW_VERSIONS`, with their live and draft versions. Any version
+  can be opened, and **Open a file instead…** is still available. If nothing is restored on start,
+  the dialog opens automatically.
+- **Save draft** (Ctrl+S) stores a `DRAFT` version that conversations don't use. Saving again
+  updates that draft in place.
+- **Publish** checks the flow: the Checklist must have no errors, and the server re-checks the
+  structure. It then stores the flow as `PUBLISHED`, and new conversations use it straight away.
+  Earlier published versions become `RETIRED`. Conversations already running keep the version they
+  started on.
+- **Status pill:** shows whether the open flow is not in the database, has unsaved changes, is a
+  draft, or is published.
+- **Concurrent edits:** every save sends the version you started from. If someone else saved in
+  the meantime, or you're saving a new flow whose id already exists, you're asked before anything
+  is overwritten.
+- **Data tab:**
+  - It loads `FC_DATA_SOURCES` on start. **Save to database** writes a source, and the server
+    warns about tables or columns it can't find.
+  - **Revert to database** discards local changes.
+  - **Load 20 rows from the database** fetches real test data for the Test tab.
+  - **Delete** is refused while a published flow still uses the source.
+  - **Create from table…** reads `USER_TAB_COLUMNS` and the primary key, guesses the version
+    column, and skips unsupported types such as CLOB.
+  - Unsaved local edits survive a reload, flagged as "changed here".
+- **Checklist:** also warns when a flow uses a data source that isn't saved in the database
+  (an error, which blocks publishing) or has unsaved changes, or a connector that isn't registered
+  in `FC_CONNECTORS`.
+- **SQL** still downloads a publish script, for example to move a flow to another environment.
 
 How the designer stays out of APEX's way:
 - **No page submits:** APEX wraps the page in one `<form>`, so every designer button is
   `type="button"`, and Enter inside designer fields commits the field instead of submitting the page.
 - **No style leaks:** all styles are scoped under `.fcd`, and all element ids start with `fcd-`.
 - **Shortcuts stay local:** keyboard shortcuts (Delete, Ctrl+Z) only act while focus is inside the designer.
-- **Test page:** `tests/apex-embed-test.html` reproduces these conditions with a page-wide form and aggressive host styles.
+- **Test pages:** `tests/apex-embed-test.html` reproduces these conditions with a page-wide form and aggressive host styles.
+  `tests/apex-designer-db-test.html` runs database mode against `tests/fake-apex-backend.js`, which
+  emulates the `FC_DESIGNER` protocol in the browser, so the designer can be tried without APEX.
 
 ## 2. Install in Oracle
 
@@ -282,14 +322,16 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 - **The PL/SQL (`FC_ENGINE`, `FC_DATA`) has not been compiled yet.** No Oracle instance was
   available when it was written. It mirrors the JavaScript engine rule for rule, but expect a
   small round of compile fixes on first install.
-- **The designer's data source catalog is local** (Phase B). It isn't read from the database yet.
-  Keep it in step with `FC_DATA_SOURCES` through Registration SQL and Import/Export. Phase C will
-  load it from APEX and offer "create from table".
+- **The designer's database mode has only been tested against the fake back end.** `FC_DESIGNER`,
+  like the rest of the PL/SQL, hasn't been compiled. The browser side follows the same protocol,
+  which `tests/fake-apex-backend.js` documents.
+- **Standalone designer:** without `data-backend="apex"`, the data source catalog is local. Keep it
+  in step with `FC_DATA_SOURCES` through Registration SQL and Import/Export.
+- **"Create from table"** lists only the parsing schema's own tables and views (`USER_OBJECTS`).
+  Sources on other schemas can still be typed in by hand.
 - **Re-upload changed files:** after updating `designer.js` or `designer.css` in APEX, re-upload
   them. APEX versions static file URLs, so browsers pick up the change. On a plain web server,
   force-reload to avoid a cached copy.
-- The designer publishes through a downloaded SQL script. Saving directly to the database
-  (an ORDS endpoint for drafts and versions) is the natural next step.
 - Not in Phase 1: resuming a conversation after a reload, line-item (repeat)
   nodes, file uploads, LLM extraction from free text, PII masking in `FC_EVENTS`, and a
   packaged APEX region plugin. The Static Content region approach above is the stand-in for the plugin.

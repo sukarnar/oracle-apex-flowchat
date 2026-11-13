@@ -1,6 +1,7 @@
 -- Removes all FlowChat objects (including demo data). Irreversible.
 begin ords.delete_module(p_module_name => 'flowchat'); exception when others then null; end;
 /
+drop package fc_designer;
 drop package fc_demo_connectors;
 drop package fc_engine;
 drop package fc_data;

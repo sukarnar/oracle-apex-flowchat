@@ -20,6 +20,9 @@ prompt == Demo data source (loan_apps)
 @@06_demo_data_source.sql
 prompt == Sample flows (loan_application, update_application)
 @@07_seed_flows.sql
+prompt == Designer back end (FC_DESIGNER Ajax Callback)
+@@09_fc_designer.sql
+show errors package body fc_designer
 -- Optional REST API for non-APEX pages:
 -- @@08_ords_module.sql
 prompt == Done
