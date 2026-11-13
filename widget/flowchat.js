@@ -204,6 +204,15 @@
     '.link{background:none;border:0;padding:0;color:var(--fc-muted);font:inherit;cursor:pointer}.link:hover{color:var(--fc-text)}',
     '.hint{color:var(--fc-muted)}',
     '.busy .composer{opacity:.6;pointer-events:none}',
+    '.row.ro{grid-template-columns:minmax(90px,40%) 1fr}',
+    's.before{color:var(--fc-muted)}.arrow{color:var(--fc-muted)}',
+    '.picks{display:flex;flex-direction:column;gap:6px;max-height:220px;overflow-y:auto}',
+    '.pick{display:flex;flex-direction:column;align-items:flex-start;gap:2px;text-align:left;font:inherit;padding:9px 12px;',
+    'border:1px solid var(--fc-border);border-radius:10px;background:var(--fc-bg);color:var(--fc-text);cursor:pointer}',
+    '.pick:hover,.pick:focus-visible{border-color:var(--fc-accent);outline:none}',
+    '.pick-title{font-weight:600;font-size:14px}.pick-sub{font-size:12.5px;color:var(--fc-muted)}',
+    '.chip.changed{background:color-mix(in srgb,var(--fc-accent) 12%,transparent)}',
+    '.chip:disabled{border-color:var(--fc-border);color:var(--fc-muted);cursor:not-allowed;background:transparent}',
     '@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}'
   ].join('');
 
@@ -391,18 +400,27 @@
 
     _addBot(msg) {
       var m = h('div', 'msg bot' + (msg.type === 'error' ? ' error' : msg.type === 'success' ? ' success' : ''));
-      if (msg.type === 'summary') {
-        var card = h('div', 'card summary');
+      if (msg.type === 'summary' || msg.type === 'record' || msg.type === 'changes') {
+        // summary: answers with Edit · record: read-only current values · changes: old → new with Edit
+        var card = h('div', 'card ' + (msg.type === 'record' ? 'record' : 'summary'));
         card.append(h('div', 'card-title', msg.text));
         var dl = h('dl'); dl.style.margin = '0';
         (msg.items || []).forEach((it) => {
-          var row = h('div', 'row');
-          row.append(h('dt', null, it.label), h('dd', null, it.display));
-          var b = h('button', 'edit', 'Edit'); b.type = 'button';
-          b.setAttribute('aria-label', 'Edit ' + it.label);
-          if (!it.editable) b.style.visibility = 'hidden';
-          b.addEventListener('click', () => this.send({ command: 'edit', slot: it.slot }, 'Change ' + it.label.toLowerCase()));
-          row.append(b);
+          var row = h('div', 'row' + (msg.type === 'record' ? ' ro' : ''));
+          var dd = h('dd');
+          if (msg.type === 'changes') {
+            dd.append(h('s', 'before', it.before || '(empty)'), h('span', 'arrow', ' → '), h('span', null, it.after || '(empty)'));
+          } else {
+            dd.textContent = it.display || '—';
+          }
+          row.append(h('dt', null, it.label), dd);
+          if (msg.type !== 'record') {
+            var b = h('button', 'edit', 'Edit'); b.type = 'button';
+            b.setAttribute('aria-label', 'Edit ' + it.label);
+            if (!it.editable) b.style.visibility = 'hidden';
+            b.addEventListener('click', () => this.send({ command: 'edit', slot: it.slot }, 'Change ' + it.label.toLowerCase()));
+            row.append(b);
+          }
           dl.append(row);
         });
         card.append(dl);
@@ -414,7 +432,7 @@
       this._log.append(m); this._scroll();
     }
 
-    _disableOldCards() { this._log.querySelectorAll('.summary .edit').forEach(function (b) { b.disabled = true; }); }
+    _disableOldCards() { this._log.querySelectorAll('.card .edit').forEach(function (b) { b.disabled = true; }); }
 
     _renderRetry() {
       var c = this._composer; c.textContent = '';
@@ -426,7 +444,7 @@
     _renderComposer(turn) {
       var c = this._composer; c.textContent = '';
       if (turn.status !== 'in_progress' || !turn['await']) {
-        var again = h('button', 'btn', 'Start a new application'); again.type = 'button';
+        var again = h('button', 'btn', this.getAttribute('restart-label') || 'Start again'); again.type = 'button';
         again.addEventListener('click', () => this.start());
         c.append(again);
         return;
@@ -437,6 +455,30 @@
         var ok = h('button', 'btn primary', a.confirmLabel || 'Confirm'); ok.type = 'button';
         ok.addEventListener('click', () => this.send({ value: 'confirm' }, a.confirmLabel || 'Confirm'));
         c.append(ok); focusEl = ok;
+      } else if (a.type === 'pick') {
+        // Search results: one card per record; only opaque tokens go back to the server.
+        var list = h('div', 'picks');
+        (a.items || []).forEach((it) => {
+          var b = h('button', 'pick'); b.type = 'button';
+          b.append(h('span', 'pick-title', it.title), it.subtitle ? h('span', 'pick-sub', it.subtitle) : '');
+          b.addEventListener('click', () => this.send({ pick: it.token }, it.title));
+          list.append(b);
+          if (!focusEl) focusEl = b;
+        });
+        c.append(list);
+      } else if (a.type === 'fieldMenu') {
+        var fchips = h('div', 'chips');
+        (a.fields || []).forEach((f) => {
+          var b = h('button', 'chip' + (f.changed ? ' changed' : ''), (f.changed ? '✓ ' : '') + f.label); b.type = 'button';
+          b.title = f.editable ? 'Currently: ' + (f.display || 'empty') : (f.reason || 'Not editable');
+          if (!f.editable) b.disabled = true;
+          b.addEventListener('click', () => this.send({ field: f.field }, 'Change ' + f.label.toLowerCase()));
+          fchips.append(b);
+          if (!focusEl && f.editable) focusEl = b;
+        });
+        var done = h('button', 'btn primary', a.doneLabel || 'Done'); done.type = 'button';
+        done.addEventListener('click', () => this.send({ command: 'done' }, a.doneLabel || 'Done'));
+        c.append(fchips, done);
       } else if (spec.kind === 'choice' || spec.kind === 'yesno') {
         var chips = h('div', 'chips');
         var opts = spec.kind === 'yesno' ? [{ value: 'yes', label: 'Yes' }, { value: 'no', label: 'No' }] : (spec.options || []);
@@ -479,12 +521,23 @@
       }
 
       var tools = h('div', 'tools');
-      if (turn.canGoBack) {
+      if (a.type === 'ask' && a.sub) {
+        // Editing one field of a loaded record: "back" keeps the current value.
+        var keep = h('button', 'link', '↩ Keep current'); keep.type = 'button';
+        keep.addEventListener('click', () => this.send({ command: 'back' }, 'Keep current'));
+        tools.append(keep);
+      } else if (turn.canGoBack) {
         var back = h('button', 'link', '↩ Back'); back.type = 'button';
         back.addEventListener('click', () => this.send({ command: 'back' }, 'Go back'));
         tools.append(back);
       } else tools.append(h('span'));
-      if (spec.required === false && a.type === 'ask') {
+      if (a.type === 'pick' && a.allowNone) {
+        var none = h('button', 'link', a.noneLabel || 'None of these'); none.type = 'button';
+        none.addEventListener('click', () => this.send({ pick: null }, a.noneLabel || 'None of these'));
+        tools.append(none);
+      } else if (a.type === 'fieldMenu') {
+        tools.append(h('span', 'hint', 'Pick a field to change'));
+      } else if (spec.required === false && a.type === 'ask') {
         var skip = h('button', 'link', 'Skip'); skip.type = 'button';
         skip.addEventListener('click', () => this.send({ value: '' }, '(skipped)'));
         tools.append(skip);

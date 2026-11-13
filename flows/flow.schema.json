@@ -38,8 +38,64 @@
       "oneOf": [
         { "$ref": "#/$defs/message" }, { "$ref": "#/$defs/ask" }, { "$ref": "#/$defs/condition" },
         { "$ref": "#/$defs/lookup" },  { "$ref": "#/$defs/summary" }, { "$ref": "#/$defs/submit" },
-        { "$ref": "#/$defs/end" }
+        { "$ref": "#/$defs/end" },
+        { "$ref": "#/$defs/findRecord" }, { "$ref": "#/$defs/changeFields" }, { "$ref": "#/$defs/saveChanges" }
       ]
+    },
+
+    "alias": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,49}$", "description": "Record alias; fields are read as alias.field" },
+
+    "findRecord": {
+      "description": "Search a data source; pick among several matches; load the chosen record as <as>.*",
+      "properties": {
+        "type": { "const": "findRecord" },
+        "source": { "type": "string", "description": "FC_DATA_SOURCES.source_id" },
+        "as": { "$ref": "#/$defs/alias" },
+        "criteria": { "type": "array", "minItems": 1, "items": { "type": "object", "required": ["field", "slot"],
+          "properties": { "field": { "type": "string" }, "op": { "enum": ["eq", "starts", "contains", "gte", "lte"] },
+                          "slot": { "type": "string" }, "optional": { "type": "boolean" } } } },
+        "minCriteria": { "type": "integer", "minimum": 1, "default": 1 },
+        "maxResults": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 },
+        "autoPick": { "type": "boolean", "default": true, "description": "Load directly when exactly one record matches" },
+        "allowNone": { "type": "boolean", "default": true }, "noneLabel": { "type": "string" },
+        "card": { "type": "object", "properties": { "title": { "type": "string" }, "subtitle": { "type": "string" } },
+                  "description": "Result card text; {{field}} placeholders use the row's (masked) values" },
+        "prompts": { "type": "object", "properties": { "many": { "type": "string" }, "none": { "type": "string" },
+          "tooMany": { "type": "string" }, "found": { "type": "string" }, "cancelled": { "type": "string" }, "gone": { "type": "string" } } },
+        "found": { "$ref": "#/$defs/id" }, "notFound": { "$ref": "#/$defs/id" },
+        "tooMany": { "$ref": "#/$defs/id" }, "cancelled": { "$ref": "#/$defs/id" }
+      },
+      "required": ["source", "as", "criteria", "found"]
+    },
+
+    "changeFields": {
+      "description": "Show the record's editable fields; the user changes any of them, then Done",
+      "properties": {
+        "type": { "const": "changeFields" },
+        "record": { "$ref": "#/$defs/alias" },
+        "cardTitle": { "type": "string" }, "prompt": { "type": "string" }, "againPrompt": { "type": "string" },
+        "doneLabel": { "type": "string" }, "noChangesText": { "type": "string" },
+        "fields": { "type": "array", "minItems": 1, "items": { "type": "object", "required": ["field"],
+          "properties": {
+            "field": { "type": "string" }, "label": { "type": "string" }, "prompt": { "type": "string" },
+            "input": { "$ref": "#/$defs/input" },
+            "validators": { "type": "array", "items": { "$ref": "#/$defs/validator" } },
+            "editableWhen": { "$ref": "#/$defs/condExpr" }, "lockedMessage": { "type": "string" } } } },
+        "done": { "$ref": "#/$defs/id" }, "noChanges": { "$ref": "#/$defs/id" }
+      },
+      "required": ["record", "fields", "done"]
+    },
+
+    "saveChanges": {
+      "description": "Send only changed fields with the record version; handles conflicts and permissions",
+      "properties": {
+        "type": { "const": "saveChanges" },
+        "record": { "$ref": "#/$defs/alias" },
+        "savedText": { "type": "string" }, "conflictText": { "type": "string" }, "noChangesText": { "type": "string" },
+        "saved": { "$ref": "#/$defs/id" }, "conflict": { "$ref": "#/$defs/id" }, "forbidden": { "$ref": "#/$defs/id" },
+        "error": { "$ref": "#/$defs/id" }, "noChanges": { "$ref": "#/$defs/id" }
+      },
+      "required": ["record", "saved"]
     },
 
     "message": {
@@ -124,6 +180,9 @@
 
     "summary": {
       "properties": { "type": { "const": "summary" }, "text": { "type": "string" },
+                      "mode": { "enum": ["answers", "changes"], "default": "answers",
+                                "description": "changes = show old -> new for the record named in 'record'" },
+                      "record": { "$ref": "#/$defs/alias" },
                       "fields": { "type": "array", "items": { "type": "string" } },
                       "confirmLabel": { "type": "string" }, "next": { "$ref": "#/$defs/id" } },
       "required": ["next"]

@@ -6,28 +6,35 @@ A chat widget you can drop into any page. It asks the questions defined in a flo
 answer on the server, branches on the answers, and fills the page's existing form as it goes.
 
 ```
-flows/      loan_application.json   sample flow (the "program")
-            flow.schema.json        JSON Schema for flow definitions (for the future designer / CI)
-designer/   index.html              visual flow designer (no dependencies)
-widget/     flowchat.js             <flow-chat> Web Component + transports + adapters (no dependencies)
-            flowchat-engine.js      reference engine in JS (demo, simulator, Node backends)
-db/         install.sql             runs 01..05 in order (06 ORDS is optional)
-            01_tables.sql           FC_FLOWS, FC_FLOW_VERSIONS, FC_CONNECTORS, FC_SESSIONS, FC_EVENTS
-            02/03_fc_engine.*       PL/SQL engine (server-authoritative)
-            04_demo_connectors.sql  sample lookup / validator / submit connectors + demo tables
-            05_seed_flow.sql        generated: publishes flows/loan_application.json
-            06_ords_module.sql      REST API for non-APEX hosts
-demo/       index.html              runs entirely in the browser using the JS engine
-tests/      engine.test.js          node tests/engine.test.js
-tools/      build-seed.js           flow JSON -> SQL publish script
+flows/      loan_application.json    sample "create" flow (collect answers, submit)
+            update_application.json  sample "search and update" flow (find, change, review, save)
+            flow.schema.json         JSON Schema for flow definitions
+designer/   index.html               visual flow designer (no dependencies)
+widget/     flowchat.js              <flow-chat> Web Component + transports + adapters (no dependencies)
+            flowchat-engine.js       reference engine in JS (demo, simulator, Node backends)
+db/         install.sql              runs 01..07 in order (08 ORDS is optional)
+            01_tables.sql            FC_FLOWS, FC_FLOW_VERSIONS, FC_CONNECTORS, FC_SESSIONS, FC_EVENTS
+            02_data_sources.sql      FC_DATA_SOURCES (+ fields) registry and the FC_DATA package
+            03/04_fc_engine.*        PL/SQL engine (server-authoritative)
+            05_demo_connectors.sql   sample lookup / validator / submit connectors + demo tables
+            06_demo_data_source.sql  exposes the demo table as the "loan_apps" data source
+            07_seed_flows.sql        generated: publishes both sample flows
+            08_ords_module.sql       REST API for non-APEX hosts
+demo/       index.html               create demo (runs in the browser using the JS engine)
+            update.html              search and update demo, with a live table and a conflict button
+tests/      engine.test.js           node tests/engine.test.js
+            update.test.js           node tests/update.test.js
+            apex-embed-test.html     designer inside a page-wide form, like APEX
+tools/      build-seed.js            flow JSON -> SQL publish script
 ```
 
-## 1. Try the demo (no database needed)
+## 1. Try the demos (no database needed)
 
 ```bash
 python -m http.server 8765
 ```
-Then open <http://localhost:8765/demo/>. The flow is fetched over HTTP, so opening the file directly won't work.
+Then open <http://localhost:8765/demo/> (create) or <http://localhost:8765/demo/update.html> (search and update).
+The flows are fetched over HTTP, so opening the files directly won't work.
 
 ## 1b. Design flows visually
 
@@ -97,6 +104,7 @@ To publish a new or changed flow:
 ```bash
 node tools/build-seed.js flows/my_flow.json > my_flow.sql
 ```
+(or use **Publish SQL** in the designer)
 Run `my_flow.sql`. Each run creates a new version. Sessions that have already started keep the version they started on.
 
 ## 3. Add it to an APEX page
@@ -129,7 +137,7 @@ answer is validated again on the server immediately before submit.
 
 ## 4. Use it on any other page
 
-Run `06_ords_module.sql`, then:
+Run `08_ords_module.sql`, then:
 
 ```html
 <script src="flowchat.js"></script>
@@ -175,6 +183,60 @@ Built-in conversation behaviour:
 - **Edit from the summary:** after the change, the flow is replayed. Branches are re-evaluated,
   any newly required question is asked, and questions you've already answered are skipped.
 
+## 6. Search and update flows
+
+`flows/update_application.json` is a complete example: ask for an email (and optionally a
+reference), find the application, change some fields, review the changes, and save.
+
+### Data sources (server-side registry)
+
+A flow never contains table names or SQL. It names a **data source**, which an administrator
+defines in `FC_DATA_SOURCES` and `FC_DATA_SOURCE_FIELDS` (see `db/06_demo_data_source.sql`):
+
+| Column | Meaning |
+|---|---|
+| `source_type` | `TABLE` (no code: FC_DATA builds bound SQL from the registered columns) or `PLSQL` (your own search/get/update functions) |
+| `object_name`, `key_column` | table or view, and its unique key |
+| `version_column` | optional NUMBER column, incremented on every update and used to detect conflicts. Without it, the original values of the changed columns are compared instead |
+| `row_filter` | trusted SQL predicate added to every search, get and update, e.g. `t.email = lower(:APP_USER)`. `:APP_USER` is bound to the signed-in APEX user |
+| field `searchable` / `search_ops` | which fields can be searched, and with which of `eq, starts, contains, gte, lte` |
+| field `updatable` | the server-side whitelist. A field that isn't updatable here can't be changed, whatever the flow says |
+| field `mask` | `last4` shows only the last 4 characters on search result cards |
+
+### New node types
+
+- **findRecord**: builds criteria from captured slots and searches the source.
+  - No match goes to `notFound`.
+  - One match is loaded straight away (`autoPick`).
+  - Several matches show result cards to pick from (`card.title` and `card.subtitle` use the row's masked values).
+  - More than `maxResults` matches goes to `tooMany`.
+  - The loaded record's fields are then available as `{{as.field}}`, in conditions, and in bindings such as `"app.phone": {...}`.
+- **changeFields**: shows the record's current values and a chip for each field. The user edits any
+  number of fields, and each one is validated exactly like an Ask (`input`, `validators`). Use
+  `editableWhen` to lock a field conditionally, for example the amount once the status isn't `NEW`.
+  **Done** goes to `done`, or to `noChanges` if nothing changed.
+- **summary** with `"mode": "changes"` shows only the changed fields as old → new, each with Edit.
+- **saveChanges**: re-validates every changed field and checks it's editable and updatable, then
+  updates only those columns, guarded by the version. Its exits:
+  - `saved`: the update succeeded.
+  - `conflict`: someone else changed the record. The latest version is reloaded with the user's
+    edits applied on top, so routing back to the review shows the new diff.
+  - `forbidden`: the field or row isn't allowed.
+  - `error`: anything else.
+
+  Every save writes the before and after values to `FC_EVENTS`.
+
+**Security:** record keys never reach the browser. Search results are sent as opaque tokens
+(`r1`, `r2`) that the engine maps back to keys on the server, so users can't reach other rows
+by tampering with ids.
+
+Turn-protocol additions:
+- `await.type` can now be `pick` (`items: [{token, title, subtitle}]`) or `fieldMenu`
+  (`fields: [{field, label, display, changed, editable, reason}]`). When editing a single field it's an
+  `ask` with `sub: true`.
+- New input payloads: `{"pick": "r1"}`, `{"pick": null}`, `{"field": "phone"}` and `{"command": "done"}`.
+- New message types: `record`, a read-only card, and `changes`, the old → new card.
+
 ## Turn protocol
 
 The server and the widget exchange exactly one JSON shape. Any backend that produces it works with the widget.
@@ -191,10 +253,13 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 9 unit tests, plus manual end-to-end runs of the demo.
-- **The PL/SQL engine has not been compiled yet.** No Oracle instance was available when it was
-  written. It mirrors the JavaScript engine rule for rule, but expect a small round of compile
-  fixes on first install.
+- The JavaScript engine and widget are tested: 17 unit tests (`tests/engine.test.js`,
+  `tests/update.test.js`), plus manual end-to-end runs of both demos.
+- **The PL/SQL (`FC_ENGINE`, `FC_DATA`) has not been compiled yet.** No Oracle instance was
+  available when it was written. It mirrors the JavaScript engine rule for rule, but expect a
+  small round of compile fixes on first install.
+- **The designer doesn't support the search/update nodes yet** (Phase B). It won't open
+  `update_application.json`; edit that flow as JSON for now.
 - The designer publishes through a downloaded SQL script. Saving directly to the database
   (an ORDS endpoint for drafts and versions) is the natural next step.
 - Not in Phase 1: resuming a conversation after a reload, line-item (repeat)

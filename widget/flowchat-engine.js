@@ -8,17 +8,26 @@
  *   - unit-testing flows.
  *
  * In production for APEX, the PL/SQL engine is authoritative; this file is optional there.
+ *
+ * Data sources (search / update flows): pass options.dataSources = { id: source } where a source has
+ *   search({criteria:[{field,op,value}], limit, context}) -> [{key, values}]
+ *   get({key, context})                                   -> {values, version} | null
+ *   update({key, version, original, changes, context})    -> {status: ok|conflict|forbidden|notfound, version?, message?}
+ *   fields: { name: {updatable, searchable, mask} }       (optional metadata; enforced by the source)
+ * createMemorySource() builds one over an in-memory array (demo, tests, designer mocks).
  */
 (function (global) {
   'use strict';
 
   var MAX_STEPS = 200;
   var REQUIRED_MSG = 'This one is required. Please provide a value.';
+  var AWAIT = { await: true };   // sentinel: a node stopped to wait for user input
 
   function pad(n) { return String(n).padStart(2, '0'); }
   function isoDate(d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); }
   function isFilled(v) { return !(v === undefined || v === null || v === ''); }
   function clone(o) { return o === undefined ? undefined : JSON.parse(JSON.stringify(o)); }
+  function same(a, b) { return String(isFilled(a) ? a : '') === String(isFilled(b) ? b : ''); }
 
   function randomId() {
     var b = new Uint8Array(16);
@@ -45,10 +54,25 @@
     return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d ? isoDate(dt) : null;
   }
 
-  function interpolate(text, slots) {
-    return String(text == null ? '' : text).replace(/\{\{\s*(\w+)\s*\}\}/g, function (_, k) {
-      return isFilled(slots[k]) ? String(slots[k]) : '';
+  // {{slot}} and {{record.field}} placeholders.
+  function interpolate(text, values) {
+    return String(text == null ? '' : text).replace(/\{\{\s*([\w.]+)\s*\}\}/g, function (_, k) {
+      return isFilled(values[k]) ? String(values[k]) : '';
     });
+  }
+
+  function displayFor(spec, v) {
+    if (!isFilled(v)) return '';
+    spec = spec || {};
+    switch (spec.kind) {
+      case 'number': return (spec.prefix || '') + formatNumber(v);
+      case 'yesno': return v === 'Y' ? 'Yes' : v === 'N' ? 'No' : String(v);
+      case 'choice': {
+        var o = (spec.options || []).find(function (x) { return String(x.value) === String(v); });
+        return o ? (o.label || o.value) : String(v);
+      }
+      default: return String(v);
+    }
   }
 
   // ---------------------------------------------------------------- parsing
@@ -103,12 +127,12 @@
     return typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v) ? parseFloat(v) : null;
   }
 
-  function evalCond(c, slots) {
+  function evalCond(c, values) {
     if (!c) return true;
-    if (c.all) return c.all.every(function (x) { return evalCond(x, slots); });
-    if (c.any) return c.any.some(function (x) { return evalCond(x, slots); });
-    if (c.not) return !evalCond(c.not, slots);
-    var v = slots[c.slot];
+    if (c.all) return c.all.every(function (x) { return evalCond(x, values); });
+    if (c.any) return c.any.some(function (x) { return evalCond(x, values); });
+    if (c.not) return !evalCond(c.not, values);
+    var v = values[c.slot];
     if (c.op === 'empty') return !isFilled(v);
     if (c.op === 'notEmpty') return isFilled(v);
     if (!isFilled(v)) return false;
@@ -126,10 +150,75 @@
     }
   }
 
-  function pickBranch(node, slots) {
+  function pickBranch(node, values) {
     var branches = node.branches || [];
-    for (var i = 0; i < branches.length; i++) if (evalCond(branches[i].when, slots)) return branches[i].next;
+    for (var i = 0; i < branches.length; i++) if (evalCond(branches[i].when, values)) return branches[i].next;
     return node['else'];
+  }
+
+  // ---------------------------------------------------------------- in-memory data source
+  function createMemorySource(def) {
+    var rows = def.rows || [];
+    var keyField = def.key || 'id';
+    var ver = def.versionField || null;
+    var fields = def.fields || {};
+    var names = Object.keys(fields);
+
+    function visible(row, req) { return !def.rowFilter || def.rowFilter(row, (req && req.context) || {}); }
+    function values(row, masked) {
+      var out = {};
+      names.forEach(function (f) {
+        var v = row[f];
+        if (masked && fields[f].mask === 'last4' && isFilled(v)) v = '•••• ' + String(v).slice(-4);
+        out[f] = v === undefined ? null : v;
+      });
+      return out;
+    }
+    function match(row, c) {
+      if (!fields[c.field] || fields[c.field].searchable === false) throw new Error('Field "' + c.field + '" is not searchable.');
+      var fv = row[c.field];
+      if (!isFilled(fv)) return false;
+      var a = String(fv).toLowerCase(), b = String(c.value).toLowerCase();
+      switch (c.op || 'eq') {
+        case 'eq': return a === b;
+        case 'starts': return a.indexOf(b) === 0;
+        case 'contains': return a.indexOf(b) >= 0;
+        case 'gte': return (asNumber(fv) !== null ? asNumber(fv) >= asNumber(c.value) : a >= b);
+        case 'lte': return (asNumber(fv) !== null ? asNumber(fv) <= asNumber(c.value) : a <= b);
+        default: throw new Error('Unknown search operator "' + c.op + '"');
+      }
+    }
+    function find(key, req) { return rows.find(function (r) { return String(r[keyField]) === String(key) && visible(r, req); }); }
+
+    return {
+      fields: fields,
+      rows: rows,
+      search: function (req) {
+        return rows.filter(function (r) { return visible(r, req) && req.criteria.every(function (c) { return match(r, c); }); })
+          .slice(0, req.limit || 50)
+          .map(function (r) { return { key: r[keyField], values: values(r, true) }; });
+      },
+      get: function (req) {
+        var r = find(req.key, req);
+        return r ? { values: values(r, false), version: ver ? r[ver] : null } : null;
+      },
+      update: function (req) {
+        var r = find(req.key, req);
+        if (!r) return { status: 'notfound' };
+        var ch = req.changes || {};
+        for (var f in ch) {
+          if (!fields[f] || !fields[f].updatable) return { status: 'forbidden', message: 'The field "' + f + '" cannot be changed.' };
+        }
+        if (ver) {
+          if (String(r[ver]) !== String(req.version)) return { status: 'conflict' };
+        } else {
+          for (var o in (req.original || {})) if (!same(r[o], req.original[o])) return { status: 'conflict' };
+        }
+        Object.keys(ch).forEach(function (k) { r[k] = ch[k]; });
+        if (ver) r[ver] = Number(r[ver]) + 1;
+        return { status: 'ok', version: ver ? r[ver] : null };
+      }
+    };
   }
 
   // ---------------------------------------------------------------- engine
@@ -138,32 +227,49 @@
     var flows = {};
     var compiled = {};
     var connectors = Object.assign({}, options.connectors);
+    var dataSources = Object.assign({}, options.dataSources);
     var sessions = new Map();
 
     function registerFlow(def) { flows[def.flowId] = clone(def); delete compiled[def.flowId]; }
     function registerConnector(name, fn) { connectors[name] = fn; }
+    function registerDataSource(name, src) { dataSources[name] = src; }
     (options.flows || []).forEach(registerFlow);
 
     function compile(flowId) {
       if (compiled[flowId]) return compiled[flowId];
       var flow = flows[flowId];
       if (!flow) throw new Error('Unknown flow "' + flowId + '"');
-      var nodes = {}, slotNodes = {};
+      var nodes = {}, slotNodes = {}, changeNodes = {}, findNodes = {};
       flow.nodes.forEach(function (n) {
         nodes[n.id] = n;
         if (n.type === 'ask' && !slotNodes[n.slot]) slotNodes[n.slot] = n;
+        if (n.type === 'changeFields' && !changeNodes[n.record]) changeNodes[n.record] = n;
+        if (n.type === 'findRecord' && !findNodes[n.as]) findNodes[n.as] = n;
       });
-      return (compiled[flowId] = { flow: flow, nodes: nodes, slotNodes: slotNodes });
+      return (compiled[flowId] = { flow: flow, nodes: nodes, slotNodes: slotNodes, changeNodes: changeNodes, findNodes: findNodes });
     }
 
     function makeCtx(sid, st) {
       var c = compile(st.flowId);
-      return { sid: sid, st: st, flow: c.flow, nodes: c.nodes, slotNodes: c.slotNodes,
-               out: [], updates: [], replay: false, forceAsk: null };
+      st.records = st.records || {};
+      st.results = st.results || {};
+      return { sid: sid, st: st, flow: c.flow, nodes: c.nodes, slotNodes: c.slotNodes, changeNodes: c.changeNodes,
+               findNodes: c.findNodes, out: [], updates: [], replay: false, forceAsk: null };
     }
 
     function say(ctx, type, text) { if (text) ctx.out.push({ type: type, text: text }); }
     function touch(ctx, slot) { if (ctx.updates.indexOf(slot) < 0) ctx.updates.push(slot); }
+
+    // Slots plus "alias.field" for every loaded record: what placeholders and conditions see.
+    function view(ctx) {
+      var v = Object.assign({}, ctx.st.slots);
+      var recs = ctx.st.records;
+      Object.keys(recs).forEach(function (a) {
+        var cur = recs[a].current || {};
+        Object.keys(cur).forEach(function (f) { v[a + '.' + f] = cur[f]; });
+      });
+      return v;
+    }
 
     function seedContext(ctx) {
       var ctxIn = ctx.st.context || {};
@@ -185,19 +291,40 @@
       return Promise.resolve(fn(payload)).then(function (r) { return r || {}; });
     }
 
-    function displayValue(ctx, slot) {
-      var v = ctx.st.slots[slot];
-      if (!isFilled(v)) return '';
-      var node = ctx.slotNodes[slot], spec = (node && node.input) || {};
-      switch (spec.kind) {
-        case 'number': return (spec.prefix || '') + formatNumber(v);
-        case 'yesno': return v === 'Y' ? 'Yes' : 'No';
-        case 'choice': {
-          var o = (spec.options || []).find(function (x) { return String(x.value) === String(v); });
-          return o ? (o.label || o.value) : String(v);
-        }
-        default: return String(v);
+    function source(name) {
+      var s = dataSources[name];
+      if (!s) throw new Error('Unknown data source "' + name + '"');
+      return s;
+    }
+    function dsContext(ctx) { return { sessionId: ctx.sid, flowId: ctx.flow.flowId, context: clone(ctx.st.context) }; }
+
+    // Input spec for a slot or "alias.field" (used for display formatting).
+    function specFor(ctx, name) {
+      var dot = name.indexOf('.');
+      if (dot > 0) {
+        var cn = ctx.changeNodes[name.slice(0, dot)];
+        var f = cn && fieldDef(cn, name.slice(dot + 1));
+        return f ? f.input : null;
       }
+      var n = ctx.slotNodes[name];
+      return n ? n.input : null;
+    }
+    function displayValue(ctx, name) { return displayFor(specFor(ctx, name), view(ctx)[name]); }
+
+    function fieldDef(changeNode, field) {
+      return (changeNode.fields || []).find(function (f) { return f.field === field; }) || null;
+    }
+    function fieldLabel(f) { return f.label || f.field; }
+    function fieldEditable(ctx, changeNode, f) {
+      var rec = ctx.st.records[changeNode.record];
+      var meta = rec && dataSources[rec.source] && dataSources[rec.source].fields;
+      if (meta && meta[f.field] && meta[f.field].updatable === false) return false;
+      return evalCond(f.editableWhen, view(ctx));
+    }
+    function recordChanges(rec) {
+      var ch = {};
+      Object.keys(rec.current).forEach(function (f) { if (!same(rec.current[f], rec.original[f])) ch[f] = rec.current[f]; });
+      return ch;
     }
 
     async function validate(ctx, node, value) {
@@ -227,6 +354,10 @@
       }
       return null;
     }
+    // A changeFields field validated like an Ask node.
+    function fieldAsNode(changeNode, f) {
+      return { id: changeNode.id, slot: changeNode.record + '.' + f.field, input: f.input || { kind: 'text' }, validators: f.validators };
+    }
 
     // Re-check every answered question before submitting (defence in depth).
     async function revalidate(ctx) {
@@ -241,6 +372,7 @@
     }
 
     function summaryMessage(ctx, node) {
+      if (node.mode === 'changes') return changesMessage(ctx, node);
       var slots = node.fields || ctx.flow.nodes
         .filter(function (n) { return n.type === 'ask' && isFilled(ctx.st.slots[n.slot]); })
         .map(function (n) { return n.slot; });
@@ -250,16 +382,48 @@
         var n = ctx.slotNodes[s];
         items.push({ slot: s, label: (n && n.label) || s, display: displayValue(ctx, s), editable: !!n });
       });
-      return { type: 'summary', text: interpolate(node.text || "Here's what I have. Please check:", ctx.st.slots), items: items };
+      return { type: 'summary', text: interpolate(node.text || "Here's what I have. Please check:", view(ctx)), items: items };
+    }
+
+    function changesMessage(ctx, node) {
+      var rec = ctx.st.records[node.record];
+      var cn = ctx.changeNodes[node.record];
+      if (!rec) throw new Error('Summary "' + node.id + '" needs a loaded record "' + node.record + '".');
+      var ch = recordChanges(rec);
+      var items = Object.keys(ch).map(function (f) {
+        var fd = cn && fieldDef(cn, f);
+        var spec = fd ? fd.input : null;
+        return { slot: node.record + '.' + f, label: fd ? fieldLabel(fd) : f,
+                 before: displayFor(spec, rec.original[f]), after: displayFor(spec, rec.current[f]), editable: !!fd };
+      });
+      return { type: 'changes', text: interpolate(node.text || (items.length ? 'Please confirm these changes:' : "You haven't changed anything yet."), view(ctx)), items: items };
+    }
+
+    function recordCard(ctx, node) {
+      var rec = ctx.st.records[node.record];
+      return {
+        type: 'record',
+        text: interpolate(node.cardTitle || 'Current details', view(ctx)),
+        items: (node.fields || []).map(function (f) {
+          return { slot: node.record + '.' + f.field, label: fieldLabel(f), display: displayFor(f.input, rec.current[f.field]) };
+        })
+      };
     }
 
     function progress(ctx) {
-      var id = ctx.flow.start, done = 0, total = 0, steps = 0;
+      var id = ctx.flow.start, done = 0, total = 0, steps = 0, v = view(ctx);
       while (id && steps++ < MAX_STEPS) {
         var n = ctx.nodes[id];
         if (!n) break;
         if (n.type === 'ask') { total++; if (isFilled(ctx.st.slots[n.slot])) done++; id = n.next; }
-        else if (n.type === 'condition') id = pickBranch(n, ctx.st.slots);
+        else if (n.type === 'findRecord') { total++; if (ctx.st.records[n.as]) done++; id = n.found; }
+        else if (n.type === 'changeFields') {
+          total++;
+          var rec = ctx.st.records[n.record];
+          if (rec && Object.keys(recordChanges(rec)).length) done++;
+          id = n.done;
+        }
+        else if (n.type === 'condition') id = pickBranch(n, v);
         else if (n.type === 'message' || n.type === 'lookup') id = n.next;
         else break;
       }
@@ -267,19 +431,123 @@
       return { done: done, total: total };
     }
 
+    // ---- data nodes
+    async function runFind(ctx, node) {
+      var st = ctx.st, v = view(ctx), prompts = node.prompts || {};
+      var criteria = [];
+      (node.criteria || []).forEach(function (c) {
+        var val = v[c.slot];
+        if (isFilled(val)) criteria.push({ field: c.field, op: c.op || 'eq', value: val });
+      });
+      if (criteria.length < (node.minCriteria || 1)) {
+        say(ctx, 'text', interpolate(prompts.none || "I couldn't find a matching record.", v));
+        return node.notFound;
+      }
+      var max = node.maxResults || 10;
+      var rows = (await Promise.resolve(source(node.source).search({ criteria: criteria, limit: max + 1, context: dsContext(ctx).context }))) || [];
+      if (!rows.length) {
+        say(ctx, 'text', interpolate(prompts.none || "I couldn't find a matching record.", v));
+        return node.notFound;
+      }
+      if (rows.length > max) {
+        say(ctx, 'text', interpolate(prompts.tooMany || "That matches too many records. Let's narrow it down.", v));
+        return node.tooMany || node.notFound;
+      }
+      if (rows.length === 1 && node.autoPick !== false) return loadRecord(ctx, node, rows[0].key);
+      st.results[node.id] = rows.map(function (r, i) {
+        var card = node.card || {};
+        return { token: 'r' + (i + 1), key: r.key,
+                 title: interpolate(card.title || String(r.key), r.values),
+                 subtitle: card.subtitle ? interpolate(card.subtitle, r.values) : '' };
+      });
+      st.current = node.id;
+      say(ctx, 'text', interpolate(prompts.many || 'I found {{count}} matching records. Which one?', Object.assign({}, v, { count: rows.length })));
+      return AWAIT;
+    }
+
+    async function loadRecord(ctx, node, key) {
+      var res = await Promise.resolve(source(node.source).get({ key: key, context: dsContext(ctx).context }));
+      delete ctx.st.results[node.id];
+      if (!res || !res.values) {
+        say(ctx, 'error', (node.prompts || {}).gone || 'That record is no longer available.');
+        return node.notFound;
+      }
+      ctx.st.records[node.as] = { source: node.source, key: key, version: res.version === undefined ? null : res.version,
+                                  original: clone(res.values), current: clone(res.values) };
+      Object.keys(res.values).forEach(function (f) { touch(ctx, node.as + '.' + f); });
+      say(ctx, 'text', interpolate((node.prompts || {}).found, view(ctx)));
+      return node.found;
+    }
+
+    function promptField(ctx, cn, f) {
+      var rec = ctx.st.records[cn.record];
+      ctx.st.current = cn.id;
+      ctx.st.editingField = f.field;
+      var cur = displayFor(f.input, rec.current[f.field]);
+      say(ctx, 'text', interpolate(f.prompt || (fieldLabel(f) + (cur ? ' is currently ' + cur + '. What should it be?' : ' is empty. What should it be?')), view(ctx)));
+    }
+
+    async function runSave(ctx, node) {
+      var st = ctx.st, rec = st.records[node.record];
+      if (!rec) throw new Error('Save changes "' + node.id + '" needs a loaded record "' + node.record + '".');
+      var cn = ctx.changeNodes[node.record];
+      var changes = recordChanges(rec), fieldsChanged = Object.keys(changes);
+      if (!fieldsChanged.length) { say(ctx, 'text', node.noChangesText || 'Nothing changed, so there was nothing to save.'); return node.noChanges || node.saved; }
+
+      // Defence in depth: every changed field must be declared editable and must still validate.
+      for (var i = 0; i < fieldsChanged.length; i++) {
+        var fd = cn && fieldDef(cn, fieldsChanged[i]);
+        if (!fd || !fieldEditable(ctx, cn, fd)) {
+          say(ctx, 'error', 'The field "' + fieldsChanged[i] + '" cannot be changed here.');
+          return node.forbidden || failed(ctx);
+        }
+        var err = await validate(ctx, fieldAsNode(cn, fd), changes[fieldsChanged[i]]);
+        if (err) { say(ctx, 'error', err); promptField(ctx, cn, fd); return AWAIT; }
+      }
+
+      var src = source(rec.source), original = {};
+      fieldsChanged.forEach(function (f) { original[f] = rec.original[f]; });
+      var r = (await Promise.resolve(src.update({ key: rec.key, version: rec.version, original: original, changes: changes, context: dsContext(ctx).context }))) || {};
+      if (r.status === 'ok') {
+        if (r.version !== undefined && r.version !== null) rec.version = r.version;
+        rec.original = clone(rec.current);
+        say(ctx, 'text', r.message || node.savedText);
+        return node.saved;
+      }
+      if (r.status === 'conflict') {
+        var fresh = await Promise.resolve(src.get({ key: rec.key, context: dsContext(ctx).context }));
+        if (!fresh || !fresh.values) { say(ctx, 'error', 'That record is no longer available.'); return node.error || failed(ctx); }
+        rec.original = clone(fresh.values);
+        rec.version = fresh.version === undefined ? null : fresh.version;
+        rec.current = Object.assign(clone(fresh.values), changes);
+        Object.keys(rec.current).forEach(function (f) { touch(ctx, node.record + '.' + f); });
+        say(ctx, 'error', r.message || node.conflictText ||
+          "Someone else changed this record after you opened it. I've loaded the latest version with your changes on top. Please check them again.");
+        return node.conflict || node.error || failed(ctx);
+      }
+      if (r.status === 'forbidden') {
+        say(ctx, 'error', r.message || "You're not allowed to change this record.");
+        return node.forbidden || failed(ctx);
+      }
+      say(ctx, 'error', r.message || 'Sorry, the changes could not be saved.');
+      return node.error || failed(ctx);
+    }
+
+    function failed(ctx) { ctx.st.status = 'failed'; ctx.st.current = null; return null; }
+
     async function run(ctx, startId) {
       var st = ctx.st, id = startId, steps = 0;
       while (id) {
         if (++steps > MAX_STEPS) throw new Error('Flow exceeded ' + MAX_STEPS + ' steps. Check it for a loop.');
-        var node = ctx.nodes[id], r;
+        var node = ctx.nodes[id], r, nxt;
         if (!node) throw new Error('Flow references unknown node "' + id + '".');
         switch (node.type) {
           case 'message':
-            if (!ctx.replay) say(ctx, 'text', interpolate(node.text, st.slots));
+            if (!ctx.replay) say(ctx, 'text', interpolate(node.text, view(ctx)));
             id = node.next;
             break;
           case 'condition':
-            id = pickBranch(node, st.slots);
+            id = pickBranch(node, view(ctx));
             break;
           case 'lookup':
             if (ctx.replay) { id = node.next; break; }
@@ -294,7 +562,7 @@
             if (ctx.replay) st.editing = true;
             ctx.replay = false; ctx.forceAsk = null;
             st.current = id;
-            say(ctx, 'text', interpolate(node.prompt, st.slots));
+            say(ctx, 'text', interpolate(node.prompt, view(ctx)));
             return;
           case 'summary':
             ctx.replay = false;
@@ -310,23 +578,44 @@
             else {
               say(ctx, 'error', r.message || 'Sorry, the submission failed.');
               id = node.onError;
-              if (!id) { st.status = 'failed'; st.current = null; return; }
+              if (!id) { failed(ctx); return; }
             }
             break;
           }
+          case 'findRecord':
+            if (ctx.replay && st.records[node.as]) { id = node.found; break; }
+            ctx.replay = false;
+            nxt = await runFind(ctx, node);
+            if (nxt === AWAIT) return;
+            id = nxt;
+            break;
+          case 'changeFields':
+            if (!st.records[node.record]) throw new Error('Change fields "' + id + '" needs a loaded record "' + node.record + '".');
+            ctx.replay = false;
+            st.current = id;
+            st.editingField = null;
+            ctx.out.push(recordCard(ctx, node));
+            say(ctx, 'text', interpolate(node.prompt || 'What would you like to change?', view(ctx)));
+            return;
+          case 'saveChanges':
+            nxt = await runSave(ctx, node);
+            if (nxt === AWAIT) return;
+            if (nxt === null && st.status === 'failed') return;
+            id = nxt;
+            break;
           case 'end':
-            say(ctx, 'success', interpolate(node.text, st.slots));
+            say(ctx, 'success', interpolate(node.text, view(ctx)));
             st.status = 'completed'; st.current = null;
             return;
           default:
             throw new Error('Unknown node type "' + node.type + '" (' + id + ').');
         }
       }
-      st.status = 'completed'; st.current = null;
+      if (st.status === 'in_progress') { st.status = 'completed'; st.current = null; }
     }
 
     function buildTurn(ctx) {
-      var st = ctx.st, aw = null;
+      var st = ctx.st, aw = null, v = view(ctx);
       if (st.status === 'in_progress' && st.current) {
         var n = ctx.nodes[st.current];
         if (n.type === 'ask') {
@@ -334,8 +623,28 @@
                  input: clone(n.input || { kind: 'text' }),
                  value: isFilled(st.slots[n.slot]) ? st.slots[n.slot] : null };
           if (!aw.input.kind) aw.input.kind = 'text';
-        } else {
+        } else if (n.type === 'summary') {
           aw = { type: 'summary', nodeId: n.id, confirmLabel: n.confirmLabel || 'Confirm & submit' };
+        } else if (n.type === 'findRecord') {
+          aw = { type: 'pick', nodeId: n.id,
+                 items: (st.results[n.id] || []).map(function (r) { return { token: r.token, title: r.title, subtitle: r.subtitle }; }),
+                 allowNone: n.allowNone !== false, noneLabel: n.noneLabel || 'None of these' };
+        } else if (n.type === 'changeFields') {
+          var rec = st.records[n.record];
+          if (st.editingField) {
+            var f = fieldDef(n, st.editingField);
+            aw = { type: 'ask', nodeId: n.id, slot: n.record + '.' + f.field, label: fieldLabel(f),
+                   input: clone(f.input || { kind: 'text' }), value: isFilled(rec.current[f.field]) ? rec.current[f.field] : null, sub: true };
+            if (!aw.input.kind) aw.input.kind = 'text';
+          } else {
+            aw = { type: 'fieldMenu', nodeId: n.id, doneLabel: n.doneLabel || 'Done',
+                   fields: (n.fields || []).map(function (fd) {
+                     var ed = fieldEditable(ctx, n, fd);
+                     return { field: fd.field, label: fieldLabel(fd), display: displayFor(fd.input, rec.current[fd.field]),
+                              changed: !same(rec.current[fd.field], rec.original[fd.field]), editable: ed,
+                              reason: ed ? null : (fd.lockedMessage || 'This field cannot be changed right now.') };
+                   }) };
+          }
         }
       }
       return {
@@ -343,11 +652,11 @@
         messages: ctx.out,
         'await': aw,
         fieldUpdates: ctx.updates.map(function (s) {
-          return { slot: s, value: isFilled(st.slots[s]) ? st.slots[s] : null,
+          return { slot: s, value: isFilled(v[s]) ? v[s] : null,
                    display: displayValue(ctx, s), binding: (ctx.flow.bindings || {})[s] || null };
         }),
         progress: progress(ctx),
-        canGoBack: st.history.length > 0
+        canGoBack: st.history.length > 0 || !!st.editingField
       };
     }
 
@@ -355,7 +664,7 @@
       var flow = compile(flowId).flow;
       var sid = randomId();
       var st = { flowId: flowId, version: flow.version || 1, status: 'in_progress', current: null,
-                 slots: {}, history: [], editing: false, context: clone(context || {}) };
+                 slots: {}, history: [], editing: false, context: clone(context || {}), records: {}, results: {}, editingField: null };
       sessions.set(sid, st);
       var ctx = makeCtx(sid, st);
       seedContext(ctx);
@@ -370,40 +679,99 @@
       payload = payload || {};
       if (st.status !== 'in_progress') return clone(buildTurn(ctx));
       var cmd = String(payload.command || '').toLowerCase();
+      var node = ctx.nodes[st.current];
 
       if (cmd === 'restart') {
-        Object.keys(st.slots).forEach(function (k) { touch(ctx, k); });
-        st.slots = {}; st.history = []; st.editing = false;
+        Object.keys(view(ctx)).forEach(function (k) { touch(ctx, k); });
+        st.slots = {}; st.history = []; st.editing = false; st.records = {}; st.results = {}; st.editingField = null;
         seedContext(ctx);
         say(ctx, 'text', "Okay, let's start over.");
         await run(ctx, ctx.flow.start);
+      } else if (cmd === 'back' && node && node.type === 'changeFields' && st.editingField) {
+        st.editingField = null;
+        say(ctx, 'text', 'No problem, I kept it as it was. Anything else to change?');
       } else if (cmd === 'back') {
         var prev = st.history.pop();
         st.editing = false;
         ctx.forceAsk = prev || st.current;
         await run(ctx, prev || st.current);
       } else if (cmd === 'edit') {
-        var target = ctx.slotNodes[payload.slot];
-        if (!target) say(ctx, 'error', 'There is no question for "' + payload.slot + '".');
-        else { st.editing = true; ctx.forceAsk = target.id; await run(ctx, target.id); }
-      } else {
-        var node = ctx.nodes[st.current];
-        if (node.type === 'ask') {
-          var parsed = parseValue(node.input, payload.value);
-          var err = parsed.error || await validate(ctx, node, parsed.value);
-          if (err) say(ctx, 'error', err);
-          else {
-            st.slots[node.slot] = parsed.value; touch(ctx, node.slot);
-            st.history.push(node.id);
-            if (st.editing) { st.editing = false; ctx.replay = true; await run(ctx, ctx.flow.start); }
-            else await run(ctx, node.next);
-          }
-        } else if (node.type === 'summary') {
-          if (/^(confirm|yes|y|ok|submit)$/i.test(String(payload.value || '').trim())) await run(ctx, node.next);
-          else say(ctx, 'text', 'Tap "' + (node.confirmLabel || 'Confirm & submit') + '", or use Edit next to any answer to change it.');
+        var slot = String(payload.slot || '');
+        var dot = slot.indexOf('.');
+        var cn = dot > 0 ? ctx.changeNodes[slot.slice(0, dot)] : null;
+        var fd = cn && fieldDef(cn, slot.slice(dot + 1));
+        var target = ctx.slotNodes[slot];
+        if (fd && fieldEditable(ctx, cn, fd)) promptField(ctx, cn, fd);
+        else if (target) { st.editing = true; ctx.forceAsk = target.id; await run(ctx, target.id); }
+        else say(ctx, 'error', 'There is no question for "' + slot + '".');
+      } else if (node.type === 'ask') {
+        var parsed = parseValue(node.input, payload.value);
+        var err = parsed.error || await validate(ctx, node, parsed.value);
+        if (err) say(ctx, 'error', err);
+        else {
+          st.slots[node.slot] = parsed.value; touch(ctx, node.slot);
+          st.history.push(node.id);
+          if (st.editing) { st.editing = false; ctx.replay = true; await run(ctx, ctx.flow.start); }
+          else await run(ctx, node.next);
         }
+      } else if (node.type === 'summary') {
+        if (/^(confirm|yes|y|ok|submit|save)$/i.test(String(payload.value || '').trim())) await run(ctx, node.next);
+        else say(ctx, 'text', 'Tap "' + (node.confirmLabel || 'Confirm & submit') + '", or use Edit next to any answer to change it.');
+      } else if (node.type === 'findRecord') {
+        await handlePick(ctx, node, payload);
+      } else if (node.type === 'changeFields') {
+        await handleChange(ctx, node, payload, cmd);
       }
       return clone(buildTurn(ctx));
+    }
+
+    async function handlePick(ctx, node, payload) {
+      var results = ctx.st.results[node.id] || [];
+      var choice = null;
+      if ('pick' in payload) {
+        if (payload.pick === null) {
+          delete ctx.st.results[node.id];
+          say(ctx, 'text', (node.prompts || {}).cancelled || 'Okay.');
+          await run(ctx, node.cancelled || node.notFound);
+          return;
+        }
+        choice = results.find(function (r) { return r.token === payload.pick; });
+      } else if (isFilled(payload.value)) {
+        var t = String(payload.value).trim().toLowerCase();
+        choice = /^\d+$/.test(t) ? results[parseInt(t, 10) - 1]
+          : results.find(function (r) { return r.title.toLowerCase().indexOf(t) >= 0; });
+      }
+      if (!choice) { say(ctx, 'error', 'Please choose one of the records shown.'); return; }
+      ctx.st.history.push(node.id);
+      var nxt = await loadRecord(ctx, node, choice.key);
+      await run(ctx, nxt);
+    }
+
+    async function handleChange(ctx, node, payload, cmd) {
+      var st = ctx.st, rec = st.records[node.record];
+      if (st.editingField) {
+        var f = fieldDef(node, st.editingField);
+        var parsed = parseValue(f.input, payload.value);
+        var err = parsed.error || await validate(ctx, fieldAsNode(node, f), parsed.value);
+        if (err) { say(ctx, 'error', err); return; }
+        rec.current[f.field] = parsed.value;
+        touch(ctx, node.record + '.' + f.field);
+        st.editingField = null;
+        say(ctx, 'text', interpolate(node.againPrompt || 'Got it. Anything else to change?', view(ctx)));
+        return;
+      }
+      var val = String(payload.value || '').trim().toLowerCase();
+      if (cmd === 'done' || (!payload.field && val && (val === 'done' || val === (node.doneLabel || 'done').toLowerCase()))) {
+        if (Object.keys(recordChanges(rec)).length) await run(ctx, node.done);
+        else { say(ctx, 'text', node.noChangesText || "You haven't changed anything."); await run(ctx, node.noChanges || node.done); }
+        return;
+      }
+      var fieldName = payload.field || null;
+      var fd = fieldName ? fieldDef(node, fieldName)
+        : (node.fields || []).find(function (x) { return fieldLabel(x).toLowerCase() === val || x.field === val; });
+      if (!fd) { say(ctx, 'error', 'Please choose a field to change, or ' + (node.doneLabel || 'Done') + '.'); return; }
+      if (!fieldEditable(ctx, node, fd)) { say(ctx, 'error', fd.lockedMessage || 'This field cannot be changed right now.'); return; }
+      promptField(ctx, node, fd);
     }
 
     return {
@@ -411,11 +779,13 @@
       input: input,
       registerFlow: registerFlow,
       registerConnector: registerConnector,
+      registerDataSource: registerDataSource,
       getState: function (sid) { return clone(sessions.get(sid)); }
     };
   }
 
-  var api = { createEngine: createEngine, parseValue: parseValue, evalCond: evalCond, interpolate: interpolate };
+  var api = { createEngine: createEngine, createMemorySource: createMemorySource, parseValue: parseValue,
+              evalCond: evalCond, interpolate: interpolate };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else global.FlowChatEngine = api;
 })(typeof window !== 'undefined' ? window : globalThis);

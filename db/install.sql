@@ -1,20 +1,25 @@
--- FlowChat installer. Run as the APEX application's parsing schema:
---   sql user/pass@db @install.sql            (SQLcl, or SQL*Plus, or SQL Workshop > SQL Scripts)
+-- FlowChat installer. Run as the APEX application's parsing schema, from this folder:
+--   sql user/pass@db @install.sql            (SQLcl, or SQL*Plus, or SQL Workshop > SQL Scripts in this order)
 -- Prerequisite (run once as ADMIN/SYS):  grant execute on sys.dbms_crypto to <schema>;
 set define off
 set serveroutput on
 whenever sqlerror exit failure rollback
 
-prompt == Tables
+prompt == Repository and runtime tables
 @@01_tables.sql
+prompt == Data source registry + FC_DATA (search / get / update)
+@@02_data_sources.sql
+show errors package body fc_data
 prompt == Engine
-@@02_fc_engine.pks
-@@03_fc_engine.pkb
+@@03_fc_engine.pks
+@@04_fc_engine.pkb
 show errors package body fc_engine
-prompt == Demo connectors
-@@04_demo_connectors.sql
-prompt == Sample flow
-@@05_seed_flow.sql
+prompt == Demo connectors and tables
+@@05_demo_connectors.sql
+prompt == Demo data source (loan_apps)
+@@06_demo_data_source.sql
+prompt == Sample flows (loan_application, update_application)
+@@07_seed_flows.sql
 -- Optional REST API for non-APEX pages:
--- @@06_ords_module.sql
+-- @@08_ords_module.sql
 prompt == Done

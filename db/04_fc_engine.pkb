@@ -1,0 +1,1725 @@
+create or replace package body fc_engine as
+
+  c_max_steps  constant pls_integer := 200;
+  c_required   constant varchar2(100) := 'This one is required. Please provide a value.';
+  c_not_found  constant varchar2(100) := 'I couldn''t find a matching record.';
+  c_ttl        constant interval day to second := interval '1' day;
+  c_nls        constant varchar2(40) := 'NLS_NUMERIC_CHARACTERS=''.,''';
+
+  type t_ctx is record (
+    session_id    varchar2(32),
+    flow          json_object_t,
+    nodes         json_object_t,   -- node id -> node
+    slot_nodes    json_object_t,   -- slot    -> id of the first ask node capturing it
+    change_nodes  json_object_t,   -- record alias -> id of its changeFields node
+    state         json_object_t,
+    slots         json_object_t,
+    records       json_object_t,   -- alias -> {source, key, version, original{}, current{}}  (server-side only)
+    results       json_object_t,   -- findRecord node id -> [{token, key, title, subtitle}]    (server-side only)
+    history       json_array_t,
+    out_msgs      json_array_t,
+    updates       json_array_t,    -- slots / alias.field changed during this turn
+    replay        boolean,
+    force_ask     varchar2(200)
+  );
+
+  ------------------------------------------------------------------------------
+  -- scalar helpers
+  ------------------------------------------------------------------------------
+  function num_str (p in number) return varchar2 is
+    l varchar2(100);
+  begin
+    if p is null then return null; end if;
+    l := to_char(p, 'TM9', c_nls);
+    if l like '.%' then l := '0' || l;
+    elsif l like '-.%' then l := '-0' || substr(l, 2);
+    end if;
+    return l;
+  end num_str;
+
+  function to_num (p in varchar2) return number is
+  begin
+    if p is null or not regexp_like(p, '^-?[0-9]+(\.[0-9]+)?$') then return null; end if;
+    return to_number(p, '999999999999999999999999999.99999999999');
+  exception when others then return null;
+  end to_num;
+
+  function fmt_num (p in number) return varchar2 is
+  begin
+    if p is null then return null; end if;
+    if p = trunc(p) then return to_char(p, 'FM999G999G999G999G990', c_nls); end if;
+    return rtrim(to_char(p, 'FM999G999G999G999G990D00', c_nls), '0');
+  end fmt_num;
+
+  -- Any JSON scalar member as text (numbers in canonical '.' format), null if absent.
+  function str (p_obj in json_object_t, p_key in varchar2) return varchar2 is
+    l_el json_element_t;
+  begin
+    if p_obj is null or p_key is null or not p_obj.has(p_key) then return null; end if;
+    l_el := p_obj.get(p_key);
+    if l_el is null or l_el.is_null then return null;
+    elsif l_el.is_string then return p_obj.get_string(p_key);
+    elsif l_el.is_number then return num_str(p_obj.get_number(p_key));
+    elsif l_el.is_true then return 'true';
+    elsif l_el.is_false then return 'false';
+    else return l_el.to_string;
+    end if;
+  end str;
+
+  function el_str (p_el in json_element_t) return varchar2 is
+    l json_object_t := json_object_t();
+  begin
+    if p_el is null then return null; end if;
+    l.put('v', p_el);
+    return str(l, 'v');
+  end el_str;
+
+  function obj (p_obj in json_object_t, p_key in varchar2) return json_object_t is
+  begin
+    if p_obj is null or not p_obj.has(p_key) or not p_obj.get(p_key).is_object then return null; end if;
+    return p_obj.get_object(p_key);
+  end obj;
+
+  function arr (p_obj in json_object_t, p_key in varchar2) return json_array_t is
+  begin
+    if p_obj is null or not p_obj.has(p_key) or not p_obj.get(p_key).is_array then return json_array_t(); end if;
+    return p_obj.get_array(p_key);
+  end arr;
+
+  function copy (p_obj in json_object_t) return json_object_t is
+  begin
+    if p_obj is null then return json_object_t(); end if;
+    return json_object_t.parse(p_obj.to_clob);
+  end copy;
+
+  function key_count (p_obj in json_object_t) return pls_integer is
+    l_keys json_key_list;
+  begin
+    if p_obj is null then return 0; end if;
+    l_keys := p_obj.get_keys;
+    return case when l_keys is null then 0 else l_keys.count end;
+  end key_count;
+
+  function same (a in varchar2, b in varchar2) return boolean is
+  begin
+    return nvl(a, chr(0)) = nvl(b, chr(0));
+  end same;
+
+  function get_bool (p_obj in json_object_t, p_key in varchar2) return boolean is
+  begin
+    return p_obj is not null and p_obj.has(p_key) and p_obj.get(p_key).is_true;
+  end get_bool;
+
+  function safe_date (p in varchar2, p_fmt in varchar2) return date is
+  begin
+    return to_date(p, p_fmt);
+  exception when others then return null;
+  end safe_date;
+
+  function resolve_date (p in varchar2) return varchar2 is
+  begin
+    case lower(p)
+      when 'today'    then return to_char(trunc(current_date), 'YYYY-MM-DD');
+      when 'tomorrow' then return to_char(trunc(current_date) + 1, 'YYYY-MM-DD');
+      else return p;
+    end case;
+  end resolve_date;
+
+  -- {{slot}} and {{record.field}} placeholders.
+  function interpolate (p_text in varchar2, p_values in json_object_t) return varchar2 is
+    l_res varchar2(32767) := p_text;
+    l_key varchar2(200);
+  begin
+    for i in 1 .. 50 loop
+      l_key := regexp_substr(l_res, '\{\{\s*([A-Za-z0-9_.]+)\s*\}\}', 1, 1, null, 1);
+      exit when l_key is null;
+      l_res := regexp_replace(l_res, '\{\{\s*' || replace(l_key, '.', '\.') || '\s*\}\}',
+                              replace(str(p_values, l_key), '\', '\\'));
+    end loop;
+    return l_res;
+  end interpolate;
+
+  ------------------------------------------------------------------------------
+  -- context helpers
+  ------------------------------------------------------------------------------
+  function get_node (c in out nocopy t_ctx, p_id in varchar2) return json_object_t is
+  begin
+    if p_id is null or not c.nodes.has(p_id) then
+      raise_application_error(-20022, 'Flow references unknown node "' || p_id || '".');
+    end if;
+    return c.nodes.get_object(p_id);
+  end get_node;
+
+  function input_spec (p_node in json_object_t) return json_object_t is
+    l json_object_t;
+  begin
+    if p_node is not null and p_node.has('input') then l := p_node.get_object('input'); else l := json_object_t(); end if;
+    if not l.has('kind') then l.put('kind', 'text'); end if;
+    return l;
+  end input_spec;
+
+  -- Slots plus "alias.field" for every loaded record: what placeholders and conditions see.
+  function vals (c in out nocopy t_ctx) return json_object_t is
+    l_v     json_object_t := copy(c.slots);
+    l_alias json_key_list := c.records.get_keys;
+    l_cur   json_object_t;
+    l_flds  json_key_list;
+  begin
+    if l_alias is not null then
+      for i in 1 .. l_alias.count loop
+        l_cur := obj(c.records.get_object(l_alias(i)), 'current');
+        if l_cur is not null then
+          l_flds := l_cur.get_keys;
+          if l_flds is not null then
+            for j in 1 .. l_flds.count loop
+              l_v.put(l_alias(i) || '.' || l_flds(j), l_cur.get(l_flds(j)));
+            end loop;
+          end if;
+        end if;
+      end loop;
+    end if;
+    return l_v;
+  end vals;
+
+  procedure add_msg (c in out nocopy t_ctx, p_type in varchar2, p_text in varchar2) is
+    l json_object_t := json_object_t();
+  begin
+    if p_text is null then return; end if;
+    l.put('type', p_type);
+    l.put('text', p_text);
+    c.out_msgs.append(l);
+  end add_msg;
+
+  procedure touch (c in out nocopy t_ctx, p_slot in varchar2) is
+  begin
+    for i in 0 .. c.updates.get_size - 1 loop
+      if c.updates.get_string(i) = p_slot then return; end if;
+    end loop;
+    c.updates.append(p_slot);
+  end touch;
+
+  procedure merge_slots (c in out nocopy t_ctx, p_res in json_object_t) is
+    l_obj  json_object_t;
+    l_keys json_key_list;
+  begin
+    l_obj := obj(p_res, 'slots');
+    if l_obj is null then return; end if;
+    l_keys := l_obj.get_keys;
+    if l_keys is null then return; end if;
+    for i in 1 .. l_keys.count loop
+      c.slots.put(l_keys(i), l_obj.get(l_keys(i)));
+      touch(c, l_keys(i));
+    end loop;
+  end merge_slots;
+
+  function failed (c in out nocopy t_ctx) return varchar2 is
+  begin
+    c.state.put('status', 'failed');
+    c.state.put_null('current');
+    return null;
+  end failed;
+
+  -- Next node id, or mark the conversation failed when the port is not connected.
+  function route (c in out nocopy t_ctx, p_id in varchar2) return varchar2 is
+  begin
+    if p_id is null then return failed(c); end if;
+    return p_id;
+  end route;
+
+  ------------------------------------------------------------------------------
+  -- connectors
+  ------------------------------------------------------------------------------
+  function payload (c in out nocopy t_ctx, p_node_id in varchar2,
+                    p_slot in varchar2 default null, p_value in json_element_t default null) return clob is
+    l json_object_t := json_object_t();
+  begin
+    l.put('sessionId', c.session_id);
+    l.put('flowId', str(c.flow, 'flowId'));
+    l.put('nodeId', p_node_id);
+    l.put('slots', c.slots);
+    if c.state.has('context') then l.put('context', c.state.get_object('context')); end if;
+    if p_slot is not null then l.put('slot', p_slot); end if;
+    if p_value is not null then l.put('value', p_value); end if;
+    return l.to_clob;
+  end payload;
+
+  function call_connector (p_connector in varchar2, p_payload in clob) return json_object_t is
+    l_type   fc_connectors.connector_type%type;
+    l_target fc_connectors.target%type;
+    l_res    clob;
+  begin
+    begin
+      select connector_type, target into l_type, l_target
+        from fc_connectors
+       where connector_id = p_connector and enabled = 'Y';
+    exception when no_data_found then
+      raise_application_error(-20011, 'Unknown or disabled connector "' || p_connector || '".');
+    end;
+
+    if l_type = 'PLSQL' then
+      execute immediate 'begin :r := ' || dbms_assert.qualified_sql_name(l_target) || '(:p); end;'
+        using out l_res, in p_payload;
+    elsif l_type = 'REST' then
+      apex_web_service.g_request_headers.delete;
+      apex_web_service.g_request_headers(1).name  := 'Content-Type';
+      apex_web_service.g_request_headers(1).value := 'application/json';
+      l_res := apex_web_service.make_rest_request(p_url => l_target, p_http_method => 'POST', p_body => p_payload);
+      if apex_web_service.g_status_code not between 200 and 299 then
+        raise_application_error(-20012, 'Connector "' || p_connector || '" returned HTTP ' || apex_web_service.g_status_code);
+      end if;
+    end if;
+
+    if l_res is null or dbms_lob.getlength(l_res) = 0 then return json_object_t(); end if;
+    return json_object_t.parse(l_res);
+  end call_connector;
+
+  ------------------------------------------------------------------------------
+  -- parsing, display & validation
+  ------------------------------------------------------------------------------
+  function parse_value (p_spec in json_object_t, p_raw in varchar2) return json_object_t is
+    l_res   json_object_t := json_object_t();
+    l_kind  varchar2(30)  := nvl(str(p_spec, 'kind'), 'text');
+    l_s     varchar2(32767) := trim(p_raw);
+    l_t     varchar2(32767);
+    l_n     varchar2(4000);
+    l_mult  number := 1;
+    l_d     date;
+    l_opts  json_array_t;
+    l_opt   json_object_t;
+    l_list  varchar2(4000);
+    l_idx   pls_integer;
+
+    function err (p_default in varchar2) return json_object_t is
+      l json_object_t := json_object_t();
+    begin
+      l.put('error', nvl(str(p_spec, 'parseMessage'), p_default));
+      return l;
+    end err;
+  begin
+    if l_s is null then
+      l_res.put_null('value');
+      return l_res;
+    end if;
+    l_t := lower(l_s);
+
+    case l_kind
+      when 'number' then
+        l_n := regexp_replace(l_t, '[[:space:],$' || unistr('\20AC\00A3\20B9') || ']', '');
+        if regexp_like(l_n, '^-?[0-9]+(\.[0-9]+)?k$') then l_mult := 1000;    l_n := substr(l_n, 1, length(l_n) - 1);
+        elsif regexp_like(l_n, '^-?[0-9]+(\.[0-9]+)?m$') then l_mult := 1000000; l_n := substr(l_n, 1, length(l_n) - 1);
+        end if;
+        if to_num(l_n) is null then return err('I need a number here, for example 25000 or 25k.'); end if;
+        l_res.put('value', round(to_num(l_n) * l_mult, 2));
+
+      when 'email' then
+        if not regexp_like(l_s, '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$') then
+          return err('That doesn''t look like a valid email address.');
+        end if;
+        l_res.put('value', l_t);
+
+      when 'date' then
+        if l_t in ('today', 'tomorrow') then
+          l_res.put('value', resolve_date(l_t));
+        else
+          if regexp_like(l_s, '^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}$') then
+            l_d := safe_date(l_s, 'YYYY-MM-DD');
+          elsif regexp_like(l_s, '^[0-9]{1,2}[/.-][0-9]{1,2}[/.-][0-9]{4}$') then
+            l_d := safe_date(regexp_replace(l_s, '[.-]', '/'), 'DD/MM/YYYY');
+          end if;
+          if l_d is null then return err('Please give a date like 2026-12-31 (or "today" / "tomorrow").'); end if;
+          l_res.put('value', to_char(l_d, 'YYYY-MM-DD'));
+        end if;
+
+      when 'choice' then
+        l_opts := arr(p_spec, 'options');
+        for i in 0 .. l_opts.get_size - 1 loop
+          l_opt := treat(l_opts.get(i) as json_object_t);
+          if lower(str(l_opt, 'value')) = l_t or lower(nvl(str(l_opt, 'label'), str(l_opt, 'value'))) = l_t then
+            l_res.put('value', str(l_opt, 'value'));
+            return l_res;
+          end if;
+          l_list := l_list || case when i > 0 then ', ' end || nvl(str(l_opt, 'label'), str(l_opt, 'value'));
+        end loop;
+        if regexp_like(l_t, '^[0-9]{1,4}$') then
+          l_idx := to_number(l_t);
+          if l_idx between 1 and l_opts.get_size then
+            l_res.put('value', str(treat(l_opts.get(l_idx - 1) as json_object_t), 'value'));
+            return l_res;
+          end if;
+        end if;
+        return err('Please pick one of: ' || l_list || '.');
+
+      when 'yesno' then
+        if l_t in ('y', 'yes', 'true', 'yeah', 'yep', 'sure', 'ok') then l_res.put('value', 'Y');
+        elsif l_t in ('n', 'no', 'false', 'nope') then l_res.put('value', 'N');
+        else return err('Please answer yes or no.');
+        end if;
+
+      else
+        l_res.put('value', l_s);
+    end case;
+    return l_res;
+  end parse_value;
+
+  function display_for (p_spec in json_object_t, p_val in varchar2) return varchar2 is
+    l_opts json_array_t;
+    l_opt  json_object_t;
+  begin
+    if p_val is null then return null; end if;
+    case str(p_spec, 'kind')
+      when 'number' then return str(p_spec, 'prefix') || nvl(fmt_num(to_num(p_val)), p_val);
+      when 'yesno'  then return case p_val when 'Y' then 'Yes' when 'N' then 'No' else p_val end;
+      when 'choice' then
+        l_opts := arr(p_spec, 'options');
+        for i in 0 .. l_opts.get_size - 1 loop
+          l_opt := treat(l_opts.get(i) as json_object_t);
+          if str(l_opt, 'value') = p_val then return nvl(str(l_opt, 'label'), p_val); end if;
+        end loop;
+        return p_val;
+      else return p_val;
+    end case;
+  end display_for;
+
+  function field_def (p_change_node in json_object_t, p_field in varchar2) return json_object_t is
+    l_flds json_array_t := arr(p_change_node, 'fields');
+    l_f    json_object_t;
+  begin
+    for i in 0 .. l_flds.get_size - 1 loop
+      l_f := treat(l_flds.get(i) as json_object_t);
+      if str(l_f, 'field') = p_field then return l_f; end if;
+    end loop;
+    return null;
+  end field_def;
+
+  function field_label (p_fd in json_object_t) return varchar2 is
+  begin
+    return nvl(str(p_fd, 'label'), str(p_fd, 'field'));
+  end field_label;
+
+  function change_node (c in out nocopy t_ctx, p_alias in varchar2) return json_object_t is
+    l_id varchar2(200) := str(c.change_nodes, p_alias);
+  begin
+    if l_id is null then return null; end if;
+    return get_node(c, l_id);
+  end change_node;
+
+  -- Input spec for a slot or "alias.field" (used for display formatting).
+  function spec_for (c in out nocopy t_ctx, p_name in varchar2) return json_object_t is
+    l_dot pls_integer := instr(p_name, '.');
+    l_cn  json_object_t;
+    l_fd  json_object_t;
+    l_nid varchar2(200);
+  begin
+    if l_dot > 1 then
+      l_cn := change_node(c, substr(p_name, 1, l_dot - 1));
+      if l_cn is null then return null; end if;
+      l_fd := field_def(l_cn, substr(p_name, l_dot + 1));
+      if l_fd is null then return null; end if;
+      return input_spec(l_fd);
+    end if;
+    l_nid := str(c.slot_nodes, p_name);
+    if l_nid is null then return null; end if;
+    return input_spec(get_node(c, l_nid));
+  end spec_for;
+
+  function display_value (c in out nocopy t_ctx, p_name in varchar2) return varchar2 is
+  begin
+    return display_for(spec_for(c, p_name), str(vals(c), p_name));
+  end display_value;
+
+  -- p_parsed = {"value": <typed value or null>}. Returns an error message or null.
+  function validate (c in out nocopy t_ctx, p_node in json_object_t, p_parsed in json_object_t) return varchar2 is
+    l_spec   json_object_t := input_spec(p_node);
+    l_kind   varchar2(30)  := str(l_spec, 'kind');
+    l_val    varchar2(32767) := str(p_parsed, 'value');
+    l_prefix varchar2(20)  := str(l_spec, 'prefix');
+    l_num    number;
+    l_lo     varchar2(30);
+    l_hi     varchar2(30);
+    l_vals   json_array_t;
+    l_v      json_object_t;
+    l_res    json_object_t;
+  begin
+    if l_val is null then
+      if str(l_spec, 'required') = 'false' then return null; end if;
+      return nvl(str(l_spec, 'requiredMessage'), c_required);
+    end if;
+
+    if l_kind = 'number' then
+      l_num := to_num(l_val);
+      if to_num(str(l_spec, 'min')) is not null and l_num < to_num(str(l_spec, 'min')) then
+        return nvl(str(l_spec, 'minMessage'), 'Please enter at least ' || l_prefix || fmt_num(to_num(str(l_spec, 'min'))) || '.');
+      end if;
+      if to_num(str(l_spec, 'max')) is not null and l_num > to_num(str(l_spec, 'max')) then
+        return nvl(str(l_spec, 'maxMessage'), 'The maximum is ' || l_prefix || fmt_num(to_num(str(l_spec, 'max'))) || '.');
+      end if;
+    elsif l_kind = 'date' then
+      l_lo := resolve_date(str(l_spec, 'minDate'));
+      l_hi := resolve_date(str(l_spec, 'maxDate'));
+      if l_lo is not null and l_val < l_lo then
+        return nvl(str(l_spec, 'minMessage'), 'Please choose a date on or after ' || l_lo || '.');
+      end if;
+      if l_hi is not null and l_val > l_hi then
+        return nvl(str(l_spec, 'maxMessage'), 'Please choose a date on or before ' || l_hi || '.');
+      end if;
+    else
+      if to_num(str(l_spec, 'minLength')) is not null and length(l_val) < to_num(str(l_spec, 'minLength')) then
+        return nvl(str(l_spec, 'minMessage'), 'Please enter at least ' || str(l_spec, 'minLength') || ' characters.');
+      end if;
+      if to_num(str(l_spec, 'maxLength')) is not null and length(l_val) > to_num(str(l_spec, 'maxLength')) then
+        return nvl(str(l_spec, 'maxMessage'), 'Please use at most ' || str(l_spec, 'maxLength') || ' characters.');
+      end if;
+    end if;
+
+    l_vals := arr(p_node, 'validators');
+    for i in 0 .. l_vals.get_size - 1 loop
+      l_v := treat(l_vals.get(i) as json_object_t);
+      if str(l_v, 'type') = 'regex' then
+        if not regexp_like(l_val, str(l_v, 'pattern')) then
+          return nvl(str(l_v, 'message'), 'That value isn''t in the expected format.');
+        end if;
+      elsif str(l_v, 'type') = 'server' then
+        l_res := call_connector(str(l_v, 'connector'),
+                                payload(c, str(p_node, 'id'), str(p_node, 'slot'), p_parsed.get('value')));
+        if str(l_res, 'valid') = 'false' then
+          return coalesce(str(l_res, 'message'), str(l_v, 'message'), 'That value wasn''t accepted.');
+        end if;
+      end if;
+    end loop;
+    return null;
+  end validate;
+
+  -- A changeFields field validated like an Ask node.
+  function field_as_node (p_change_node in json_object_t, p_fd in json_object_t) return json_object_t is
+    l json_object_t := json_object_t();
+  begin
+    l.put('id', str(p_change_node, 'id'));
+    l.put('slot', str(p_change_node, 'record') || '.' || str(p_fd, 'field'));
+    l.put('input', input_spec(p_fd));
+    if p_fd.has('validators') then l.put('validators', p_fd.get_array('validators')); end if;
+    return l;
+  end field_as_node;
+
+  ------------------------------------------------------------------------------
+  -- conditions
+  ------------------------------------------------------------------------------
+  function eval_cond (p_values in json_object_t, p_cond in json_object_t) return boolean is
+    l_arr json_array_t;
+    l_op  varchar2(20);
+    l_v   varchar2(32767);
+    l_cv  varchar2(32767);
+    l_n1  number;
+    l_n2  number;
+  begin
+    if p_cond is null then return true; end if;
+    if p_cond.has('all') then
+      l_arr := p_cond.get_array('all');
+      for i in 0 .. l_arr.get_size - 1 loop
+        if not eval_cond(p_values, treat(l_arr.get(i) as json_object_t)) then return false; end if;
+      end loop;
+      return true;
+    elsif p_cond.has('any') then
+      l_arr := p_cond.get_array('any');
+      for i in 0 .. l_arr.get_size - 1 loop
+        if eval_cond(p_values, treat(l_arr.get(i) as json_object_t)) then return true; end if;
+      end loop;
+      return false;
+    elsif p_cond.has('not') then
+      return not eval_cond(p_values, p_cond.get_object('not'));
+    end if;
+
+    l_op := str(p_cond, 'op');
+    l_v  := str(p_values, str(p_cond, 'slot'));
+    if l_op = 'empty'    then return l_v is null; end if;
+    if l_op = 'notEmpty' then return l_v is not null; end if;
+    if l_op is null or l_op not in ('=', '!=', '>', '>=', '<', '<=', 'in') then
+      raise_application_error(-20023, 'Unknown operator "' || l_op || '".');
+    end if;
+    if l_v is null then return false; end if;
+
+    if l_op = 'in' then
+      l_arr := p_cond.get_array('value');
+      for i in 0 .. l_arr.get_size - 1 loop
+        if el_str(l_arr.get(i)) = l_v then return true; end if;
+      end loop;
+      return false;
+    end if;
+
+    l_cv := str(p_cond, 'value');
+    l_n1 := to_num(l_v);
+    l_n2 := to_num(l_cv);
+    if l_n1 is not null and l_n2 is not null then
+      return case l_op
+               when '='  then l_n1 =  l_n2  when '!=' then l_n1 <> l_n2
+               when '>'  then l_n1 >  l_n2  when '>=' then l_n1 >= l_n2
+               when '<'  then l_n1 <  l_n2  when '<=' then l_n1 <= l_n2
+             end;
+    end if;
+    return case l_op
+             when '='  then l_v =  l_cv  when '!=' then nvl(l_v <> l_cv, true)
+             when '>'  then l_v >  l_cv  when '>=' then l_v >= l_cv
+             when '<'  then l_v <  l_cv  when '<=' then l_v <= l_cv
+           end;
+  end eval_cond;
+
+  function pick_branch (p_values in json_object_t, p_node in json_object_t) return varchar2 is
+    l_br json_array_t := arr(p_node, 'branches');
+    l_b  json_object_t;
+  begin
+    for i in 0 .. l_br.get_size - 1 loop
+      l_b := treat(l_br.get(i) as json_object_t);
+      if eval_cond(p_values, obj(l_b, 'when')) then return str(l_b, 'next'); end if;
+    end loop;
+    return str(p_node, 'else');
+  end pick_branch;
+
+  ------------------------------------------------------------------------------
+  -- records (findRecord / changeFields / saveChanges)
+  ------------------------------------------------------------------------------
+  function record_changes (p_rec in json_object_t) return json_object_t is
+    l_cur  json_object_t := obj(p_rec, 'current');
+    l_org  json_object_t := obj(p_rec, 'original');
+    l_keys json_key_list;
+    l_out  json_object_t := json_object_t();
+  begin
+    if l_cur is null then return l_out; end if;
+    l_keys := l_cur.get_keys;
+    if l_keys is null then return l_out; end if;
+    for i in 1 .. l_keys.count loop
+      if not same(str(l_cur, l_keys(i)), str(l_org, l_keys(i))) then
+        l_out.put(l_keys(i), l_cur.get(l_keys(i)));
+      end if;
+    end loop;
+    return l_out;
+  end record_changes;
+
+  function field_editable (c in out nocopy t_ctx, p_change_node in json_object_t, p_fd in json_object_t) return boolean is
+    l_rec json_object_t := obj(c.records, str(p_change_node, 'record'));
+  begin
+    if l_rec is null then return false; end if;
+    if not fc_data.is_updatable(str(l_rec, 'source'), str(p_fd, 'field')) then return false; end if;
+    return eval_cond(vals(c), obj(p_fd, 'editableWhen'));
+  end field_editable;
+
+  procedure prompt_field (c in out nocopy t_ctx, p_change_node in json_object_t, p_fd in json_object_t) is
+    l_rec json_object_t := obj(c.records, str(p_change_node, 'record'));
+    l_cur varchar2(4000);
+  begin
+    c.state.put('current', str(p_change_node, 'id'));
+    c.state.put('editingField', str(p_fd, 'field'));
+    l_cur := display_for(input_spec(p_fd), str(obj(l_rec, 'current'), str(p_fd, 'field')));
+    add_msg(c, 'text', interpolate(nvl(str(p_fd, 'prompt'),
+      field_label(p_fd) || case when l_cur is not null then ' is currently ' || l_cur || '. What should it be?'
+                                else ' is empty. What should it be?' end), vals(c)));
+  end prompt_field;
+
+  function load_record (c in out nocopy t_ctx, p_node in json_object_t, p_key in varchar2) return varchar2 is
+    l_alias varchar2(100) := str(p_node, 'as');
+    l_res   json_object_t;
+    l_vals  json_object_t;
+    l_rec   json_object_t := json_object_t();
+    l_keys  json_key_list;
+  begin
+    l_res := fc_data.get_row(str(p_node, 'source'), p_key, obj(c.state, 'context'));
+    if c.results.has(str(p_node, 'id')) then c.results.remove(str(p_node, 'id')); end if;
+    l_vals := obj(l_res, 'values');
+    if l_vals is null then
+      add_msg(c, 'error', nvl(str(obj(p_node, 'prompts'), 'gone'), 'That record is no longer available.'));
+      return str(p_node, 'notFound');
+    end if;
+    l_rec.put('source', str(p_node, 'source'));
+    l_rec.put('key', p_key);
+    if str(l_res, 'version') is not null then l_rec.put('version', str(l_res, 'version')); else l_rec.put_null('version'); end if;
+    l_rec.put('original', copy(l_vals));
+    l_rec.put('current', copy(l_vals));
+    c.records.put(l_alias, l_rec);
+    l_keys := l_vals.get_keys;
+    if l_keys is not null then
+      for i in 1 .. l_keys.count loop touch(c, l_alias || '.' || l_keys(i)); end loop;
+    end if;
+    add_msg(c, 'text', interpolate(str(obj(p_node, 'prompts'), 'found'), vals(c)));
+    return str(p_node, 'found');
+  end load_record;
+
+  function run_find (c in out nocopy t_ctx, p_node in json_object_t, p_await out boolean) return varchar2 is
+    l_v       json_object_t := vals(c);
+    l_prompts json_object_t := obj(p_node, 'prompts');
+    l_card    json_object_t := obj(p_node, 'card');
+    l_crit    json_array_t  := json_array_t();
+    l_cdef    json_array_t  := arr(p_node, 'criteria');
+    l_cd      json_object_t;
+    l_c       json_object_t;
+    l_val     varchar2(4000);
+    l_max     pls_integer   := nvl(to_num(str(p_node, 'maxResults')), 10);
+    l_rows    json_array_t;
+    l_row     json_object_t;
+    l_vals    json_object_t;
+    l_res     json_array_t  := json_array_t();
+    l_r       json_object_t;
+  begin
+    p_await := false;
+    for i in 0 .. l_cdef.get_size - 1 loop
+      l_cd  := treat(l_cdef.get(i) as json_object_t);
+      l_val := str(l_v, str(l_cd, 'slot'));
+      if l_val is not null then
+        l_c := json_object_t();
+        l_c.put('field', str(l_cd, 'field'));
+        l_c.put('op', nvl(str(l_cd, 'op'), 'eq'));
+        l_c.put('value', l_val);
+        l_crit.append(l_c);
+      end if;
+    end loop;
+    if l_crit.get_size < nvl(to_num(str(p_node, 'minCriteria')), 1) then
+      add_msg(c, 'text', interpolate(nvl(str(l_prompts, 'none'), c_not_found), l_v));
+      return str(p_node, 'notFound');
+    end if;
+
+    l_rows := fc_data.search_rows(str(p_node, 'source'), l_crit, l_max + 1, obj(c.state, 'context'));
+    if l_rows.get_size = 0 then
+      add_msg(c, 'text', interpolate(nvl(str(l_prompts, 'none'), c_not_found), l_v));
+      return str(p_node, 'notFound');
+    end if;
+    if l_rows.get_size > l_max then
+      add_msg(c, 'text', interpolate(nvl(str(l_prompts, 'tooMany'), 'That matches too many records. Let''s narrow it down.'), l_v));
+      return nvl(str(p_node, 'tooMany'), str(p_node, 'notFound'));
+    end if;
+    if l_rows.get_size = 1 and nvl(str(p_node, 'autoPick'), 'true') <> 'false' then
+      return load_record(c, p_node, str(treat(l_rows.get(0) as json_object_t), 'key'));
+    end if;
+
+    for i in 0 .. l_rows.get_size - 1 loop
+      l_row  := treat(l_rows.get(i) as json_object_t);
+      l_vals := obj(l_row, 'values');
+      l_r    := json_object_t();
+      l_r.put('token', 'r' || (i + 1));
+      l_r.put('key', str(l_row, 'key'));
+      l_r.put('title', interpolate(nvl(str(l_card, 'title'), str(l_row, 'key')), l_vals));
+      l_r.put('subtitle', case when str(l_card, 'subtitle') is not null then interpolate(str(l_card, 'subtitle'), l_vals) end);
+      l_res.append(l_r);
+    end loop;
+    c.results.put(str(p_node, 'id'), l_res);
+    c.state.put('current', str(p_node, 'id'));
+    l_v.put('count', l_rows.get_size);
+    add_msg(c, 'text', interpolate(nvl(str(l_prompts, 'many'), 'I found {{count}} matching records. Which one?'), l_v));
+    p_await := true;
+    return null;
+  end run_find;
+
+  function run_save (c in out nocopy t_ctx, p_node in json_object_t, p_await out boolean) return varchar2 is
+    l_alias   varchar2(100) := str(p_node, 'record');
+    l_rec     json_object_t := obj(c.records, l_alias);
+    l_cn      json_object_t;
+    l_changes json_object_t;
+    l_keys    json_key_list;
+    l_fd      json_object_t;
+    l_w       json_object_t;
+    l_err     varchar2(4000);
+    l_orig    json_object_t := json_object_t();
+    l_r       json_object_t;
+    l_fresh   json_object_t;
+    l_cur     json_object_t;
+    l_audit   json_object_t := json_object_t();
+    l_all     json_key_list;
+    l_sid     varchar2(32)  := c.session_id;
+    l_nid     varchar2(200) := str(p_node, 'id');
+    l_audit_c clob;
+  begin
+    p_await := false;
+    if l_rec is null then
+      raise_application_error(-20024, 'Save changes "' || str(p_node, 'id') || '" needs a loaded record "' || l_alias || '".');
+    end if;
+    l_cn      := change_node(c, l_alias);
+    l_changes := record_changes(l_rec);
+    l_keys    := l_changes.get_keys;
+    if l_keys is null or l_keys.count = 0 then
+      add_msg(c, 'text', nvl(str(p_node, 'noChangesText'), 'Nothing changed, so there was nothing to save.'));
+      return nvl(str(p_node, 'noChanges'), str(p_node, 'saved'));
+    end if;
+
+    -- Defence in depth: every changed field must be declared editable and must still validate.
+    for i in 1 .. l_keys.count loop
+      l_fd := null;
+      if l_cn is not null then l_fd := field_def(l_cn, l_keys(i)); end if;
+      if l_fd is null or not field_editable(c, l_cn, l_fd) then
+        add_msg(c, 'error', 'The field "' || l_keys(i) || '" cannot be changed here.');
+        return route(c, str(p_node, 'forbidden'));
+      end if;
+      l_w := json_object_t();
+      l_w.put('value', l_changes.get(l_keys(i)));
+      l_err := validate(c, field_as_node(l_cn, l_fd), l_w);
+      if l_err is not null then
+        add_msg(c, 'error', l_err);
+        prompt_field(c, l_cn, l_fd);
+        p_await := true;
+        return null;
+      end if;
+      l_orig.put(l_keys(i), obj(l_rec, 'original').get(l_keys(i)));
+    end loop;
+
+    l_r := fc_data.update_row(str(l_rec, 'source'), str(l_rec, 'key'), str(l_rec, 'version'),
+                              l_orig, l_changes, obj(c.state, 'context'));
+
+    -- audit trail (before / after) in the session transcript
+    l_audit.put('action', 'update');
+    l_audit.put('source', str(l_rec, 'source'));
+    l_audit.put('key', str(l_rec, 'key'));
+    l_audit.put('before', l_orig);
+    l_audit.put('after', l_changes);
+    l_audit.put('result', nvl(str(l_r, 'status'), 'error'));
+    l_audit_c := l_audit.to_clob;   -- package-private functions and object methods can't appear inside SQL
+    insert into fc_events (session_id, direction, node_id, payload)
+    values (l_sid, 'OUT', l_nid, l_audit_c);
+
+    case nvl(str(l_r, 'status'), 'error')
+      when 'ok' then
+        if str(l_r, 'version') is not null then l_rec.put('version', str(l_r, 'version')); end if;
+        l_rec.put('original', copy(obj(l_rec, 'current')));
+        c.records.put(l_alias, l_rec);
+        add_msg(c, 'text', nvl(str(l_r, 'message'), str(p_node, 'savedText')));
+        return str(p_node, 'saved');
+
+      when 'conflict' then
+        l_fresh := fc_data.get_row(str(l_rec, 'source'), str(l_rec, 'key'), obj(c.state, 'context'));
+        if obj(l_fresh, 'values') is null then
+          add_msg(c, 'error', 'That record is no longer available.');
+          return route(c, str(p_node, 'error'));
+        end if;
+        l_cur := copy(obj(l_fresh, 'values'));
+        for i in 1 .. l_keys.count loop l_cur.put(l_keys(i), l_changes.get(l_keys(i))); end loop;
+        l_rec.put('original', copy(obj(l_fresh, 'values')));
+        if str(l_fresh, 'version') is not null then l_rec.put('version', str(l_fresh, 'version')); else l_rec.put_null('version'); end if;
+        l_rec.put('current', l_cur);
+        c.records.put(l_alias, l_rec);
+        l_all := l_cur.get_keys;
+        if l_all is not null then
+          for i in 1 .. l_all.count loop touch(c, l_alias || '.' || l_all(i)); end loop;
+        end if;
+        add_msg(c, 'error', coalesce(str(l_r, 'message'), str(p_node, 'conflictText'),
+          'Someone else changed this record after you opened it. I''ve loaded the latest version with your changes on top. Please check them again.'));
+        return route(c, coalesce(str(p_node, 'conflict'), str(p_node, 'error')));
+
+      when 'forbidden' then
+        add_msg(c, 'error', nvl(str(l_r, 'message'), 'You''re not allowed to change this record.'));
+        return route(c, str(p_node, 'forbidden'));
+
+      else
+        add_msg(c, 'error', nvl(str(l_r, 'message'), 'Sorry, the changes could not be saved.'));
+        return route(c, str(p_node, 'error'));
+    end case;
+  end run_save;
+
+  ------------------------------------------------------------------------------
+  -- runtime
+  ------------------------------------------------------------------------------
+  procedure add_changes (c in out nocopy t_ctx, p_node in json_object_t) is
+    l_alias   varchar2(100) := str(p_node, 'record');
+    l_rec     json_object_t := obj(c.records, l_alias);
+    l_cn      json_object_t;
+    l_changes json_object_t;
+    l_keys    json_key_list;
+    l_fd      json_object_t;
+    l_spec    json_object_t;
+    l_item    json_object_t;
+    l_items   json_array_t := json_array_t();
+    l_msg     json_object_t := json_object_t();
+  begin
+    if l_rec is null then
+      raise_application_error(-20025, 'Summary "' || str(p_node, 'id') || '" needs a loaded record "' || l_alias || '".');
+    end if;
+    l_cn      := change_node(c, l_alias);
+    l_changes := record_changes(l_rec);
+    l_keys    := l_changes.get_keys;
+    if l_keys is not null then
+      for i in 1 .. l_keys.count loop
+        l_fd := null;
+        l_spec := null;
+        if l_cn is not null then l_fd := field_def(l_cn, l_keys(i)); end if;
+        if l_fd is not null then l_spec := input_spec(l_fd); end if;
+        l_item := json_object_t();
+        l_item.put('slot', l_alias || '.' || l_keys(i));
+        l_item.put('label', case when l_fd is not null then field_label(l_fd) else l_keys(i) end);
+        l_item.put('before', display_for(l_spec, str(obj(l_rec, 'original'), l_keys(i))));
+        l_item.put('after', display_for(l_spec, str(obj(l_rec, 'current'), l_keys(i))));
+        l_item.put('editable', l_fd is not null);
+        l_items.append(l_item);
+      end loop;
+    end if;
+    l_msg.put('type', 'changes');
+    l_msg.put('text', interpolate(nvl(str(p_node, 'text'),
+      case when l_items.get_size > 0 then 'Please confirm these changes:' else 'You haven''t changed anything yet.' end), vals(c)));
+    l_msg.put('items', l_items);
+    c.out_msgs.append(l_msg);
+  end add_changes;
+
+  procedure add_summary (c in out nocopy t_ctx, p_node in json_object_t) is
+    l_msg    json_object_t := json_object_t();
+    l_items  json_array_t  := json_array_t();
+    l_fields json_array_t;
+    l_nodes  json_array_t;
+    l_n      json_object_t;
+    l_seen   varchar2(32767) := ',';
+
+    procedure add_item (p_slot in varchar2) is
+      l_nid  varchar2(200) := str(c.slot_nodes, p_slot);
+      l_item json_object_t := json_object_t();
+    begin
+      if instr(l_seen, ',' || p_slot || ',') > 0 then return; end if;
+      l_seen := l_seen || p_slot || ',';
+      l_item.put('slot', p_slot);
+      l_item.put('label', case when l_nid is not null then nvl(str(get_node(c, l_nid), 'label'), p_slot) else p_slot end);
+      l_item.put('display', display_value(c, p_slot));
+      l_item.put('editable', l_nid is not null);
+      l_items.append(l_item);
+    end add_item;
+  begin
+    if str(p_node, 'mode') = 'changes' then
+      add_changes(c, p_node);
+      return;
+    end if;
+    if p_node.has('fields') then
+      l_fields := p_node.get_array('fields');
+      for i in 0 .. l_fields.get_size - 1 loop add_item(l_fields.get_string(i)); end loop;
+    else
+      l_nodes := c.flow.get_array('nodes');
+      for i in 0 .. l_nodes.get_size - 1 loop
+        l_n := treat(l_nodes.get(i) as json_object_t);
+        if str(l_n, 'type') = 'ask' and str(c.slots, str(l_n, 'slot')) is not null then
+          add_item(str(l_n, 'slot'));
+        end if;
+      end loop;
+    end if;
+    l_msg.put('type', 'summary');
+    l_msg.put('text', interpolate(nvl(str(p_node, 'text'), 'Here''s what I have. Please check:'), vals(c)));
+    l_msg.put('items', l_items);
+    c.out_msgs.append(l_msg);
+  end add_summary;
+
+  procedure add_record_card (c in out nocopy t_ctx, p_node in json_object_t) is
+    l_rec   json_object_t := obj(c.records, str(p_node, 'record'));
+    l_flds  json_array_t  := arr(p_node, 'fields');
+    l_fd    json_object_t;
+    l_item  json_object_t;
+    l_items json_array_t  := json_array_t();
+    l_msg   json_object_t := json_object_t();
+  begin
+    for i in 0 .. l_flds.get_size - 1 loop
+      l_fd := treat(l_flds.get(i) as json_object_t);
+      l_item := json_object_t();
+      l_item.put('slot', str(p_node, 'record') || '.' || str(l_fd, 'field'));
+      l_item.put('label', field_label(l_fd));
+      l_item.put('display', display_for(input_spec(l_fd), str(obj(l_rec, 'current'), str(l_fd, 'field'))));
+      l_items.append(l_item);
+    end loop;
+    l_msg.put('type', 'record');
+    l_msg.put('text', interpolate(nvl(str(p_node, 'cardTitle'), 'Current details'), vals(c)));
+    l_msg.put('items', l_items);
+    c.out_msgs.append(l_msg);
+  end add_record_card;
+
+  -- Re-check every answered question before submit. Returns the failing node id (or null).
+  function revalidate (c in out nocopy t_ctx, p_err out varchar2) return varchar2 is
+    l_nodes  json_array_t := c.flow.get_array('nodes');
+    l_n      json_object_t;
+    l_slot   varchar2(200);
+    l_parsed json_object_t;
+  begin
+    for i in 0 .. l_nodes.get_size - 1 loop
+      l_n := treat(l_nodes.get(i) as json_object_t);
+      l_slot := str(l_n, 'slot');
+      if str(l_n, 'type') = 'ask' and str(c.slots, l_slot) is not null then
+        l_parsed := json_object_t();
+        l_parsed.put('value', c.slots.get(l_slot));
+        p_err := validate(c, l_n, l_parsed);
+        if p_err is not null then return str(l_n, 'id'); end if;
+      end if;
+    end loop;
+    return null;
+  end revalidate;
+
+  procedure progress (c in out nocopy t_ctx, p_done out pls_integer, p_total out pls_integer) is
+    l_id    varchar2(200) := str(c.flow, 'start');
+    l_v     json_object_t := vals(c);
+    l_n     json_object_t;
+    l_type  varchar2(30);
+    l_steps pls_integer := 0;
+  begin
+    p_done := 0; p_total := 0;
+    while l_id is not null and l_steps < c_max_steps loop
+      l_steps := l_steps + 1;
+      exit when not c.nodes.has(l_id);
+      l_n := c.nodes.get_object(l_id);
+      l_type := str(l_n, 'type');
+      if l_type = 'ask' then
+        p_total := p_total + 1;
+        if str(c.slots, str(l_n, 'slot')) is not null then p_done := p_done + 1; end if;
+        l_id := str(l_n, 'next');
+      elsif l_type = 'findRecord' then
+        p_total := p_total + 1;
+        if c.records.has(str(l_n, 'as')) then p_done := p_done + 1; end if;
+        l_id := str(l_n, 'found');
+      elsif l_type = 'changeFields' then
+        p_total := p_total + 1;
+        if key_count(record_changes(obj(c.records, str(l_n, 'record')))) > 0 then p_done := p_done + 1; end if;
+        l_id := str(l_n, 'done');
+      elsif l_type = 'condition' then
+        l_id := pick_branch(l_v, l_n);
+      elsif l_type in ('message', 'lookup') then
+        l_id := str(l_n, 'next');
+      else
+        exit;
+      end if;
+    end loop;
+    if str(c.state, 'status') = 'completed' then p_done := p_total; end if;
+  end progress;
+
+  procedure run (c in out nocopy t_ctx, p_start in varchar2) is
+    l_id      varchar2(200) := p_start;
+    l_node    json_object_t;
+    l_type    varchar2(30);
+    l_slot    varchar2(200);
+    l_res     json_object_t;
+    l_bad     varchar2(200);
+    l_err     varchar2(4000);
+    l_await   boolean;
+    l_steps   pls_integer := 0;
+  begin
+    while l_id is not null loop
+      l_steps := l_steps + 1;
+      if l_steps > c_max_steps then
+        raise_application_error(-20020, 'Flow exceeded ' || c_max_steps || ' steps. Check it for a loop.');
+      end if;
+      l_node := get_node(c, l_id);
+      l_type := str(l_node, 'type');
+
+      case l_type
+        when 'message' then
+          if not c.replay then add_msg(c, 'text', interpolate(str(l_node, 'text'), vals(c))); end if;
+          l_id := str(l_node, 'next');
+
+        when 'condition' then
+          l_id := pick_branch(vals(c), l_node);
+
+        when 'lookup' then
+          if c.replay then
+            l_id := str(l_node, 'next');
+          else
+            l_res := call_connector(str(l_node, 'connector'), payload(c, l_id));
+            merge_slots(c, l_res);
+            add_msg(c, 'text', str(l_res, 'message'));
+            if str(l_res, 'found') = 'false' and l_node.has('onNotFound') then
+              l_id := str(l_node, 'onNotFound');
+            else
+              l_id := str(l_node, 'next');
+            end if;
+          end if;
+
+        when 'ask' then
+          l_slot := str(l_node, 'slot');
+          if (c.replay or get_bool(l_node, 'skipIfFilled'))
+             and str(c.slots, l_slot) is not null
+             and nvl(c.force_ask, '~') <> l_id then
+            l_id := str(l_node, 'next');
+          else
+            -- a question reached while replaying an edit keeps the replay going after it's answered
+            if c.replay then c.state.put('editing', true); end if;
+            c.replay := false;
+            c.force_ask := null;
+            c.state.put('current', l_id);
+            add_msg(c, 'text', interpolate(str(l_node, 'prompt'), vals(c)));
+            return;
+          end if;
+
+        when 'summary' then
+          c.replay := false;
+          c.state.put('current', l_id);
+          add_summary(c, l_node);
+          return;
+
+        when 'submit' then
+          l_bad := revalidate(c, l_err);
+          if l_bad is not null then
+            add_msg(c, 'error', l_err);
+            c.state.put('editing', true);
+            c.force_ask := l_bad;
+            l_id := l_bad;
+          else
+            l_res := call_connector(str(l_node, 'connector'), payload(c, l_id));
+            merge_slots(c, l_res);
+            if str(l_res, 'ok') = 'true' then
+              add_msg(c, 'text', str(l_res, 'message'));
+              l_id := nvl(str(l_node, 'onSuccess'), str(l_node, 'next'));
+            else
+              add_msg(c, 'error', nvl(str(l_res, 'message'), 'Sorry, the submission failed.'));
+              l_id := route(c, str(l_node, 'onError'));
+              if l_id is null then return; end if;
+            end if;
+          end if;
+
+        when 'findRecord' then
+          if c.replay and c.records.has(str(l_node, 'as')) then
+            l_id := str(l_node, 'found');
+          else
+            c.replay := false;
+            l_id := run_find(c, l_node, l_await);
+            if l_await then return; end if;
+          end if;
+
+        when 'changeFields' then
+          if not c.records.has(str(l_node, 'record')) then
+            raise_application_error(-20026, 'Change fields "' || l_id || '" needs a loaded record "' || str(l_node, 'record') || '".');
+          end if;
+          c.replay := false;
+          c.state.put('current', l_id);
+          c.state.put_null('editingField');
+          add_record_card(c, l_node);
+          add_msg(c, 'text', interpolate(nvl(str(l_node, 'prompt'), 'What would you like to change?'), vals(c)));
+          return;
+
+        when 'saveChanges' then
+          l_id := run_save(c, l_node, l_await);
+          if l_await then return; end if;
+          if l_id is null and str(c.state, 'status') = 'failed' then return; end if;
+
+        when 'end' then
+          add_msg(c, 'success', interpolate(str(l_node, 'text'), vals(c)));
+          c.state.put('status', 'completed');
+          c.state.put_null('current');
+          return;
+
+        else
+          raise_application_error(-20021, 'Unknown node type "' || l_type || '" (' || l_id || ').');
+      end case;
+    end loop;
+    if str(c.state, 'status') = 'in_progress' then
+      c.state.put('status', 'completed');
+      c.state.put_null('current');
+    end if;
+  end run;
+
+  function build_turn (c in out nocopy t_ctx) return clob is
+    l_turn    json_object_t := json_object_t();
+    l_aw      json_object_t;
+    l_node    json_object_t;
+    l_type    varchar2(30);
+    l_updates json_array_t := json_array_t();
+    l_u       json_object_t;
+    l_prog    json_object_t := json_object_t();
+    l_bind    json_object_t;
+    l_slot    varchar2(200);
+    l_cur     varchar2(200) := str(c.state, 'current');
+    l_view    json_object_t := vals(c);
+    l_rec     json_object_t;
+    l_fd      json_object_t;
+    l_flds    json_array_t;
+    l_items   json_array_t;
+    l_item    json_object_t;
+    l_res     json_array_t;
+    l_r       json_object_t;
+    l_field   varchar2(100);
+    l_edit    boolean;
+    l_done    pls_integer;
+    l_total   pls_integer;
+  begin
+    if str(c.state, 'status') = 'in_progress' and l_cur is not null then
+      l_node := get_node(c, l_cur);
+      l_type := str(l_node, 'type');
+      l_aw := json_object_t();
+      l_aw.put('nodeId', l_cur);
+      l_field := str(c.state, 'editingField');
+
+      if l_type = 'ask' then
+        l_slot := str(l_node, 'slot');
+        l_aw.put('type', 'ask');
+        l_aw.put('slot', l_slot);
+        l_aw.put('label', nvl(str(l_node, 'label'), l_slot));
+        l_aw.put('input', input_spec(l_node));
+        if str(c.slots, l_slot) is not null then l_aw.put('value', c.slots.get(l_slot)); else l_aw.put_null('value'); end if;
+
+      elsif l_type = 'summary' then
+        l_aw.put('type', 'summary');
+        l_aw.put('confirmLabel', nvl(str(l_node, 'confirmLabel'), 'Confirm & submit'));
+
+      elsif l_type = 'findRecord' then
+        l_aw.put('type', 'pick');
+        l_items := json_array_t();
+        if c.results.has(l_cur) then
+          l_res := c.results.get_array(l_cur);
+          for i in 0 .. l_res.get_size - 1 loop
+            l_r := treat(l_res.get(i) as json_object_t);
+            l_item := json_object_t();             -- never the key: only the opaque token
+            l_item.put('token', str(l_r, 'token'));
+            l_item.put('title', str(l_r, 'title'));
+            l_item.put('subtitle', str(l_r, 'subtitle'));
+            l_items.append(l_item);
+          end loop;
+        end if;
+        l_aw.put('items', l_items);
+        l_aw.put('allowNone', nvl(str(l_node, 'allowNone'), 'true') <> 'false');
+        l_aw.put('noneLabel', nvl(str(l_node, 'noneLabel'), 'None of these'));
+
+      elsif l_type = 'changeFields' then
+        l_rec := obj(c.records, str(l_node, 'record'));
+        if l_field is not null then
+          l_fd := field_def(l_node, l_field);
+          l_aw.put('type', 'ask');
+          l_aw.put('slot', str(l_node, 'record') || '.' || l_field);
+          l_aw.put('label', field_label(l_fd));
+          l_aw.put('input', input_spec(l_fd));
+          if str(obj(l_rec, 'current'), l_field) is not null then
+            l_aw.put('value', obj(l_rec, 'current').get(l_field));
+          else
+            l_aw.put_null('value');
+          end if;
+          l_aw.put('sub', true);
+        else
+          l_aw.put('type', 'fieldMenu');
+          l_aw.put('doneLabel', nvl(str(l_node, 'doneLabel'), 'Done'));
+          l_items := json_array_t();
+          l_flds  := arr(l_node, 'fields');
+          for i in 0 .. l_flds.get_size - 1 loop
+            l_fd   := treat(l_flds.get(i) as json_object_t);
+            l_edit := field_editable(c, l_node, l_fd);
+            l_item := json_object_t();
+            l_item.put('field', str(l_fd, 'field'));
+            l_item.put('label', field_label(l_fd));
+            l_item.put('display', display_for(input_spec(l_fd), str(obj(l_rec, 'current'), str(l_fd, 'field'))));
+            l_item.put('changed', not same(str(obj(l_rec, 'current'), str(l_fd, 'field')), str(obj(l_rec, 'original'), str(l_fd, 'field'))));
+            l_item.put('editable', l_edit);
+            if l_edit then l_item.put_null('reason');
+            else l_item.put('reason', nvl(str(l_fd, 'lockedMessage'), 'This field cannot be changed right now.'));
+            end if;
+            l_items.append(l_item);
+          end loop;
+          l_aw.put('fields', l_items);
+        end if;
+      end if;
+    end if;
+
+    l_bind := obj(c.flow, 'bindings');
+    for i in 0 .. c.updates.get_size - 1 loop
+      l_slot := c.updates.get_string(i);
+      l_u := json_object_t();
+      l_u.put('slot', l_slot);
+      if str(l_view, l_slot) is not null then l_u.put('value', l_view.get(l_slot)); else l_u.put_null('value'); end if;
+      l_u.put('display', display_value(c, l_slot));
+      if l_bind is not null and l_bind.has(l_slot) then l_u.put('binding', l_bind.get_object(l_slot)); else l_u.put_null('binding'); end if;
+      l_updates.append(l_u);
+    end loop;
+
+    progress(c, l_done, l_total);
+    l_prog.put('done', l_done);
+    l_prog.put('total', l_total);
+
+    l_turn.put('sessionId', c.session_id);
+    l_turn.put('flowId', str(c.state, 'flowId'));
+    l_turn.put('version', to_num(str(c.state, 'version')));
+    l_turn.put('status', str(c.state, 'status'));
+    l_turn.put('messages', c.out_msgs);
+    if l_aw is not null then l_turn.put('await', l_aw); else l_turn.put_null('await'); end if;
+    l_turn.put('fieldUpdates', l_updates);
+    l_turn.put('progress', l_prog);
+    l_turn.put('canGoBack', c.history.get_size > 0 or str(c.state, 'editingField') is not null);
+    return l_turn.to_clob;
+  end build_turn;
+
+  ------------------------------------------------------------------------------
+  -- persistence
+  ------------------------------------------------------------------------------
+  procedure log_event (p_session_id in varchar2, p_dir in varchar2, p_node in varchar2, p_payload in clob) is
+  begin
+    insert into fc_events (session_id, direction, node_id, payload)
+    values (p_session_id, p_dir, p_node, p_payload);
+  end log_event;
+
+  procedure init_ctx (c in out nocopy t_ctx) is
+  begin
+    c.out_msgs  := json_array_t();
+    c.updates   := json_array_t();
+    c.records   := json_object_t();
+    c.results   := json_object_t();
+    c.replay    := false;
+    c.force_ask := null;
+  end init_ctx;
+
+  procedure load_flow (c in out nocopy t_ctx, p_flow_id in varchar2, p_version in number) is
+    l_def   clob;
+    l_nodes json_array_t;
+    l_node  json_object_t;
+    l_type  varchar2(30);
+  begin
+    select definition into l_def
+      from fc_flow_versions
+     where flow_id = p_flow_id and version = p_version;
+    c.flow := json_object_t.parse(l_def);
+    c.nodes := json_object_t();
+    c.slot_nodes := json_object_t();
+    c.change_nodes := json_object_t();
+    l_nodes := c.flow.get_array('nodes');
+    for i in 0 .. l_nodes.get_size - 1 loop
+      l_node := treat(l_nodes.get(i) as json_object_t);
+      l_type := str(l_node, 'type');
+      c.nodes.put(str(l_node, 'id'), l_node);
+      if l_type = 'ask' and not c.slot_nodes.has(str(l_node, 'slot')) then
+        c.slot_nodes.put(str(l_node, 'slot'), str(l_node, 'id'));
+      elsif l_type = 'changeFields' and not c.change_nodes.has(str(l_node, 'record')) then
+        c.change_nodes.put(str(l_node, 'record'), str(l_node, 'id'));
+      end if;
+    end loop;
+  end load_flow;
+
+  -- Context values whose key is a known slot (asked or bound) prefill that slot.
+  procedure seed_context (c in out nocopy t_ctx) is
+    l_ctx  json_object_t := obj(c.state, 'context');
+    l_bind json_object_t := obj(c.flow, 'bindings');
+    l_keys json_key_list;
+  begin
+    if l_ctx is null then return; end if;
+    l_keys := l_ctx.get_keys;
+    if l_keys is null then return; end if;
+    for i in 1 .. l_keys.count loop
+      if str(l_ctx, l_keys(i)) is not null
+         and (c.slot_nodes.has(l_keys(i)) or (l_bind is not null and l_bind.has(l_keys(i)))) then
+        c.slots.put(l_keys(i), l_ctx.get(l_keys(i)));
+      end if;
+    end loop;
+  end seed_context;
+
+  procedure save_session (c in out nocopy t_ctx) is
+    l_state  clob;
+    l_status varchar2(20);
+  begin
+    c.state.put('slots', c.slots);
+    c.state.put('history', c.history);
+    c.state.put('records', c.records);
+    c.state.put('results', c.results);
+    l_state  := c.state.to_clob;
+    l_status := str(c.state, 'status');
+    update fc_sessions
+       set state = l_state, status = l_status,
+           updated_at = systimestamp, expires_at = systimestamp + c_ttl
+     where session_id = c.session_id;
+  end save_session;
+
+  procedure load_session (c in out nocopy t_ctx, p_session_id in varchar2) is
+    l_flow_id fc_sessions.flow_id%type;
+    l_version fc_sessions.version%type;
+    l_state   clob;
+    l_apex    fc_sessions.apex_session%type;
+    l_expires fc_sessions.expires_at%type;
+  begin
+    begin
+      select flow_id, version, state, apex_session, expires_at
+        into l_flow_id, l_version, l_state, l_apex, l_expires
+        from fc_sessions
+       where session_id = p_session_id
+         for update;
+    exception when no_data_found then
+      raise_application_error(-20002, 'Session not found or expired.');
+    end;
+    if l_expires < systimestamp then
+      raise_application_error(-20002, 'Session not found or expired.');
+    end if;
+    if l_apex is not null and l_apex <> nvl(sys_context('APEX$SESSION', 'APP_SESSION'), '-') then
+      raise_application_error(-20003, 'This conversation belongs to another session.');
+    end if;
+
+    init_ctx(c);
+    c.session_id := p_session_id;
+    load_flow(c, l_flow_id, l_version);   -- pinned version
+    c.state := json_object_t.parse(l_state);
+    c.slots   := obj(c.state, 'slots');
+    c.records := obj(c.state, 'records');
+    c.results := obj(c.state, 'results');
+    if c.slots   is null then c.slots   := json_object_t(); end if;   -- NVL isn't defined for object types
+    if c.records is null then c.records := json_object_t(); end if;
+    if c.results is null then c.results := json_object_t(); end if;
+    if c.state.has('history') then c.history := c.state.get_array('history'); else c.history := json_array_t(); end if;
+  end load_session;
+
+  ------------------------------------------------------------------------------
+  -- input handlers for data nodes
+  ------------------------------------------------------------------------------
+  procedure handle_pick (c in out nocopy t_ctx, p_node in json_object_t, p_in in json_object_t) is
+    l_id      varchar2(200) := str(p_node, 'id');
+    l_results json_array_t;
+    l_r       json_object_t;
+    l_key     varchar2(4000);
+    l_token   varchar2(100);
+    l_val     varchar2(4000) := lower(trim(str(p_in, 'value')));
+    l_next    varchar2(200);
+  begin
+    if c.results.has(l_id) then l_results := c.results.get_array(l_id); else l_results := json_array_t(); end if;
+
+    if p_in.has('pick') and p_in.get('pick').is_null then
+      c.results.remove(l_id);
+      add_msg(c, 'text', nvl(str(obj(p_node, 'prompts'), 'cancelled'), 'Okay.'));
+      run(c, nvl(str(p_node, 'cancelled'), str(p_node, 'notFound')));
+      return;
+    end if;
+
+    l_token := str(p_in, 'pick');
+    for i in 0 .. l_results.get_size - 1 loop
+      l_r := treat(l_results.get(i) as json_object_t);
+      if (l_token is not null and str(l_r, 'token') = l_token)
+         or (l_token is null and l_val is not null
+             and (l_val = to_char(i + 1) or instr(lower(str(l_r, 'title')), l_val) > 0)) then
+        l_key := str(l_r, 'key');
+        exit;
+      end if;
+    end loop;
+
+    if l_key is null then
+      add_msg(c, 'error', 'Please choose one of the records shown.');
+      return;
+    end if;
+    c.history.append(l_id);
+    l_next := load_record(c, p_node, l_key);
+    run(c, l_next);
+  end handle_pick;
+
+  procedure handle_change (c in out nocopy t_ctx, p_node in json_object_t, p_in in json_object_t, p_cmd in varchar2) is
+    l_alias  varchar2(100) := str(p_node, 'record');
+    l_rec    json_object_t := obj(c.records, l_alias);
+    l_cur    json_object_t;
+    l_field  varchar2(100) := str(c.state, 'editingField');
+    l_fd     json_object_t;
+    l_parsed json_object_t;
+    l_err    varchar2(4000);
+    l_val    varchar2(4000) := lower(trim(str(p_in, 'value')));
+    l_flds   json_array_t;
+    l_f      json_object_t;
+  begin
+    if l_field is not null then
+      l_fd := field_def(p_node, l_field);
+      l_parsed := parse_value(input_spec(l_fd), str(p_in, 'value'));
+      l_err := str(l_parsed, 'error');
+      if l_err is null then l_err := validate(c, field_as_node(p_node, l_fd), l_parsed); end if;
+      if l_err is not null then
+        add_msg(c, 'error', l_err);
+        return;
+      end if;
+      l_cur := obj(l_rec, 'current');
+      l_cur.put(l_field, l_parsed.get('value'));
+      l_rec.put('current', l_cur);
+      c.records.put(l_alias, l_rec);
+      touch(c, l_alias || '.' || l_field);
+      c.state.put_null('editingField');
+      add_msg(c, 'text', interpolate(nvl(str(p_node, 'againPrompt'), 'Got it. Anything else to change?'), vals(c)));
+      return;
+    end if;
+
+    if p_cmd = 'done'
+       or (str(p_in, 'field') is null and l_val is not null
+           and l_val in ('done', lower(nvl(str(p_node, 'doneLabel'), 'done')))) then
+      if key_count(record_changes(l_rec)) > 0 then
+        run(c, str(p_node, 'done'));
+      else
+        add_msg(c, 'text', nvl(str(p_node, 'noChangesText'), 'You haven''t changed anything.'));
+        run(c, nvl(str(p_node, 'noChanges'), str(p_node, 'done')));
+      end if;
+      return;
+    end if;
+
+    if str(p_in, 'field') is not null then
+      l_fd := field_def(p_node, str(p_in, 'field'));
+    elsif l_val is not null then
+      l_flds := arr(p_node, 'fields');
+      for i in 0 .. l_flds.get_size - 1 loop
+        l_f := treat(l_flds.get(i) as json_object_t);
+        if lower(field_label(l_f)) = l_val or str(l_f, 'field') = l_val then l_fd := l_f; exit; end if;
+      end loop;
+    end if;
+
+    if l_fd is null then
+      add_msg(c, 'error', 'Please choose a field to change, or ' || nvl(str(p_node, 'doneLabel'), 'Done') || '.');
+    elsif not field_editable(c, p_node, l_fd) then
+      add_msg(c, 'error', nvl(str(l_fd, 'lockedMessage'), 'This field cannot be changed right now.'));
+    else
+      prompt_field(c, p_node, l_fd);
+    end if;
+  end handle_change;
+
+  ------------------------------------------------------------------------------
+  -- public API
+  ------------------------------------------------------------------------------
+  function start_session (p_flow_id in varchar2, p_context in clob default null) return clob is
+    c         t_ctx;
+    l_version number;
+    l_ctx     json_object_t;
+    l_turn    clob;
+    l_sid     varchar2(32);
+  begin
+    select max(version) into l_version
+      from fc_flow_versions
+     where flow_id = p_flow_id and status = 'PUBLISHED';
+    if l_version is null then
+      raise_application_error(-20001, 'No published version of flow "' || p_flow_id || '".');
+    end if;
+
+    init_ctx(c);
+    l_sid := rawtohex(dbms_crypto.randombytes(16));
+    c.session_id := l_sid;
+    load_flow(c, p_flow_id, l_version);
+
+    if p_context is null or dbms_lob.getlength(p_context) = 0 then
+      l_ctx := json_object_t();
+    else
+      l_ctx := json_object_t.parse(p_context);
+    end if;
+
+    c.state := json_object_t();
+    c.state.put('flowId', p_flow_id);
+    c.state.put('version', l_version);
+    c.state.put('status', 'in_progress');
+    c.state.put_null('current');
+    c.state.put('editing', false);
+    c.state.put_null('editingField');
+    c.state.put('context', l_ctx);
+    c.slots   := json_object_t();
+    c.history := json_array_t();
+    seed_context(c);
+
+    insert into fc_sessions (session_id, flow_id, version, status, state, app_user, apex_session, expires_at)
+    values (l_sid, p_flow_id, l_version, 'in_progress', '{}',
+            coalesce(sys_context('APEX$SESSION', 'APP_USER'), user),
+            sys_context('APEX$SESSION', 'APP_SESSION'),
+            systimestamp + c_ttl);
+    log_event(l_sid, 'IN', null, nvl(p_context, '{}'));
+
+    run(c, str(c.flow, 'start'));
+    save_session(c);
+    l_turn := build_turn(c);
+    log_event(l_sid, 'OUT', str(c.state, 'current'), l_turn);
+    return l_turn;
+  end start_session;
+
+  function handle_input (p_session_id in varchar2, p_input in clob) return clob is
+    c        t_ctx;
+    l_in     json_object_t;
+    l_cmd    varchar2(30);
+    l_cur    varchar2(200);
+    l_node   json_object_t;
+    l_type   varchar2(30);
+    l_parsed json_object_t;
+    l_err    varchar2(4000);
+    l_prev   varchar2(200);
+    l_slot   varchar2(300);
+    l_dot    pls_integer;
+    l_cn     json_object_t;
+    l_fd     json_object_t;
+    l_target varchar2(200);
+    l_keys   json_key_list;
+    l_turn   clob;
+  begin
+    load_session(c, p_session_id);
+    if p_input is null or dbms_lob.getlength(p_input) = 0 then l_in := json_object_t(); else l_in := json_object_t.parse(p_input); end if;
+    l_cur := str(c.state, 'current');
+    log_event(p_session_id, 'IN', l_cur, l_in.to_clob);
+
+    if str(c.state, 'status') <> 'in_progress' then
+      return build_turn(c);
+    end if;
+
+    l_cmd := lower(str(l_in, 'command'));
+    if l_cur is not null then
+      l_node := get_node(c, l_cur);
+      l_type := str(l_node, 'type');
+    end if;
+
+    if l_cmd = 'restart' then
+      l_keys := vals(c).get_keys;
+      if l_keys is not null then
+        for i in 1 .. l_keys.count loop touch(c, l_keys(i)); end loop;
+      end if;
+      c.slots   := json_object_t();
+      c.records := json_object_t();
+      c.results := json_object_t();
+      c.history := json_array_t();
+      c.state.put('editing', false);
+      c.state.put_null('editingField');
+      seed_context(c);
+      add_msg(c, 'text', 'Okay, let''s start over.');
+      run(c, str(c.flow, 'start'));
+
+    elsif l_cmd = 'back' and l_type = 'changeFields' and str(c.state, 'editingField') is not null then
+      c.state.put_null('editingField');
+      add_msg(c, 'text', 'No problem, I kept it as it was. Anything else to change?');
+
+    elsif l_cmd = 'back' then
+      c.state.put('editing', false);
+      if c.history.get_size > 0 then
+        l_prev := c.history.get_string(c.history.get_size - 1);
+        c.history.remove(c.history.get_size - 1);
+      end if;
+      c.force_ask := nvl(l_prev, l_cur);
+      run(c, nvl(l_prev, l_cur));
+
+    elsif l_cmd = 'edit' then
+      l_slot := str(l_in, 'slot');
+      l_dot  := instr(l_slot, '.');
+      if l_dot > 1 then
+        l_cn := change_node(c, substr(l_slot, 1, l_dot - 1));
+        if l_cn is not null then l_fd := field_def(l_cn, substr(l_slot, l_dot + 1)); end if;
+      end if;
+      l_target := str(c.slot_nodes, l_slot);
+      if l_fd is not null and field_editable(c, l_cn, l_fd) then
+        prompt_field(c, l_cn, l_fd);
+      elsif l_target is not null then
+        c.state.put('editing', true);
+        c.force_ask := l_target;
+        run(c, l_target);
+      else
+        add_msg(c, 'error', 'There is no question for "' || l_slot || '".');
+      end if;
+
+    elsif l_type = 'ask' then
+      l_parsed := parse_value(input_spec(l_node), str(l_in, 'value'));
+      l_err := str(l_parsed, 'error');
+      if l_err is null then l_err := validate(c, l_node, l_parsed); end if;
+
+      if l_err is not null then
+        add_msg(c, 'error', l_err);
+      else
+        c.slots.put(str(l_node, 'slot'), l_parsed.get('value'));
+        touch(c, str(l_node, 'slot'));
+        c.history.append(l_cur);
+        if get_bool(c.state, 'editing') then
+          c.state.put('editing', false);
+          c.replay := true;
+          run(c, str(c.flow, 'start'));
+        else
+          run(c, str(l_node, 'next'));
+        end if;
+      end if;
+
+    elsif l_type = 'summary' then
+      if lower(trim(str(l_in, 'value'))) in ('confirm', 'yes', 'y', 'ok', 'submit', 'save') then
+        run(c, str(l_node, 'next'));
+      else
+        add_msg(c, 'text', 'Tap "' || nvl(str(l_node, 'confirmLabel'), 'Confirm & submit')
+                           || '", or use Edit next to any answer to change it.');
+      end if;
+
+    elsif l_type = 'findRecord' then
+      handle_pick(c, l_node, l_in);
+
+    elsif l_type = 'changeFields' then
+      handle_change(c, l_node, l_in, l_cmd);
+    end if;
+
+    save_session(c);
+    l_turn := build_turn(c);
+    log_event(p_session_id, 'OUT', str(c.state, 'current'), l_turn);
+    return l_turn;
+  end handle_input;
+
+  function publish_flow (p_definition in clob, p_status in varchar2 default 'PUBLISHED') return number is
+    l_def     json_object_t := json_object_t.parse(p_definition);
+    l_flow_id varchar2(100) := str(l_def, 'flowId');
+    l_name    varchar2(200) := str(l_def, 'name');
+    l_version number;
+    l_clob    clob;
+  begin
+    if l_flow_id is null or not l_def.has('start') or not l_def.has('nodes') then
+      raise_application_error(-20030, 'Definition needs flowId, start and nodes.');
+    end if;
+
+    merge into fc_flows f
+    using (select l_flow_id flow_id, l_name name from dual) s
+       on (f.flow_id = s.flow_id)
+     when matched then update set f.name = nvl(s.name, f.name)
+     when not matched then insert (flow_id, name) values (s.flow_id, s.name);
+
+    select nvl(max(version), 0) + 1 into l_version from fc_flow_versions where flow_id = l_flow_id;
+    l_def.put('version', l_version);
+    l_clob := l_def.to_clob;
+
+    insert into fc_flow_versions (flow_id, version, status, definition)
+    values (l_flow_id, l_version, p_status, l_clob);
+    return l_version;
+  end publish_flow;
+
+  procedure purge_expired is
+  begin
+    delete from fc_sessions where expires_at < systimestamp - interval '30' day;
+  end purge_expired;
+
+  ------------------------------------------------------------------------------
+  -- HTTP glue
+  ------------------------------------------------------------------------------
+  procedure http_out (p_json in clob, p_status in number default null) is
+    l_len pls_integer := nvl(dbms_lob.getlength(p_json), 0);
+    l_off pls_integer := 1;
+  begin
+    if p_status is not null then
+      owa_util.status_line(nstatus => p_status, creason => null, bclose_header => false);
+      owa_util.mime_header('application/json', false, 'UTF-8');
+      htp.p('Cache-Control: no-store');
+      owa_util.http_header_close;
+    end if;
+    while l_off <= l_len loop
+      htp.prn(dbms_lob.substr(p_json, 8000, l_off));
+      l_off := l_off + 8000;
+    end loop;
+  end http_out;
+
+  function error_json return clob is
+    l json_object_t := json_object_t();
+  begin
+    if sqlcode between -20999 and -20000 then
+      l.put('error', regexp_replace(sqlerrm, '^ORA-[0-9]+: ', ''));
+    else
+      l.put('error', 'Unexpected server error. Please try again.');
+      apex_debug.error('FlowChat: %s %s', sqlerrm, dbms_utility.format_error_backtrace);
+    end if;
+    return l.to_clob;
+  end error_json;
+
+  procedure apex_start is
+  begin
+    savepoint fc_turn;
+    http_out(start_session(apex_application.g_x01, apex_application.g_x02));
+  exception when others then
+    rollback to fc_turn;
+    http_out(error_json);
+  end apex_start;
+
+  procedure apex_input is
+  begin
+    savepoint fc_turn;
+    http_out(handle_input(apex_application.g_x01, apex_application.g_x02));
+  exception when others then
+    rollback to fc_turn;
+    http_out(error_json);
+  end apex_input;
+
+  procedure ords_start (p_body in clob) is
+    l_body json_object_t;
+    l_ctx  clob;
+    l_res  clob;
+  begin
+    savepoint fc_turn;
+    l_body := json_object_t.parse(nvl(p_body, '{}'));
+    if l_body.has('context') then l_ctx := l_body.get_object('context').to_clob; end if;
+    l_res := start_session(str(l_body, 'flowId'), l_ctx);
+    http_out(l_res, 201);
+  exception when others then
+    rollback to fc_turn;
+    http_out(error_json, case when sqlcode between -20999 and -20000 then 400 else 500 end);
+  end ords_start;
+
+  procedure ords_input (p_session_id in varchar2, p_body in clob) is
+    l_res clob;
+  begin
+    savepoint fc_turn;
+    l_res := handle_input(p_session_id, p_body);
+    http_out(l_res, 200);
+  exception when others then
+    rollback to fc_turn;
+    http_out(error_json, case when sqlcode = -20002 then 404
+                              when sqlcode between -20999 and -20000 then 400
+                              else 500 end);
+  end ords_input;
+
+end fc_engine;
+/
