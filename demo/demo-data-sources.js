@@ -27,7 +27,15 @@
   function create(engineApi) {
     return engineApi.createMemorySource({ rows: rows(), key: 'app_id', versionField: 'version', fields: fields });
   }
-  var api = { create: create };
+  // Public-page variant: rows are only visible for the identity proved by a Verify step,
+  // like a row_filter of  upper(email) = upper(:FC_VERIFIED)  on the database side.
+  function createPublic(engineApi, sharedRows) {
+    return engineApi.createMemorySource({ rows: sharedRows || rows(), key: 'app_id', versionField: 'version', fields: fields,
+      rowFilter: function (row, context, verified) {
+        return !!verified && String(row.email).toLowerCase() === String(verified).toLowerCase();
+      } });
+  }
+  var api = { create: create, createPublic: createPublic };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else global.FlowChatDemoData = api;
 })(typeof window !== 'undefined' ? window : globalThis);

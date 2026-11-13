@@ -39,6 +39,17 @@
       return { valid: true };
     },
 
+    // Verify step: delivers a one-time code. The demo has no mail server, so the "email" goes to
+    // an in-page outbox (window.FlowChatDemoOutbox) and an "fc-demo-outbox" event is fired.
+    send_code: async function (p) {
+      await wait(200);
+      var msg = { at: new Date(), channel: p.channel, to: p.to,
+                  text: 'Your verification code is ' + p.code + '. It expires in ' + p.ttlMinutes + ' minutes.' };
+      (global.FlowChatDemoOutbox = global.FlowChatDemoOutbox || []).push(msg);
+      global.dispatchEvent(new CustomEvent('fc-demo-outbox', { detail: msg }));
+      return { ok: true };
+    },
+
     create_application: async function (p) {
       await wait(400);
       var ref = 'LN-' + String(nextRef++).padStart(5, '0');

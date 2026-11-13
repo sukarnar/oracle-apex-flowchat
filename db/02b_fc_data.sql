@@ -24,6 +24,11 @@ create or replace package fc_data authid definer as
                         p_context in json_object_t default null) return json_object_t;
   function is_updatable (p_source in varchar2, p_field in varchar2) return boolean;
 
+  -- Identity proved by the conversation's latest Verify step (or null). FC_ENGINE sets it on every
+  -- request. A row_filter can use it as :FC_VERIFIED, e.g.  upper(email) = upper(:FC_VERIFIED);
+  -- PLSQL sources receive it as "verified" in their payload.
+  procedure set_verified (p_value in varchar2);
+
   -- First rows of a TABLE source (row_filter applied, nothing masked) for the designer's Test tab:
   --   [{ "key": "...", "version": "...", "values": {...} }]. PLSQL sources return [].
   function sample_rows (p_source in varchar2, p_limit in pls_integer default 20) return json_array_t;
@@ -33,6 +38,7 @@ end fc_data;
 create or replace package body fc_data as
 
   c_nls constant varchar2(40) := 'NLS_NUMERIC_CHARACTERS=''.,''';
+  g_verified varchar2(4000);
 
   type t_field is record (
     field       fc_data_source_fields.field%type,
@@ -63,6 +69,11 @@ create or replace package body fc_data as
     end if;
     return l_el.to_string;
   end jstr;
+
+  procedure set_verified (p_value in varchar2) is
+  begin
+    g_verified := p_value;
+  end set_verified;
 
   function app_user return varchar2 is
   begin
@@ -129,6 +140,9 @@ create or replace package body fc_data as
     if instr(upper(p_sql), ':APP_USER') > 0 then
       dbms_sql.bind_variable(p_cur, ':APP_USER', app_user);
     end if;
+    if instr(upper(p_sql), ':FC_VERIFIED') > 0 then
+      dbms_sql.bind_variable(p_cur, ':FC_VERIFIED', g_verified, 4000);   -- null (no rows) until verified
+    end if;
   end bind_all;
 
   function mask_value (p_mask in varchar2, p_val in varchar2) return varchar2 is
@@ -150,6 +164,7 @@ create or replace package body fc_data as
     l json_object_t := json_object_t();
   begin
     l.put('appUser', app_user);
+    if g_verified is not null then l.put('verified', g_verified); else l.put_null('verified'); end if;
     if p_context is not null then l.put('context', p_context); end if;
     return l;
   end ctx_payload;

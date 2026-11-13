@@ -22,7 +22,7 @@
 
   function seed() {
     var base = (document.getElementById('fcd-root') || { dataset: {} }).dataset.flowsBase || '../flows/';
-    return Promise.all(['loan_application.json', 'update_application.json'].map(function (f) {
+    return Promise.all(['loan_application.json', 'update_application.json', 'update_application_public.json'].map(function (f) {
       return fetch(base + f).then(function (r) { return r.json(); });
     })).then(function (defs) {
       var db = {
@@ -46,7 +46,8 @@
           { id: 'check_affordability', type: 'PLSQL', description: 'Loan <= 5x annual income' },
           { id: 'check_email', type: 'PLSQL', description: 'Rejects disposable email domains' },
           { id: 'create_application', type: 'PLSQL', description: 'Inserts the loan application' },
-          { id: 'lookup_customer', type: 'PLSQL', description: 'Prefills name for known customers' }
+          { id: 'lookup_customer', type: 'PLSQL', description: 'Prefills name for known customers' },
+          { id: 'send_code', type: 'PLSQL', description: 'Verify step: delivers a one-time code (demo writes to FC_DEMO_OUTBOX)' }
         ],
         tables: {
           FC_DEMO_LOAN_APPS: { type: 'TABLE', pk: ['APP_ID'], columns: [
@@ -69,6 +70,10 @@
           ]
         }
       };
+      // 10_verify_demo.sql: same table, rows limited to the verified email
+      db.sources.loan_apps_public = JSON.parse(JSON.stringify(db.sources.loan_apps));
+      db.sources.loan_apps_public.rowFilter = 'upper(t.email) = upper(:FC_VERIFIED)';
+      db.rows.loan_apps_public = [];   // sample_rows: nothing is verified in the designer
       defs.forEach(function (d) {
         d.version = 1;
         db.flows[d.flowId] = { name: d.name, versions: [{ version: 1, status: 'PUBLISHED', definition: d, createdBy: 'ADMIN', createdAt: '2026-11-01 09:00' }] };
@@ -83,8 +88,8 @@
   }
 
   var PORTS = ['next', 'else', 'onNotFound', 'onSuccess', 'onError', 'found', 'notFound', 'tooMany', 'cancelled',
-               'done', 'noChanges', 'saved', 'conflict', 'forbidden', 'error'];
-  var TYPES = ['message', 'ask', 'condition', 'lookup', 'summary', 'submit', 'end', 'findRecord', 'changeFields', 'saveChanges'];
+               'done', 'noChanges', 'saved', 'conflict', 'forbidden', 'error', 'verified', 'failed'];
+  var TYPES = ['message', 'ask', 'condition', 'lookup', 'summary', 'submit', 'end', 'verify', 'findRecord', 'changeFields', 'saveChanges'];
   function validationErrors(def) {
     var errs = [], ids = {};
     if (!/^[a-z0-9_]{1,100}$/.test(def.flowId || '')) errs.push('flowId must be lowercase letters, digits and _');

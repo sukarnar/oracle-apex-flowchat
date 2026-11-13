@@ -8,11 +8,13 @@ answer on the server, branches on the answers, and fills the page's existing for
 ```
 flows/      loan_application.json    sample "create" flow (collect answers, submit)
             update_application.json  sample "search and update" flow (find, change, review, save)
+            update_application_public.json  same, for public pages: verifies a one-time code first
             flow.schema.json         JSON Schema for flow definitions
 designer/   index.html               visual flow designer (no dependencies)
 widget/     flowchat.js              <flow-chat> Web Component + transports + adapters (no dependencies)
             flowchat-engine.js       reference engine in JS (demo, simulator, Node backends)
-db/         install.sql              first-time install: runs 01..07 and 09 in order (08 ORDS is optional)
+db/         install.sql              first-time install: runs 01..07, 09, 10, 11 in order (08 ORDS is optional)
+            upgrade_phase_d.sql      upgrades an existing install with the Verify step (keeps your data)
             reinstall_packages.sql   re-creates FC_DATA, FC_ENGINE, FC_DESIGNER only (upgrades, compile fixes)
             01_tables.sql            FC_FLOWS, FC_FLOW_VERSIONS, FC_CONNECTORS, FC_SESSIONS, FC_EVENTS
             02_data_sources.sql      FC_DATA_SOURCES (+ fields) registry tables
@@ -23,10 +25,14 @@ db/         install.sql              first-time install: runs 01..07 and 09 in o
             07_seed_flows.sql        generated: publishes both sample flows
             08_ords_module.sql       REST API for non-APEX hosts
             09_fc_designer.sql       FC_DESIGNER: back end for the designer hosted in APEX
+            10_verify_demo.sql       send_code connector, FC_DEMO_OUTBOX, "loan_apps_public" data source
+            11_seed_public_flow.sql  generated: publishes update_application_public
 demo/       index.html               create demo (runs in the browser using the JS engine)
             update.html              search and update demo, with a live table and a conflict button
+            verify.html              public-page demo: one-time code first, with an in-page outbox
 tests/      engine.test.js           node tests/engine.test.js
             update.test.js           node tests/update.test.js
+            verify.test.js           node tests/verify.test.js
             apex-embed-test.html     designer inside a page-wide form, like APEX
             apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
             fake-apex-backend.js     emulates the FC_DESIGNER Ajax protocol in the browser (testing only)
@@ -38,7 +44,8 @@ tools/      build-seed.js            flow JSON -> SQL publish script
 ```bash
 python -m http.server 8765
 ```
-Then open <http://localhost:8765/demo/> (create) or <http://localhost:8765/demo/update.html> (search and update).
+Then open <http://localhost:8765/demo/> (create), <http://localhost:8765/demo/update.html> (search and update)
+or <http://localhost:8765/demo/verify.html> (search and update on a public page, with a one-time code).
 The flows are fetched over HTTP, so opening the files directly won't work.
 
 ## 1b. Design flows visually
@@ -292,6 +299,48 @@ defines in `FC_DATA_SOURCES` and `FC_DATA_SOURCE_FIELDS` (see `db/06_demo_data_s
 
   Every save writes the before and after values to `FC_EVENTS`.
 
+### Verify step (one-time code) for public pages
+
+On a page without login there is no `:APP_USER`, so a row filter can't limit people to their own
+records: anyone who typed someone else's email could open their application. Put a **Verify** step
+between the question that captures the email (or phone) and **Find record**.
+`flows/update_application_public.json` shows the pattern.
+
+```json
+{ "id": "verify_email", "type": "verify", "slot": "email", "channel": "email", "connector": "send_code",
+  "codeLength": 6, "ttlMinutes": 10, "maxAttempts": 3, "maxResends": 2,
+  "verified": "ask_ref", "failed": "locked" }
+```
+
+- The engine generates the code with `DBMS_CRYPTO` and keeps only a salted SHA-256 hash in the session.
+  The code itself is never in a turn, never in the session state, and never written to `FC_EVENTS`.
+  The user's answer is logged there as `(one-time code, not logged)`.
+- The node's **connector** delivers it. It receives the usual payload plus
+  `{"channel", "to", "code", "ttlMinutes"}` and returns `{"ok": true}` or `{"ok": false, "message": "…"}`.
+  The demo connector `fc_demo_verify.send_code` writes to `FC_DEMO_OUTBOX` instead of sending
+  (`select * from fc_demo_outbox order by msg_id desc`); its comments show the `APEX_MAIL` call to use instead.
+- Wrong codes count down (`maxAttempts`). Expired codes are replaced automatically. **Send a new code**
+  is offered under the input (`maxResends`), and the previous code stops working. Running out of
+  attempts or resends, or a failed send, goes to `failed` (or ends the conversation as failed).
+- Verification is tied to the value: changing the email afterwards (Back, or Edit) needs a new code.
+  Back skips over a Verify step that has already passed.
+- **Two locks on the data:**
+  1. On Find record, set `"requireVerified": "email"`. The engine refuses to search unless that answer
+     passed verification with its current value. The designer also checks there's a required
+     *equals* criterion on it.
+  2. On the data source, bind the verified value in the row filter:
+     `upper(t.email) = upper(:FC_VERIFIED)` (see `loan_apps_public` in `db/10_verify_demo.sql`).
+     `:FC_VERIFIED` is null until the conversation passes a Verify step, so nothing is visible before then,
+     even if a flow is misdesigned. PLSQL sources get the same value as `"verified"` in their payload.
+- In the designer, the **Test** tab shows each code in a pop-up message, because nothing is sent.
+  Data sources whose row filter uses `:FC_VERIFIED` return no sample rows in the Data tab, because
+  nothing is verified there.
+
+**Upgrading an existing install:** from the `db` folder run `@upgrade_phase_d.sql`. It re-creates the
+packages, adds the demo connector and data source, and publishes the sample flow. Tables and data are kept.
+Then upload the new `flowchat.js` and `designer.js` (APEX static files), and add
+`update_application_public` to a page without authentication the same way as the other flows.
+
 **Security:** record keys never reach the browser. Search results are sent as opaque tokens
 (`r1`, `r2`) that the engine maps back to keys on the server, so users can't reach other rows
 by tampering with ids.
@@ -301,6 +350,9 @@ Turn-protocol additions:
   (`fields: [{field, label, display, changed, editable, reason}]`). When editing a single field it's an
   `ask` with `sub: true`.
 - New input payloads: `{"pick": "r1"}`, `{"pick": null}`, `{"field": "phone"}` and `{"command": "done"}`.
+- Verify step: an `ask` with `secret: true` (the widget echoes dots instead of the code), input hints
+  (`inputMode`, `autocomplete: "one-time-code"`, `maxLength`) and `actions: [{command: "resend", label}]`,
+  which the widget shows as links. Input `{"command": "resend"}` sends a new code.
 - New message types: `record`, a read-only card, and `changes`, the old → new card.
 
 ## Turn protocol
@@ -319,14 +371,13 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 17 unit tests (`tests/engine.test.js`,
-  `tests/update.test.js`), plus manual end-to-end runs of both demos.
-- **The PL/SQL (`FC_ENGINE`, `FC_DATA`) has not been compiled yet.** No Oracle instance was
-  available when it was written. It mirrors the JavaScript engine rule for rule, but expect a
-  small round of compile fixes on first install.
-- **The designer's database mode has only been tested against the fake back end.** `FC_DESIGNER`,
-  like the rest of the PL/SQL, hasn't been compiled. The browser side follows the same protocol,
-  which `tests/fake-apex-backend.js` documents.
+- The JavaScript engine and widget are tested: 26 unit tests (`tests/engine.test.js`,
+  `tests/update.test.js`, `tests/verify.test.js`), plus manual end-to-end runs of the demos.
+- **The Phase D Verify step in PL/SQL (`FC_ENGINE`, `FC_DATA`, `10_verify_demo.sql`) has not been
+  compiled yet.** It mirrors the JavaScript engine, which is tested. Expect possible small compile
+  fixes when you run `upgrade_phase_d.sql`.
+- Phases 1 to C (`FC_ENGINE`, `FC_DATA`, `FC_DESIGNER`) have been installed and run on Oracle with APEX,
+  including the designer's database mode.
 - **Standalone designer:** without `data-backend="apex"`, the data source catalog is local. Keep it
   in step with `FC_DATA_SOURCES` through Registration SQL and Import/Export.
 - **"Create from table"** lists only the parsing schema's own tables and views (`USER_OBJECTS`).
@@ -334,8 +385,7 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 - **Re-upload changed files:** after updating `designer.js` or `designer.css` in APEX, re-upload
   them. APEX versions static file URLs, so browsers pick up the change. On a plain web server,
   force-reload to avoid a cached copy.
-- Not in Phase 1: resuming a conversation after a reload, line-item (repeat)
-  nodes, file uploads, LLM extraction from free text, PII masking in `FC_EVENTS`, and a
+- Not done yet (rest of Phase D): child rows / line items (repeat), bulk updates, resuming a conversation after a reload, file uploads, LLM extraction from free text, PII masking in `FC_EVENTS`, and a
   packaged APEX region plugin. The Static Content region approach above is the stand-in for the plugin.
 - When an edit replays the flow, lookups are not re-run. For example, if you change the email,
   the customer lookup keeps its earlier result.

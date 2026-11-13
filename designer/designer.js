@@ -12,6 +12,7 @@
   function boot() {
 
   // ======================================================================== constants
+  const VERSION = '1.4.0 (phase D: verify step)';
   const NODE_W = 230;
   const STORE_KEY = 'flowchat-designer:v1';
 
@@ -24,7 +25,8 @@
     (ROOT.dataset.sampleUrl ? ROOT.dataset.sampleUrl.replace(/[^/]*$/, '') : '../flows/');
   const SAMPLES = [
     { file: 'loan_application.json', label: 'Loan application', desc: 'Create: ask, branch, summary, submit' },
-    { file: 'update_application.json', label: 'Update application', desc: 'Search & update: find, change, save' }
+    { file: 'update_application.json', label: 'Update application', desc: 'Search & update: find, change, save' },
+    { file: 'update_application_public.json', label: 'Update (public page)', desc: 'Verify a one-time code, then find and update' }
   ];
   const STANDALONE = document.body.classList.contains('fcd-page');
 
@@ -124,6 +126,9 @@
                  make: (id) => ({ id, type: 'submit', connector: '' }) },
     end:       { label: 'End',       color: '#475569', desc: 'Finish the conversation.',
                  make: (id) => ({ id, type: 'end', text: 'All done!' }) },
+    verify:    { label: 'Verify', color: '#9333ea', group: 'data', desc: 'Send a one-time code to an answer (email or phone) and check it before searching.',
+                 make: (id) => ({ id, type: 'verify', slot: '', channel: 'email', connector: '', codeLength: 6, ttlMinutes: 10,
+                                  maxAttempts: 3, maxResends: 2 }) },
     findRecord: { label: 'Find record', color: '#0d9488', group: 'data', desc: 'Search a data source; pick among matches; load one.',
                  make: (id) => ({ id, type: 'findRecord', source: '', as: 'rec', criteria: [], maxResults: 10,
                                   card: { title: '' }, prompts: { many: 'I found {{count}} matching records. Which one?' } }) },
@@ -140,13 +145,15 @@
     tooMany: 'If too many match, go to', cancelled: 'If the user picks "None of these", go to',
     done: 'When the user clicks Done, go to', noChanges: 'If nothing was changed, go to',
     saved: 'After saving, go to', conflict: 'On a conflict (record changed meanwhile), go to',
-    forbidden: 'If not allowed, go to', error: 'On any other error, go to'
+    forbidden: 'If not allowed, go to', error: 'On any other error, go to',
+    verified: 'Once the code is correct, go to', failed: 'After too many wrong codes, or if sending fails, go to'
   };
   const PORT_HINTS = {
     tooMany: 'Optional. Defaults to the not-found path.', cancelled: 'Optional. Defaults to the not-found path.',
     noChanges: 'Optional. Defaults to the Done path.',
     conflict: 'Usually back to the review summary: the latest values are reloaded with the user\'s edits on top.',
-    forbidden: 'Optional. Without it the conversation ends as failed.', error: 'Optional. Without it the conversation ends as failed.'
+    forbidden: 'Optional. Without it the conversation ends as failed.', error: 'Optional. Without it the conversation ends as failed.',
+    failed: 'Optional. Without it the conversation ends as failed.'
   };
 
   // Default data source catalog: mirrors db/06_demo_data_source.sql so the update sample works in Test.
@@ -173,6 +180,9 @@
       ]
     }
   };
+  // Public-page variant (db/10_verify_demo.sql): same table, rows limited to the verified email.
+  DEFAULT_CATALOG.loan_apps_public = Object.assign(JSON.parse(JSON.stringify(DEFAULT_CATALOG.loan_apps)),
+    { rowFilter: 'upper(t.email) = upper(:FC_VERIFIED)' });
   const SEARCH_OPS = [['eq', 'equals'], ['starts', 'starts with'], ['contains', 'contains'], ['gte', '≥'], ['lte', '≤']];
   const FIELD_TYPES = ['VARCHAR2', 'NUMBER', 'DATE'];
 
@@ -281,6 +291,7 @@
       case 'summary': return [{ key: 'next', label: 'confirm' }];
       case 'lookup': return [{ key: 'next', label: 'next' }, { key: 'onNotFound', label: 'not found', optional: true }];
       case 'submit': return [{ key: 'onSuccess', label: 'success' }, { key: 'onError', label: 'error', optional: true }];
+      case 'verify': return [{ key: 'verified', label: 'verified' }, { key: 'failed', label: 'failed', optional: true }];
       case 'findRecord': return [{ key: 'found', label: 'found' }, { key: 'notFound', label: 'not found' },
         { key: 'tooMany', label: 'too many', optional: true }, { key: 'cancelled', label: 'none of these', optional: true }];
       case 'changeFields': return [{ key: 'done', label: 'done' }, { key: 'noChanges', label: 'no changes', optional: true }];
@@ -341,6 +352,11 @@
     return src ? (src.fields || []).find((f) => f.field === field) || null : null;
   }
   function findNodes() { return S.flow.nodes.filter((n) => n.type === 'findRecord'); }
+  function verifiedSlots() {
+    const out = [];
+    S.flow.nodes.forEach((n) => { if (n.type === 'verify' && n.slot && out.indexOf(n.slot) < 0) out.push(n.slot); });
+    return out;
+  }
   function aliases() {
     const out = [];
     findNodes().forEach((n) => { if (n.as && out.indexOf(n.as) < 0) out.push(n.as); });
@@ -382,6 +398,7 @@
     const map = {};
     S.flow.nodes.forEach((n) => {
       if ((n.type === 'lookup' || n.type === 'submit') && n.connector) map[n.connector] = map[n.connector] || n.type;
+      if (n.type === 'verify' && n.connector) map[n.connector] = map[n.connector] || 'sender';
       if (n.type === 'ask') (n.validators || []).forEach((v) => {
         if (v.type === 'server' && v.connector) map[v.connector] = map[v.connector] || 'validator';
       });
@@ -647,9 +664,30 @@
             else if (als.indexOf(n.record) < 0) add('error', 'No Find record loads a record called "' + n.record + '".', n.id);
           }
           break;
+        case 'verify': {
+          if (!n.slot) add('error', 'Verify has no answer selected to send the code to.', n.id);
+          else if (askSlots().indexOf(n.slot) < 0) add('error', 'Verify uses "' + n.slot + '", which is never asked.', n.id);
+          if (!n.connector) add('error', 'Verify has no connector to send the code.', n.id);
+          if (isFilled(n.codeLength) && (n.codeLength < 4 || n.codeLength > 10)) add('error', 'Code length must be 4 to 10 digits.', n.id);
+          if (isFilled(n.maxAttempts) && n.maxAttempts < 1) add('error', 'Allow at least one attempt.', n.id);
+          if (!findNodes().some((x) => x.requireVerified === n.slot)) {
+            add('warning', 'No Find record requires "' + n.slot + '" to be verified, so searches are not limited to the verified identity.', n.id);
+          }
+          Object.keys(n.prompts || {}).forEach((k) => placeholders(String(n.prompts[k])
+            .replace(/\{\{\s*(codeLength|ttlMinutes|remaining|tries)\s*\}\}/g, ''), n.id));
+          break;
+        }
         case 'findRecord': {
           const src = sourceDef(n.source);
           const crit = n.criteria || [];
+          if (n.requireVerified) {
+            if (verifiedSlots().indexOf(n.requireVerified) < 0) add('error', 'No Verify step checks "' + n.requireVerified + '".', n.id);
+            else if (!crit.some((c) => c.slot === n.requireVerified && (c.op || 'eq') === 'eq' && !c.optional)) {
+              add('error', 'Add a required "equals" criterion on "' + n.requireVerified + '", so the search is limited to the verified identity.', n.id);
+            }
+          } else if (verifiedSlots().length) {
+            add('warning', 'This flow verifies "' + verifiedSlots().join('", "') + '" but this search doesn\'t require it.', n.id);
+          }
           if (!n.source) add('error', 'Find record has no data source.', n.id);
           else if (!src) add('warning', 'Data source "' + n.source + '" is not in the designer catalog, so its fields can\'t be checked. Add it in the Data tab.', n.id);
           if (!/^[a-z][a-z0-9_]{0,49}$/.test(n.as || '')) add('error', 'Record alias must use lowercase letters, digits and _.', n.id);
@@ -789,7 +827,8 @@
       case 'ask': return n.prompt;
       case 'condition': return (n.branches || []).length ? null : 'No branches yet';
       case 'lookup': case 'submit': return n.connector ? 'Calls ' + n.connector : '';
-      case 'findRecord': return n.source ? 'Search ' + n.source + (n.as ? ' → ' + n.as : '') : '';
+      case 'verify': return n.slot ? 'Send a code to ' + n.slot + (n.connector ? ' via ' + n.connector : '') : '';
+      case 'findRecord': return n.source ? (n.requireVerified ? '\uD83D\uDD12 ' : '') + 'Search ' + n.source + (n.as ? ' → ' + n.as : '') : '';
       case 'changeFields': return n.record ? 'Edit ' + (n.fields || []).length + ' field(s) of ' + n.record : '';
       case 'saveChanges': return n.record ? 'Save changes to ' + n.record : '';
       case 'summary': return n.mode === 'changes' ? 'Review changes to ' + (n.record || '?') : n.text;
@@ -1150,7 +1189,7 @@
       idField(n)
     );
     const editors = { message: textEditor, end: textEditor, ask: askEditor, condition: condEditor, lookup: connEditor, submit: connEditor,
-                      summary: summaryEditor, findRecord: findEditor, changeFields: changeEditor, saveChanges: saveEditor };
+                      summary: summaryEditor, verify: verifyEditor, findRecord: findEditor, changeFields: changeEditor, saveChanges: saveEditor };
     body.append(editors[n.type](n));
     if (n.type !== 'condition' && n.type !== 'end') {
       body.append(h('h4', { class: 'sub', text: 'Connections' }));
@@ -1521,6 +1560,13 @@
     wrap.append(h('div', { class: 'grid2' },
       F('Data source', sel(srcOpts, n.source || '', (v) => mutate(() => setOrDelete(n, 'source', v), { panel: true }), { mono: true })),
       F('Record alias', aliasInput(n))));
+    const vs = verifiedSlots();
+    if (vs.length || n.requireVerified) {
+      const vOpts = [['', 'No (signed-in pages only)']].concat(vs.map((s) => [s, 'Yes: "' + s + '" must be verified']));
+      if (n.requireVerified && vs.indexOf(n.requireVerified) < 0) vOpts.push([n.requireVerified, n.requireVerified + ' (no Verify step)']);
+      wrap.append(F('Require a verified identity', sel(vOpts, n.requireVerified || '', (v) => mutate(() => setOrDelete(n, 'requireVerified', v), { panel: true })),
+        'The search is refused unless this answer passed a Verify step with its current value.'));
+    }
     wrap.append(h('p', { class: 'hint' }, 'Loaded fields are available as ', h('code', { text: '{{' + (n.as || 'alias') + '.field}}' }),
       ' and in conditions. ', h('button', { class: 'lnk', text: 'Manage data sources →', onclick: () => setTab('data') })));
 
@@ -1669,6 +1715,38 @@
     return wrap;
   }
 
+  function verifyEditor(n) {
+    const asks = askSlots();
+    const slotOpts = [['', '— choose an answer —']].concat(asks.map((s) => [s, s]));
+    if (n.slot && asks.indexOf(n.slot) < 0) slotOpts.push([n.slot, n.slot + ' (not asked)']);
+    const pr = () => (n.prompts = n.prompts || {});
+    const prompt = (key, label, ph, hint) => F(label, bound(() => (n.prompts || {})[key], (v) => { setOrDelete(pr(), key, v); if (!Object.keys(n.prompts).length) delete n.prompts; },
+      { multiline: true, rows: 2, key: n.id + '.p.' + key, placeholder: ph }), hint);
+    return h('div', null,
+      h('div', { class: 'grid2' },
+        F('Send the code to', sel(slotOpts, n.slot || '', (v) => mutate(() => setOrDelete(n, 'slot', v), { panel: true }), { mono: true }),
+          'An earlier answer, usually the email or phone.'),
+        F('Channel', sel([['email', 'Email'], ['sms', 'SMS']], n.channel || 'email', (v) => mutate(() => { n.channel = v; })),
+          'Passed to the connector.')),
+      F('Connector id', connectorInput(() => n.connector, (v) => setOrDelete(n, 'connector', v.trim()), n.id + '.conn'),
+        'Delivers the code. Receives {"channel", "to", "code", "ttlMinutes"} and returns {"ok": true} or {"ok": false, "message": "…"}.'),
+      h('div', { class: 'grid2' },
+        F('Code length', bound(() => n.codeLength, (v) => setOrDelete(n, 'codeLength', numOrNull(v)), { type: 'number', key: n.id + '.len', placeholder: '6' })),
+        F('Expires after (minutes)', bound(() => n.ttlMinutes, (v) => setOrDelete(n, 'ttlMinutes', numOrNull(v)), { type: 'number', key: n.id + '.ttl', placeholder: '10' })),
+        F('Wrong codes allowed', bound(() => n.maxAttempts, (v) => setOrDelete(n, 'maxAttempts', numOrNull(v)), { type: 'number', key: n.id + '.att', placeholder: '3' })),
+        F('New codes allowed', bound(() => n.maxResends, (v) => setOrDelete(n, 'maxResends', numOrNull(v)), { type: 'number', key: n.id + '.rs', placeholder: '2' }))),
+      h('h4', { class: 'sub', text: 'Messages' }),
+      prompt('sent', 'After sending', "I've sent a {{codeLength}}-digit code to {{" + (n.slot || 'email') + "}}. Please enter it here.",
+        'Placeholders: {{codeLength}}, {{ttlMinutes}} and any answer.'),
+      prompt('wrong', 'Wrong code', "That code isn't right. You have {{remaining}} more {{tries}}."),
+      prompt('success', 'When verified', '(none)'),
+      prompt('locked', 'Too many wrong codes', "That's too many wrong codes, so I can't continue."),
+      h('div', { class: 'card' }, h('div', { class: 'hint', style: 'margin:0' },
+        'Only a salted hash of the code is stored, and it is never shown in the chat or written to FC_EVENTS. ',
+        'Once verified, the value is passed to data sources (bind ', h('code', { text: ':FC_VERIFIED' }),
+        ' in a row filter), and changing the answer afterwards needs a new code. In the Test tab the code is shown in a pop-up message.')));
+  }
+
   function saveEditor(n) {
     return h('div', null,
       F('Record', recordSelect(n, 'record')),
@@ -1779,7 +1857,8 @@
   const ROLE_PRESETS = {
     validator: [['Accept', { valid: true }], ['Reject', { valid: false, message: 'Rejected by the test mock.' }]],
     lookup: [['Not found', { found: false }], ['Found', { found: true, slots: {}, message: 'I found a matching record.' }]],
-    submit: [['Success', { ok: true, slots: { reference: 'TEST-0001' } }], ['Failure', { ok: false, message: 'Test failure from the mock.' }]]
+    submit: [['Success', { ok: true, slots: { reference: 'TEST-0001' } }], ['Failure', { ok: false, message: 'Test failure from the mock.' }]],
+    sender: [['Sent', { ok: true }], ['Sending fails', { ok: false, message: "Sorry, I couldn't send the code." }]]
   };
   const mockFor = (id, role) => (S.mocks[id] !== undefined ? S.mocks[id] : JSON.stringify(ROLE_PRESETS[role][0][1], null, 2));
 
@@ -1893,9 +1972,13 @@
     const uses = connectorUses();
     const connectors = {};
     Object.keys(uses).forEach((id) => {
-      connectors[id] = () => {
+      connectors[id] = (p) => {
         const txt = mockFor(id, uses[id]);
-        try { return JSON.parse(txt); } catch (e) { throw new Error('The test mock for "' + id + '" is not valid JSON.'); }
+        let res;
+        try { res = JSON.parse(txt); } catch (e) { throw new Error('The test mock for "' + id + '" is not valid JSON.'); }
+        // Verify: nothing is really sent in a test, so show the code to whoever is testing.
+        if (uses[id] === 'sender' && res.ok !== false) toast('Test code for ' + p.to + ': ' + p.code, 12000);
+        return res;
       };
     });
     testEngine = FlowChatEngine.createEngine({ flows: [flow], connectors, dataSources: buildTestSources() });
@@ -2410,16 +2493,35 @@
       document.removeEventListener('pointerdown', close);
     }), 0);
   }
-  function loadSample(s) {
-    fetch(FLOWS_BASE + s.file).then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then((f) => {
-        // make sure the sample's data sources exist in the catalog
-        const cat = catalog();
-        (f.nodes || []).forEach((n) => { if (n.type === 'findRecord' && n.source && !cat[n.source] && DEFAULT_CATALOG[n.source]) cat[n.source] = clone(DEFAULT_CATALOG[n.source]); });
+  // Loads a sample from FLOWS_BASE. In database mode, falls back to the copy that install.sql
+  // published (flow id = file name without .json), so the JSON files don't have to be uploaded.
+  async function loadSample(s) {
+    const url = FLOWS_BASE + s.file;
+    const flowId = s.file.replace(/\.json$/, '');
+    let fileErr;
+    try {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const f = await r.json();
+      const cat = catalog();   // make sure the sample's data sources exist in the catalog
+      (f.nodes || []).forEach((n) => { if (n.type === 'findRecord' && n.source && !cat[n.source] && DEFAULT_CATALOG[n.source]) cat[n.source] = clone(DEFAULT_CATALOG[n.source]); });
+      testEngine = null;
+      replaceFlow(checkShape(f), 'Loaded the ' + s.label + ' sample');
+      return;
+    } catch (e) { fileErr = e; }
+
+    if (BACKEND) {
+      try {
+        const r = await BACKEND.call('loadFlow', { flowId });
         testEngine = null;
-        replaceFlow(checkShape(f), 'Loaded the ' + s.label + ' sample');
-      })
-      .catch((err) => toast('Could not load the sample: ' + err.message));
+        replaceFlow(checkShape(r.definition), 'Opened the ' + s.label + ' sample from the database (v' + r.version + ')',
+          { flowId, version: r.version, status: r.status });
+        return;
+      } catch (e) { /* not in the database either: report the file error below */ }
+    }
+    console.warn('[FlowChat Designer] sample not found at', new URL(url, location.href).href, fileErr);
+    toast('Could not load the sample from ' + new URL(url, location.href).pathname + ' (' + fileErr.message + '). ' +
+          'Upload ' + s.file + ' to Static Application Files, or set data-flows-base on the region.', 9000);
   }
 
   function renderTitle() {
@@ -2595,12 +2697,17 @@
       renderDbStatus();
       await loadDbMeta();
       if (!restored) openDialog();
+    } else if (window.apex && window.apex.server) {
+      // On an APEX page but database mode is off: say why Save draft / Publish are missing.
+      console.info('[FlowChat Designer] ' + VERSION + ': database mode is off. Add data-backend="apex" to <div id="fcd-root">.');
+      toast('Database mode is off: add data-backend="apex" to the designer region’s div to save and publish here.', 9000);
     }
+    console.info('[FlowChat Designer] ' + VERSION + (BACKEND ? ', database mode (process ' + (ROOT.dataset.process || 'FC_DESIGNER') + ')' : ', file mode'));
     window.addEventListener('resize', () => drawEdges());
   }
 
   // Small debugging / automation handle.
-  window.FlowChatDesigner = { get state() { return S; }, analyze, publishSql, select: (id) => select(id ? { kind: 'node', id } : null) };
+  window.FlowChatDesigner = { version: VERSION, mode: BACKEND ? 'database' : 'file', get state() { return S; }, analyze, publishSql, select: (id) => select(id ? { kind: 'node', id } : null) };
   init();
   } // boot
 })();

@@ -15,6 +15,11 @@
  *   update({key, version, original, changes, context})    -> {status: ok|conflict|forbidden|notfound, version?, message?}
  *   fields: { name: {updatable, searchable, mask} }       (optional metadata; enforced by the source)
  * createMemorySource() builds one over an in-memory array (demo, tests, designer mocks).
+ * Every data source request also carries `verified`: the identity proved by the most recent
+ * Verify step (for example the email address a one-time code was sent to), or null.
+ *
+ * Verify step (one-time code): the engine generates the code, keeps only a salted SHA-256 hash,
+ * and calls the node's connector with {channel, to, code, ttlMinutes} to deliver it.
  */
 (function (global) {
   'use strict';
@@ -34,6 +39,26 @@
     if (global.crypto && global.crypto.getRandomValues) global.crypto.getRandomValues(b);
     else for (var i = 0; i < 16; i++) b[i] = Math.floor(Math.random() * 256);
     return Array.prototype.map.call(b, function (x) { return x.toString(16).padStart(2, '0'); }).join('').toUpperCase();
+  }
+
+  function cryptoObj() { return (typeof globalThis !== 'undefined' && globalThis.crypto) || null; }
+  function randomCode(len) {
+    var c = cryptoObj(), out = '';
+    var b = new Uint32Array(len);
+    if (c && c.getRandomValues) c.getRandomValues(b);
+    else for (var i = 0; i < len; i++) b[i] = Math.floor(Math.random() * 4294967296);
+    for (var j = 0; j < len; j++) out += String(b[j] % 10);
+    return out;
+  }
+  // Salted SHA-256 (hex). The plain code is never stored in the session.
+  async function hashCode(salt, code) {
+    var text = String(salt) + ':' + String(code), c = cryptoObj();
+    if (c && c.subtle) {
+      var buf = await c.subtle.digest('SHA-256', new TextEncoder().encode(text));
+      return Array.prototype.map.call(new Uint8Array(buf), function (x) { return x.toString(16).padStart(2, '0'); }).join('');
+    }
+    if (typeof require === 'function') return require('crypto').createHash('sha256').update(text).digest('hex');
+    throw new Error('No SHA-256 implementation available for the Verify step.');
   }
 
   function formatNumber(n) {
@@ -164,7 +189,7 @@
     var fields = def.fields || {};
     var names = Object.keys(fields);
 
-    function visible(row, req) { return !def.rowFilter || def.rowFilter(row, (req && req.context) || {}); }
+    function visible(row, req) { return !def.rowFilter || def.rowFilter(row, (req && req.context) || {}, (req && req.verified) || null); }
     function values(row, masked) {
       var out = {};
       names.forEach(function (f) {
@@ -297,6 +322,11 @@
       return s;
     }
     function dsContext(ctx) { return { sessionId: ctx.sid, flowId: ctx.flow.flowId, context: clone(ctx.st.context) }; }
+    function verifiedValue(ctx) { return isFilled(ctx.st.verifiedLast) ? ctx.st.verifiedLast : null; }
+    function isVerified(ctx, slot) {
+      var v = view(ctx)[slot];
+      return isFilled(v) && (ctx.st.verified || {})[slot] === String(v);
+    }
 
     // Input spec for a slot or "alias.field" (used for display formatting).
     function specFor(ctx, name) {
@@ -424,6 +454,7 @@
           id = n.done;
         }
         else if (n.type === 'condition') id = pickBranch(n, v);
+        else if (n.type === 'verify') id = n.verified;
         else if (n.type === 'message' || n.type === 'lookup') id = n.next;
         else break;
       }
@@ -435,6 +466,11 @@
     async function runFind(ctx, node) {
       var st = ctx.st, v = view(ctx), prompts = node.prompts || {};
       var criteria = [];
+      if (node.requireVerified && !isVerified(ctx, node.requireVerified)) {
+        // Never search for an identity that hasn't passed a Verify step (a flow design error).
+        say(ctx, 'error', "I can't look that up until it has been verified.");
+        return failed(ctx);
+      }
       (node.criteria || []).forEach(function (c) {
         var val = v[c.slot];
         if (isFilled(val)) criteria.push({ field: c.field, op: c.op || 'eq', value: val });
@@ -444,7 +480,7 @@
         return node.notFound;
       }
       var max = node.maxResults || 10;
-      var rows = (await Promise.resolve(source(node.source).search({ criteria: criteria, limit: max + 1, context: dsContext(ctx).context }))) || [];
+      var rows = (await Promise.resolve(source(node.source).search({ criteria: criteria, limit: max + 1, context: dsContext(ctx).context, verified: verifiedValue(ctx) }))) || [];
       if (!rows.length) {
         say(ctx, 'text', interpolate(prompts.none || "I couldn't find a matching record.", v));
         return node.notFound;
@@ -466,7 +502,7 @@
     }
 
     async function loadRecord(ctx, node, key) {
-      var res = await Promise.resolve(source(node.source).get({ key: key, context: dsContext(ctx).context }));
+      var res = await Promise.resolve(source(node.source).get({ key: key, context: dsContext(ctx).context, verified: verifiedValue(ctx) }));
       delete ctx.st.results[node.id];
       if (!res || !res.values) {
         say(ctx, 'error', (node.prompts || {}).gone || 'That record is no longer available.');
@@ -507,7 +543,7 @@
 
       var src = source(rec.source), original = {};
       fieldsChanged.forEach(function (f) { original[f] = rec.original[f]; });
-      var r = (await Promise.resolve(src.update({ key: rec.key, version: rec.version, original: original, changes: changes, context: dsContext(ctx).context }))) || {};
+      var r = (await Promise.resolve(src.update({ key: rec.key, version: rec.version, original: original, changes: changes, context: dsContext(ctx).context, verified: verifiedValue(ctx) }))) || {};
       if (r.status === 'ok') {
         if (r.version !== undefined && r.version !== null) rec.version = r.version;
         rec.original = clone(rec.current);
@@ -515,7 +551,7 @@
         return node.saved;
       }
       if (r.status === 'conflict') {
-        var fresh = await Promise.resolve(src.get({ key: rec.key, context: dsContext(ctx).context }));
+        var fresh = await Promise.resolve(src.get({ key: rec.key, context: dsContext(ctx).context, verified: verifiedValue(ctx) }));
         if (!fresh || !fresh.values) { say(ctx, 'error', 'That record is no longer available.'); return node.error || failed(ctx); }
         rec.original = clone(fresh.values);
         rec.version = fresh.version === undefined ? null : fresh.version;
@@ -534,6 +570,95 @@
     }
 
     function failed(ctx) { ctx.st.status = 'failed'; ctx.st.current = null; return null; }
+
+    // ---- verify (one-time code)
+    function verifyOpts(node) {
+      return { len: Math.min(Math.max(parseInt(node.codeLength, 10) || 6, 4), 10),
+               ttl: Math.max(parseInt(node.ttlMinutes, 10) || 10, 1),
+               attempts: Math.max(parseInt(node.maxAttempts, 10) || 3, 1),
+               resends: Math.max(isFilled(node.maxResends) ? parseInt(node.maxResends, 10) || 0 : 2, 0) };
+    }
+    function verifyValues(ctx, node, extra) {
+      var o = verifyOpts(node);
+      return Object.assign({}, view(ctx), { codeLength: o.len, ttlMinutes: o.ttl }, extra);
+    }
+    // Generates, hashes and sends a code. Returns false when the connector reports a failure.
+    async function sendCode(ctx, node) {
+      var st = ctx.st, o = verifyOpts(node), target = String(view(ctx)[node.slot]);
+      var prev = (st.verify || {})[node.id];
+      var code = randomCode(o.len);
+      st.verify = st.verify || {};
+      st.verify[node.id] = { hash: await hashCode(ctx.sid + ':' + node.id, code), target: target,
+                             expiresAt: Date.now() + o.ttl * 60000, attempts: 0,
+                             sends: (prev && prev.target === target ? prev.sends : 0) + 1 };
+      var r = await callConnector(ctx, node.connector, { nodeId: node.id, channel: node.channel || 'email',
+                                                        to: target, code: code, ttlMinutes: o.ttl });
+      if (r.ok === false) {
+        delete st.verify[node.id];
+        say(ctx, 'error', r.message || "Sorry, I couldn't send the code.");
+        return false;
+      }
+      return true;
+    }
+    async function verifyFailed(ctx, node) {
+      if (node.failed) await run(ctx, node.failed);
+      else failed(ctx);
+    }
+    async function runVerify(ctx, node) {
+      var st = ctx.st, target = view(ctx)[node.slot];
+      if (!isFilled(target)) throw new Error('Verify "' + node.id + '" needs a value in "' + node.slot + '".');
+      if (isVerified(ctx, node.slot)) { st.verifiedLast = String(target); return node.verified; }
+      if (ctx.replay) st.editing = true;   // reached while replaying an edit: resume the replay once verified
+      ctx.replay = false;
+      if (!(await sendCode(ctx, node))) return node.failed || failed(ctx);
+      st.current = node.id;
+      say(ctx, 'text', interpolate((node.prompts || {}).sent || "I've sent a {{codeLength}}-digit code to {{" + node.slot + "}}. Please enter it here.", verifyValues(ctx, node)));
+      return AWAIT;
+    }
+    async function handleVerify(ctx, node, payload, cmd) {
+      var st = ctx.st, o = verifyOpts(node), pr = node.prompts || {};
+      var pend = (st.verify || {})[node.id];
+      if (cmd === 'resend' || !pend) {
+        if (pend && pend.sends > o.resends) { say(ctx, 'error', pr.tooManySends || "I can't send any more codes. Please use the last one I sent."); return; }
+        if (!(await sendCode(ctx, node))) { await verifyFailed(ctx, node); return; }
+        say(ctx, 'text', interpolate(pr.resent || "I've sent a new code to {{" + node.slot + "}}.", verifyValues(ctx, node)));
+        return;
+      }
+      var code = String(payload.value || '').replace(/\s+/g, '');
+      if (!code) { say(ctx, 'error', 'Please enter the code.'); return; }
+      if (Date.now() > pend.expiresAt) {
+        if (pend.sends > o.resends) {
+          delete st.verify[node.id];
+          say(ctx, 'error', pr.locked || "That code has expired and I can't send another one.");
+          await verifyFailed(ctx, node);
+          return;
+        }
+        if (!(await sendCode(ctx, node))) { await verifyFailed(ctx, node); return; }
+        say(ctx, 'error', interpolate(pr.expired || "That code has expired, so I've sent a new one to {{" + node.slot + "}}.", verifyValues(ctx, node)));
+        return;
+      }
+      if ((await hashCode(ctx.sid + ':' + node.id, code)) !== pend.hash) {
+        pend.attempts++;
+        var left = o.attempts - pend.attempts;
+        if (left <= 0) {
+          delete st.verify[node.id];
+          say(ctx, 'error', pr.locked || "That's too many wrong codes, so I can't continue.");
+          await verifyFailed(ctx, node);
+          return;
+        }
+        say(ctx, 'error', interpolate(pr.wrong || "That code isn't right. You have {{remaining}} more {{tries}}.",
+          verifyValues(ctx, node, { remaining: left, tries: left === 1 ? 'try' : 'tries' })));
+        return;
+      }
+      delete st.verify[node.id];
+      st.verified = st.verified || {};
+      st.verified[node.slot] = pend.target;
+      st.verifiedLast = pend.target;
+      st.history.push(node.id);
+      say(ctx, 'text', interpolate(pr.success, view(ctx)));
+      if (st.editing) { st.editing = false; ctx.replay = true; await run(ctx, ctx.flow.start); }
+      else await run(ctx, node.verified);
+    }
 
     async function run(ctx, startId) {
       var st = ctx.st, id = startId, steps = 0;
@@ -582,6 +707,12 @@
             }
             break;
           }
+          case 'verify':
+            nxt = await runVerify(ctx, node);
+            if (nxt === AWAIT) return;
+            if (nxt === null && st.status === 'failed') return;
+            id = nxt;
+            break;
           case 'findRecord':
             if (ctx.replay && st.records[node.as]) { id = node.found; break; }
             ctx.replay = false;
@@ -625,6 +756,12 @@
           if (!aw.input.kind) aw.input.kind = 'text';
         } else if (n.type === 'summary') {
           aw = { type: 'summary', nodeId: n.id, confirmLabel: n.confirmLabel || 'Confirm & submit' };
+        } else if (n.type === 'verify') {
+          var vo = verifyOpts(n);
+          aw = { type: 'ask', nodeId: n.id, slot: '#code', label: n.label || 'Code', secret: true, value: null,
+                 input: { kind: 'text', inputMode: 'numeric', autocomplete: 'one-time-code', maxLength: vo.len,
+                          placeholder: n.placeholder || vo.len + '-digit code' },
+                 actions: [{ command: 'resend', label: n.resendLabel || 'Send a new code' }] };
         } else if (n.type === 'findRecord') {
           aw = { type: 'pick', nodeId: n.id,
                  items: (st.results[n.id] || []).map(function (r) { return { token: r.token, title: r.title, subtitle: r.subtitle }; }),
@@ -664,7 +801,8 @@
       var flow = compile(flowId).flow;
       var sid = randomId();
       var st = { flowId: flowId, version: flow.version || 1, status: 'in_progress', current: null,
-                 slots: {}, history: [], editing: false, context: clone(context || {}), records: {}, results: {}, editingField: null };
+                 slots: {}, history: [], editing: false, context: clone(context || {}), records: {}, results: {}, editingField: null,
+                 verify: {}, verified: {}, verifiedLast: null };
       sessions.set(sid, st);
       var ctx = makeCtx(sid, st);
       seedContext(ctx);
@@ -684,6 +822,7 @@
       if (cmd === 'restart') {
         Object.keys(view(ctx)).forEach(function (k) { touch(ctx, k); });
         st.slots = {}; st.history = []; st.editing = false; st.records = {}; st.results = {}; st.editingField = null;
+        st.verify = {}; st.verified = {}; st.verifiedLast = null;
         seedContext(ctx);
         say(ctx, 'text', "Okay, let's start over.");
         await run(ctx, ctx.flow.start);
@@ -692,6 +831,8 @@
         say(ctx, 'text', 'No problem, I kept it as it was. Anything else to change?');
       } else if (cmd === 'back') {
         var prev = st.history.pop();
+        // A passed Verify step has nothing to ask again: step back past it.
+        while (prev && ctx.nodes[prev] && ctx.nodes[prev].type === 'verify' && st.history.length) prev = st.history.pop();
         st.editing = false;
         ctx.forceAsk = prev || st.current;
         await run(ctx, prev || st.current);
@@ -717,6 +858,8 @@
       } else if (node.type === 'summary') {
         if (/^(confirm|yes|y|ok|submit|save)$/i.test(String(payload.value || '').trim())) await run(ctx, node.next);
         else say(ctx, 'text', 'Tap "' + (node.confirmLabel || 'Confirm & submit') + '", or use Edit next to any answer to change it.');
+      } else if (node.type === 'verify') {
+        await handleVerify(ctx, node, payload, cmd);
       } else if (node.type === 'findRecord') {
         await handlePick(ctx, node, payload);
       } else if (node.type === 'changeFields') {

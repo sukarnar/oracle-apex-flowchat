@@ -641,6 +641,123 @@ create or replace package body fc_engine as
     return str(p_node, 'found');
   end load_record;
 
+  ------------------------------------------------------------------------------
+  -- verify (one-time code). Only a salted SHA-256 of the code is kept in the session.
+  ------------------------------------------------------------------------------
+  function now_secs return number is
+  begin
+    return round((cast(sys_extract_utc(systimestamp) as date) - date '1970-01-01') * 86400);
+  end now_secs;
+
+  function opt_int (p_node in json_object_t, p_key in varchar2, p_default in pls_integer,
+                    p_min in pls_integer, p_max in pls_integer default null) return pls_integer is
+    l number := trunc(to_num(str(p_node, p_key)));
+  begin
+    l := greatest(nvl(l, p_default), p_min);
+    if p_max is not null then l := least(l, p_max); end if;
+    return l;
+  end opt_int;
+
+  function hash_code (p_salt in varchar2, p_code in varchar2) return varchar2 is
+  begin
+    return lower(rawtohex(dbms_crypto.hash(utl_raw.cast_to_raw(p_salt || ':' || p_code), dbms_crypto.hash_sh256)));
+  end hash_code;
+
+  function random_code (p_len in pls_integer) return varchar2 is
+    l varchar2(20);
+  begin
+    for i in 1 .. p_len loop
+      l := l || to_char(abs(mod(dbms_crypto.randominteger, 10)));
+    end loop;
+    return l;
+  end random_code;
+
+  -- A state member that holds an object ({} when absent).
+  function st_obj (c in out nocopy t_ctx, p_key in varchar2) return json_object_t is
+    l json_object_t := obj(c.state, p_key);
+  begin
+    if l is null then l := json_object_t(); end if;
+    return l;
+  end st_obj;
+
+  -- True when the slot's current value is the one that passed verification.
+  function is_verified (c in out nocopy t_ctx, p_slot in varchar2) return boolean is
+    l_val varchar2(4000) := str(c.slots, p_slot);
+  begin
+    return l_val is not null and str(st_obj(c, 'verified'), p_slot) = l_val;
+  end is_verified;
+
+  function verify_vals (c in out nocopy t_ctx, p_node in json_object_t) return json_object_t is
+    l json_object_t := vals(c);
+  begin
+    l.put('codeLength', opt_int(p_node, 'codeLength', 6, 4, 10));
+    l.put('ttlMinutes', opt_int(p_node, 'ttlMinutes', 10, 1));
+    return l;
+  end verify_vals;
+
+  -- Generates, hashes and sends a code. False when the connector reports {"ok": false}.
+  function send_code (c in out nocopy t_ctx, p_node in json_object_t) return boolean is
+    l_id     varchar2(200)  := str(p_node, 'id');
+    l_ttl    pls_integer    := opt_int(p_node, 'ttlMinutes', 10, 1);
+    l_target varchar2(4000) := str(c.slots, str(p_node, 'slot'));
+    l_code   varchar2(20)   := random_code(opt_int(p_node, 'codeLength', 6, 4, 10));
+    l_all    json_object_t  := st_obj(c, 'verify');
+    l_prev   json_object_t  := obj(l_all, l_id);
+    l_pend   json_object_t  := json_object_t();
+    l_pay    json_object_t;
+    l_res    json_object_t;
+    l_sends  pls_integer    := 1;
+  begin
+    if l_prev is not null and str(l_prev, 'target') = l_target then
+      l_sends := nvl(to_num(str(l_prev, 'sends')), 0) + 1;
+    end if;
+    l_pend.put('hash', hash_code(c.session_id || ':' || l_id, l_code));
+    l_pend.put('target', l_target);
+    l_pend.put('expiresAt', now_secs + l_ttl * 60);
+    l_pend.put('attempts', 0);
+    l_pend.put('sends', l_sends);
+    l_all.put(l_id, l_pend);
+    c.state.put('verify', l_all);
+
+    l_pay := json_object_t.parse(payload(c, l_id));
+    l_pay.put('channel', nvl(str(p_node, 'channel'), 'email'));
+    l_pay.put('to', l_target);
+    l_pay.put('code', l_code);
+    l_pay.put('ttlMinutes', l_ttl);
+    l_res := call_connector(str(p_node, 'connector'), l_pay.to_clob);
+    if str(l_res, 'ok') = 'false' then
+      l_all.remove(l_id);
+      c.state.put('verify', l_all);
+      add_msg(c, 'error', nvl(str(l_res, 'message'), 'Sorry, I couldn''t send the code.'));
+      return false;
+    end if;
+    return true;
+  end send_code;
+
+  function run_verify (c in out nocopy t_ctx, p_node in json_object_t, p_await out boolean) return varchar2 is
+    l_slot varchar2(200) := str(p_node, 'slot');
+  begin
+    p_await := false;
+    if str(c.slots, l_slot) is null then
+      raise_application_error(-20027, 'Verify "' || str(p_node, 'id') || '" needs a value in "' || l_slot || '".');
+    end if;
+    if is_verified(c, l_slot) then
+      c.state.put('verifiedLast', str(c.slots, l_slot));
+      fc_data.set_verified(str(c.slots, l_slot));
+      return str(p_node, 'verified');
+    end if;
+    if c.replay then c.state.put('editing', true); end if;   -- reached while replaying an edit: resume after it
+    c.replay := false;
+    if not send_code(c, p_node) then
+      return route(c, str(p_node, 'failed'));
+    end if;
+    c.state.put('current', str(p_node, 'id'));
+    add_msg(c, 'text', interpolate(nvl(str(obj(p_node, 'prompts'), 'sent'),
+      'I''ve sent a {{codeLength}}-digit code to {{' || l_slot || '}}. Please enter it here.'), verify_vals(c, p_node)));
+    p_await := true;
+    return null;
+  end run_verify;
+
   function run_find (c in out nocopy t_ctx, p_node in json_object_t, p_await out boolean) return varchar2 is
     l_v       json_object_t := vals(c);
     l_prompts json_object_t := obj(p_node, 'prompts');
@@ -658,6 +775,11 @@ create or replace package body fc_engine as
     l_r       json_object_t;
   begin
     p_await := false;
+    if str(p_node, 'requireVerified') is not null and not is_verified(c, str(p_node, 'requireVerified')) then
+      -- never search for an identity that hasn't passed a Verify step (a flow design error)
+      add_msg(c, 'error', 'I can''t look that up until it has been verified.');
+      return failed(c);
+    end if;
     for i in 0 .. l_cdef.get_size - 1 loop
       l_cd  := treat(l_cdef.get(i) as json_object_t);
       l_val := str(l_v, str(l_cd, 'slot'));
@@ -963,6 +1085,8 @@ create or replace package body fc_engine as
         l_id := str(l_n, 'done');
       elsif l_type = 'condition' then
         l_id := pick_branch(l_v, l_n);
+      elsif l_type = 'verify' then
+        l_id := str(l_n, 'verified');
       elsif l_type in ('message', 'lookup') then
         l_id := str(l_n, 'next');
       else
@@ -1055,6 +1179,11 @@ create or replace package body fc_engine as
             end if;
           end if;
 
+        when 'verify' then
+          l_id := run_verify(c, l_node, l_await);
+          if l_await then return; end if;
+          if l_id is null and str(c.state, 'status') = 'failed' then return; end if;
+
         when 'findRecord' then
           if c.replay and c.records.has(str(l_node, 'as')) then
             l_id := str(l_node, 'found');
@@ -1119,6 +1248,9 @@ create or replace package body fc_engine as
     l_edit    boolean;
     l_done    pls_integer;
     l_total   pls_integer;
+    l_spec    json_object_t;
+    l_acts    json_array_t;
+    l_act     json_object_t;
   begin
     if str(c.state, 'status') = 'in_progress' and l_cur is not null then
       l_node := get_node(c, l_cur);
@@ -1138,6 +1270,26 @@ create or replace package body fc_engine as
       elsif l_type = 'summary' then
         l_aw.put('type', 'summary');
         l_aw.put('confirmLabel', nvl(str(l_node, 'confirmLabel'), 'Confirm & submit'));
+
+      elsif l_type = 'verify' then
+        l_aw.put('type', 'ask');
+        l_aw.put('slot', '#code');
+        l_aw.put('label', nvl(str(l_node, 'label'), 'Code'));
+        l_aw.put('secret', true);
+        l_aw.put_null('value');
+        l_spec := json_object_t();
+        l_spec.put('kind', 'text');
+        l_spec.put('inputMode', 'numeric');
+        l_spec.put('autocomplete', 'one-time-code');
+        l_spec.put('maxLength', opt_int(l_node, 'codeLength', 6, 4, 10));
+        l_spec.put('placeholder', nvl(str(l_node, 'placeholder'), opt_int(l_node, 'codeLength', 6, 4, 10) || '-digit code'));
+        l_aw.put('input', l_spec);
+        l_act := json_object_t();
+        l_act.put('command', 'resend');
+        l_act.put('label', nvl(str(l_node, 'resendLabel'), 'Send a new code'));
+        l_acts := json_array_t();
+        l_acts.append(l_act);
+        l_aw.put('actions', l_acts);
 
       elsif l_type = 'findRecord' then
         l_aw.put('type', 'pick');
@@ -1334,6 +1486,7 @@ create or replace package body fc_engine as
     if c.records is null then c.records := json_object_t(); end if;
     if c.results is null then c.results := json_object_t(); end if;
     if c.state.has('history') then c.history := c.state.get_array('history'); else c.history := json_array_t(); end if;
+    fc_data.set_verified(str(c.state, 'verifiedLast'));   -- package state may be left over from another request
   end load_session;
 
   ------------------------------------------------------------------------------
@@ -1376,6 +1529,96 @@ create or replace package body fc_engine as
     l_next := load_record(c, p_node, l_key);
     run(c, l_next);
   end handle_pick;
+
+  procedure handle_verify (c in out nocopy t_ctx, p_node in json_object_t, p_in in json_object_t, p_cmd in varchar2) is
+    l_id      varchar2(200) := str(p_node, 'id');
+    l_slot    varchar2(200) := str(p_node, 'slot');
+    l_prompts json_object_t := obj(p_node, 'prompts');
+    l_all     json_object_t := st_obj(c, 'verify');
+    l_pend    json_object_t := obj(l_all, l_id);
+    l_max_att pls_integer   := opt_int(p_node, 'maxAttempts', 3, 1);
+    l_max_rs  pls_integer   := opt_int(p_node, 'maxResends', 2, 0);
+    l_code    varchar2(4000) := regexp_replace(str(p_in, 'value'), '\s', '');
+    l_tries   pls_integer;
+    l_v       json_object_t;
+    l_vf      json_object_t;
+
+    procedure give_up is
+      l_dummy varchar2(1);
+    begin
+      if str(p_node, 'failed') is not null then run(c, str(p_node, 'failed')); else l_dummy := failed(c); end if;
+    end give_up;
+
+    procedure forget is
+    begin
+      l_all.remove(l_id);
+      c.state.put('verify', l_all);
+    end forget;
+  begin
+    if p_cmd = 'resend' or l_pend is null then
+      if l_pend is not null and nvl(to_num(str(l_pend, 'sends')), 0) > l_max_rs then
+        add_msg(c, 'error', nvl(str(l_prompts, 'tooManySends'), 'I can''t send any more codes. Please use the last one I sent.'));
+        return;
+      end if;
+      if not send_code(c, p_node) then give_up; return; end if;
+      add_msg(c, 'text', interpolate(nvl(str(l_prompts, 'resent'), 'I''ve sent a new code to {{' || l_slot || '}}.'), verify_vals(c, p_node)));
+      return;
+    end if;
+
+    if l_code is null then
+      add_msg(c, 'error', 'Please enter the code.');
+      return;
+    end if;
+
+    if now_secs > to_num(str(l_pend, 'expiresAt')) then
+      if nvl(to_num(str(l_pend, 'sends')), 0) > l_max_rs then
+        forget;
+        add_msg(c, 'error', nvl(str(l_prompts, 'locked'), 'That code has expired and I can''t send another one.'));
+        give_up;
+        return;
+      end if;
+      if not send_code(c, p_node) then give_up; return; end if;
+      add_msg(c, 'error', interpolate(nvl(str(l_prompts, 'expired'),
+        'That code has expired, so I''ve sent a new one to {{' || l_slot || '}}.'), verify_vals(c, p_node)));
+      return;
+    end if;
+
+    if hash_code(c.session_id || ':' || l_id, l_code) <> str(l_pend, 'hash') then
+      l_tries := nvl(to_num(str(l_pend, 'attempts')), 0) + 1;
+      if l_max_att - l_tries <= 0 then
+        forget;
+        add_msg(c, 'error', nvl(str(l_prompts, 'locked'), 'That''s too many wrong codes, so I can''t continue.'));
+        give_up;
+        return;
+      end if;
+      l_pend.put('attempts', l_tries);
+      l_all.put(l_id, l_pend);
+      c.state.put('verify', l_all);
+      l_v := verify_vals(c, p_node);
+      l_v.put('remaining', l_max_att - l_tries);
+      l_v.put('tries', case when l_max_att - l_tries = 1 then 'try' else 'tries' end);
+      add_msg(c, 'error', interpolate(nvl(str(l_prompts, 'wrong'),
+        'That code isn''t right. You have {{remaining}} more {{tries}}.'), l_v));
+      return;
+    end if;
+
+    -- verified
+    forget;
+    l_vf := st_obj(c, 'verified');
+    l_vf.put(l_slot, str(l_pend, 'target'));
+    c.state.put('verified', l_vf);
+    c.state.put('verifiedLast', str(l_pend, 'target'));
+    fc_data.set_verified(str(l_pend, 'target'));
+    c.history.append(l_id);
+    add_msg(c, 'text', interpolate(str(l_prompts, 'success'), vals(c)));
+    if get_bool(c.state, 'editing') then
+      c.state.put('editing', false);
+      c.replay := true;
+      run(c, str(c.flow, 'start'));
+    else
+      run(c, str(p_node, 'verified'));
+    end if;
+  end handle_verify;
 
   procedure handle_change (c in out nocopy t_ctx, p_node in json_object_t, p_in in json_object_t, p_cmd in varchar2) is
     l_alias  varchar2(100) := str(p_node, 'record');
@@ -1457,6 +1700,7 @@ create or replace package body fc_engine as
     end if;
 
     init_ctx(c);
+    fc_data.set_verified(null);
     l_sid := rawtohex(dbms_crypto.randombytes(16));
     c.session_id := l_sid;
     load_flow(c, p_flow_id, l_version);
@@ -1510,11 +1754,18 @@ create or replace package body fc_engine as
     l_target varchar2(200);
     l_keys   json_key_list;
     l_turn   clob;
+    l_log    clob;
   begin
     load_session(c, p_session_id);
     if p_input is null or dbms_lob.getlength(p_input) = 0 then l_in := json_object_t(); else l_in := json_object_t.parse(p_input); end if;
     l_cur := str(c.state, 'current');
-    log_event(p_session_id, 'IN', l_cur, l_in.to_clob);
+    l_log := l_in.to_clob;
+    if l_cur is not null and c.nodes.has(l_cur) and l_in.has('value') then
+      if str(c.nodes.get_object(l_cur), 'type') = 'verify' then
+        l_log := '{"value":"(one-time code, not logged)"}';
+      end if;
+    end if;
+    log_event(p_session_id, 'IN', l_cur, l_log);
 
     if str(c.state, 'status') <> 'in_progress' then
       return build_turn(c);
@@ -1537,6 +1788,10 @@ create or replace package body fc_engine as
       c.history := json_array_t();
       c.state.put('editing', false);
       c.state.put_null('editingField');
+      c.state.put('verify', json_object_t());
+      c.state.put('verified', json_object_t());
+      c.state.put_null('verifiedLast');
+      fc_data.set_verified(null);
       seed_context(c);
       add_msg(c, 'text', 'Okay, let''s start over.');
       run(c, str(c.flow, 'start'));
@@ -1550,6 +1805,11 @@ create or replace package body fc_engine as
       if c.history.get_size > 0 then
         l_prev := c.history.get_string(c.history.get_size - 1);
         c.history.remove(c.history.get_size - 1);
+        -- a passed Verify step has nothing to ask again: step back past it
+        while c.history.get_size > 0 and str(get_node(c, l_prev), 'type') = 'verify' loop
+          l_prev := c.history.get_string(c.history.get_size - 1);
+          c.history.remove(c.history.get_size - 1);
+        end loop;
       end if;
       c.force_ask := nvl(l_prev, l_cur);
       run(c, nvl(l_prev, l_cur));
@@ -1599,6 +1859,9 @@ create or replace package body fc_engine as
         add_msg(c, 'text', 'Tap "' || nvl(str(l_node, 'confirmLabel'), 'Confirm & submit')
                            || '", or use Edit next to any answer to change it.');
       end if;
+
+    elsif l_type = 'verify' then
+      handle_verify(c, l_node, l_in, l_cmd);
 
     elsif l_type = 'findRecord' then
       handle_pick(c, l_node, l_in);

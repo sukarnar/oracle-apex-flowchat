@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlowChat Verify Demo</title>
+<style>
+  :root {
+    --bg: #eef1f6; --panel: #fff; --text: #18202c; --muted: #64708a; --border: #dde2ea; --accent: #2563eb;
+    --hl: rgba(37, 99, 235, .12); --warn: #b54708; --warn-bg: #fef4e6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #0d1117; --panel: #161b24; --text: #e8ecf3; --muted: #97a1b6; --border: #2e3747; --hl: rgba(96, 140, 255, .18); --warn: #f5b25c; --warn-bg: #3a2c16; }
+  }
+  :root[data-theme="dark"] { --bg: #0d1117; --panel: #161b24; --text: #e8ecf3; --muted: #97a1b6; --border: #2e3747; --hl: rgba(96, 140, 255, .18); --warn: #f5b25c; --warn-bg: #3a2c16; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .top { padding: 20px 24px 8px; max-width: 1240px; margin: 0 auto; }
+  .top h1 { font-size: 20px; margin: 0 0 4px; }
+  .top p { margin: 0; color: var(--muted); font-size: 14px; }
+  .top a { color: var(--accent); }
+  main { max-width: 1240px; margin: 0 auto; padding: 16px 24px 32px; display: grid; grid-template-columns: 1fr 420px; gap: 20px; align-items: start; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px; margin-bottom: 20px; }
+  .panel h2 { font-size: 15px; margin: 0 0 2px; }
+  .hint { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
+  .form { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px 14px; }
+  .form label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); }
+  .form input { font: inherit; font-size: 14px; color: var(--text); background: color-mix(in srgb, var(--border) 30%, var(--panel)); border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 600; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 7px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.changed { background: var(--hl); transition: background 1.5s; }
+  .row-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+  button.sim { font: inherit; font-size: 13px; border: 1px solid var(--warn); color: var(--warn); background: var(--warn-bg); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+  ul.tips { font-size: 13px; color: var(--muted); margin: 0; padding-left: 18px; }
+  code { font-size: 12px; }
+  .outbox { display: flex; flex-direction: column; gap: 8px; }
+  .mail { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 13.5px; }
+  .mail .meta { color: var(--muted); font-size: 12px; }
+  .mail b { font-size: 18px; letter-spacing: 2px; font-variant-numeric: tabular-nums; }
+  .empty { color: var(--muted); font-size: 13px; }
+  flow-chat { position: sticky; top: 16px; --fc-height: min(680px, calc(100vh - 40px)); }
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; padding: 12px 16px 24px; }
+    .top { padding: 16px 16px 4px; }
+    flow-chat { position: static; order: -1; --fc-height: 560px; }
+    .form { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body>
+  <div class="top">
+    <h1>FlowChat: verify before search (public page)</h1>
+    <p>Before searching, the chat sends a one-time code to the email address and only continues once it's entered. The data source only shows rows for the verified email. <a href="update.html">Signed-in update demo →</a></p>
+  </div>
+  <main>
+    <section>
+      <div class="panel">
+        <h2>Outbox (stands in for email)</h2>
+        <p class="hint">The demo <code>send_code</code> connector puts messages here instead of sending email. In the database, the connector would call APEX_MAIL or an SMS gateway.</p>
+        <div class="outbox" id="outbox"><span class="empty">No messages yet.</span></div>
+      </div>
+
+      <div class="panel">
+        <h2>Loaded record (bound page fields)</h2>
+        <p class="hint">Filled from <code>bindings["app.*"]</code> when the record loads or a field changes.</p>
+        <div class="form">
+          <label>Reference <input id="u_reference" readonly></label>
+          <label>Status <input id="u_status" readonly></label>
+          <label>Amount <input id="u_amount" readonly></label>
+          <label>Phone <input id="u_phone" readonly></label>
+          <label>Funds needed by <input id="u_start_date" readonly></label>
+          <label>Contact OK <input id="u_contact_ok" readonly></label>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Database table: loan_apps (in memory)</h2>
+        <p class="hint">Data source <code>loan_apps_public</code> reads this table, filtered to rows whose email matches the verified one.</p>
+        <div class="table-wrap"><table id="tbl"></table></div>
+      </div>
+
+      <div class="panel">
+        <h2>Try</h2>
+        <ul class="tips">
+          <li>Enter <code>jane.doe@example.com</code>, then copy the code from the outbox.</li>
+          <li>Type a wrong code: you get 3 tries, then the chat stops.</li>
+          <li>Use <b>Send a new code</b>: the previous code stops working. At most 2 resends.</li>
+          <li>After verifying, go <b>Back</b> and change the email: the new address must be verified too.</li>
+        </ul>
+      </div>
+    </section>
+
+    <flow-chat id="chat" flow="update_application_public" transport="local" adapter="dom"
+               heading="Update assistant" subheading="Verify, then change an application" manual-start></flow-chat>
+  </main>
+
+  <script src="../widget/flowchat-engine.js"></script>
+  <script src="../widget/flowchat.js"></script>
+  <script src="demo-data-sources.js"></script>
+  <script src="demo-connectors.js"></script>
+  <script>
+    (async function () {
+      const chat = document.getElementById('chat');
+      const src = FlowChatDemoData.createPublic(FlowChatEngine);
+      const box = document.getElementById('outbox');
+      window.addEventListener('fc-demo-outbox', (e) => {
+        if (box.querySelector('.empty')) box.textContent = '';
+        const m = e.detail, el = document.createElement('div');
+        el.className = 'mail';
+        const meta = document.createElement('div'); meta.className = 'meta';
+        meta.textContent = 'To ' + m.to + ' · ' + m.at.toLocaleTimeString();
+        const body = document.createElement('div');
+        const code = (m.text.match(/\d{4,10}/) || [''])[0];
+        body.append(m.text.split(code)[0], Object.assign(document.createElement('b'), { textContent: code }), m.text.split(code)[1]);
+        el.append(meta, body);
+        box.prepend(el);
+      });
+      const cols = ['reference', 'email', 'status', 'amount', 'phone', 'start_date', 'contact_ok', 'version'];
+      let prev = {};
+      function renderTable() {
+        const tbl = document.getElementById('tbl');
+        tbl.innerHTML = '';
+        const head = tbl.insertRow();
+        cols.forEach((c) => { const th = document.createElement('th'); th.textContent = c; head.append(th); });
+        src.rows.forEach((r) => {
+          const tr = tbl.insertRow();
+          cols.forEach((c) => {
+            const td = tr.insertCell();
+            td.textContent = r[c];
+            const k = r.app_id + ':' + c;
+            if (prev[k] !== undefined && prev[k] !== r[c]) { td.classList.add('changed'); setTimeout(() => td.classList.remove('changed'), 50); }
+            prev[k] = r[c];
+          });
+        });
+      }
+      renderTable();
+      try {
+        const flow = await fetch('../flows/update_application_public.json').then((r) => r.json());
+        const engine = FlowChatEngine.createEngine({ flows: [flow], connectors: { send_code: FlowChatDemoConnectors.send_code },
+                                                   dataSources: { loan_apps_public: src } });
+        chat.configure({ transport: new FlowChat.LocalTransport(engine) });
+        chat.addEventListener('fc-turn', renderTable);
+        chat.start();
+      } catch (e) {
+        alert('Could not load the flow: ' + e.message + '. Serve this folder over HTTP (see README).');
+      }
+    })();
+  </script>
+</body>
+</html>

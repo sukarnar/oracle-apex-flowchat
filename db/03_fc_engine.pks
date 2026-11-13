@@ -14,6 +14,7 @@ create or replace package fc_engine authid definer as
   --   {"value": "..."}                       answer the current question / "confirm" a summary
   --   {"command": "back" | "restart"}
   --   {"command": "edit", "slot": "amount"}  change an answer from the summary
+  --   {"command": "resend"}                  Verify step: send a new one-time code
   ------------------------------------------------------------------------------
 
   function start_session (p_flow_id in varchar2, p_context in clob default null) return clob;

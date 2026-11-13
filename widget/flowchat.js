@@ -494,7 +494,7 @@
         var inp = h('input');
         inp.name = a.slot;
         inp.setAttribute('aria-label', a.label || a.slot);
-        inp.autocomplete = { email: 'email', applicant_name: 'name', phone: 'tel' }[a.slot] || 'off';
+        inp.autocomplete = spec.autocomplete || { email: 'email', applicant_name: 'name', phone: 'tel' }[a.slot] || 'off';
         if (spec.kind === 'date') {
           inp.type = 'date';
           if (spec.minDate) inp.min = resolveDate(spec.minDate);
@@ -504,6 +504,7 @@
         } else {
           inp.type = 'text';
           if (spec.kind === 'number') inp.inputMode = 'decimal';
+          if (spec.inputMode) inp.inputMode = spec.inputMode;
           if (spec.maxLength) inp.maxLength = spec.maxLength;
         }
         inp.placeholder = spec.placeholder || 'Type your answer...';
@@ -515,7 +516,8 @@
           e.preventDefault();
           var v = inp.value.trim();
           if (!v && spec.required !== false) { inp.focus(); return; }
-          this.send({ value: v }, v || '(skipped)');
+          // Secret answers (one-time codes) are not echoed into the transcript.
+          this.send({ value: v }, a.secret ? '•'.repeat(v.length) : (v || '(skipped)'));
         });
         c.append(form); focusEl = inp;
       }
@@ -537,6 +539,15 @@
         tools.append(none);
       } else if (a.type === 'fieldMenu') {
         tools.append(h('span', 'hint', 'Pick a field to change'));
+      } else if (a.actions && a.actions.length) {
+        // Extra commands offered by the step, e.g. Verify's "Send a new code".
+        var acts = h('span');
+        a.actions.forEach((x) => {
+          var b = h('button', 'link', x.label || x.command); b.type = 'button';
+          b.addEventListener('click', () => this.send({ command: x.command }, x.label || x.command));
+          acts.append(b);
+        });
+        tools.append(acts);
       } else if (spec.required === false && a.type === 'ask') {
         var skip = h('button', 'link', 'Skip'); skip.type = 'button';
         skip.addEventListener('click', () => this.send({ value: '' }, '(skipped)'));

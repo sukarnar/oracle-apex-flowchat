@@ -17,11 +17,11 @@ column name format a20
 column text format a90
 select name, type, line, position, text
   from user_errors
- where name in ('FC_DATA', 'FC_ENGINE', 'FC_DESIGNER', 'FC_DEMO_CONNECTORS')
+ where name in ('FC_DATA', 'FC_ENGINE', 'FC_DESIGNER', 'FC_DEMO_CONNECTORS', 'FC_DEMO_VERIFY')
  order by name, type, sequence;
 
 prompt == Object status
 select object_name, object_type, status
   from user_objects
- where object_name in ('FC_DATA', 'FC_ENGINE', 'FC_DESIGNER', 'FC_DEMO_CONNECTORS')
+ where object_name in ('FC_DATA', 'FC_ENGINE', 'FC_DESIGNER', 'FC_DEMO_CONNECTORS', 'FC_DEMO_VERIFY')
  order by object_name, object_type;
