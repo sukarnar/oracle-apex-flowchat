@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://flowchat.local/flow.schema.json",
+  "title": "FlowChat flow definition",
+  "type": "object",
+  "required": ["flowId", "start", "nodes"],
+  "properties": {
+    "flowId":   { "type": "string", "pattern": "^[a-z0-9_]{1,100}$" },
+    "version":  { "type": "integer", "minimum": 1 },
+    "name":     { "type": "string" },
+    "start":    { "type": "string", "description": "Id of the first node" },
+    "bindings": {
+      "type": "object",
+      "description": "slot -> where the value is mirrored on the host page, one key per adapter",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "apex": { "type": "string", "description": "APEX page item name, e.g. P10_EMAIL" },
+          "dom":  { "type": "string", "description": "CSS selector of an input/select/checkbox" }
+        },
+        "additionalProperties": { "type": "string" }
+      }
+    },
+    "nodes": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/node" } }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9_]{1,200}$" },
+
+    "node": {
+      "type": "object",
+      "required": ["id", "type"],
+      "properties": { "id": { "$ref": "#/$defs/id" } },
+      "oneOf": [
+        { "$ref": "#/$defs/message" }, { "$ref": "#/$defs/ask" }, { "$ref": "#/$defs/condition" },
+        { "$ref": "#/$defs/lookup" },  { "$ref": "#/$defs/summary" }, { "$ref": "#/$defs/submit" },
+        { "$ref": "#/$defs/end" }
+      ]
+    },
+
+    "message": {
+      "properties": { "type": { "const": "message" }, "text": { "type": "string" }, "next": { "$ref": "#/$defs/id" } },
+      "required": ["text", "next"]
+    },
+
+    "ask": {
+      "properties": {
+        "type":   { "const": "ask" },
+        "slot":   { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,99}$" },
+        "label":  { "type": "string" },
+        "prompt": { "type": "string", "description": "Supports {{slot}} placeholders" },
+        "skipIfFilled": { "type": "boolean", "default": false },
+        "input":  { "$ref": "#/$defs/input" },
+        "validators": { "type": "array", "items": { "$ref": "#/$defs/validator" } },
+        "next":   { "$ref": "#/$defs/id" }
+      },
+      "required": ["slot", "prompt", "next"]
+    },
+
+    "input": {
+      "type": "object",
+      "properties": {
+        "kind": { "enum": ["text", "email", "number", "date", "choice", "yesno"], "default": "text" },
+        "required": { "type": "boolean", "default": true },
+        "placeholder": { "type": "string" },
+        "minLength": { "type": "integer" }, "maxLength": { "type": "integer" },
+        "min": { "type": "number" }, "max": { "type": "number" },
+        "prefix": { "type": "string", "description": "Display prefix for numbers, e.g. $" },
+        "minDate": { "type": "string", "description": "YYYY-MM-DD, 'today' or 'tomorrow'" },
+        "maxDate": { "type": "string" },
+        "options": {
+          "type": "array",
+          "items": { "type": "object", "required": ["value"],
+                     "properties": { "value": { "type": "string" }, "label": { "type": "string" } } }
+        },
+        "requiredMessage": { "type": "string" }, "parseMessage": { "type": "string" },
+        "minMessage": { "type": "string" }, "maxMessage": { "type": "string" }
+      }
+    },
+
+    "validator": {
+      "type": "object",
+      "required": ["type"],
+      "oneOf": [
+        { "properties": { "type": { "const": "regex" }, "pattern": { "type": "string" }, "message": { "type": "string" } },
+          "required": ["pattern"] },
+        { "properties": { "type": { "const": "server" }, "connector": { "type": "string" }, "message": { "type": "string" } },
+          "required": ["connector"] }
+      ]
+    },
+
+    "condExpr": {
+      "type": "object",
+      "description": "Either a comparison {slot, op, value} or a combination {all:[..]} / {any:[..]} / {not:{..}}",
+      "properties": {
+        "slot": { "type": "string" },
+        "op": { "enum": ["=", "!=", ">", ">=", "<", "<=", "in", "empty", "notEmpty"] },
+        "value": {},
+        "all": { "type": "array", "items": { "$ref": "#/$defs/condExpr" } },
+        "any": { "type": "array", "items": { "$ref": "#/$defs/condExpr" } },
+        "not": { "$ref": "#/$defs/condExpr" }
+      }
+    },
+
+    "condition": {
+      "properties": {
+        "type": { "const": "condition" },
+        "branches": { "type": "array", "items": { "type": "object", "required": ["when", "next"],
+          "properties": { "when": { "$ref": "#/$defs/condExpr" }, "next": { "$ref": "#/$defs/id" } } } },
+        "else": { "$ref": "#/$defs/id" }
+      },
+      "required": ["branches", "else"]
+    },
+
+    "lookup": {
+      "properties": { "type": { "const": "lookup" }, "connector": { "type": "string" },
+                      "next": { "$ref": "#/$defs/id" }, "onNotFound": { "$ref": "#/$defs/id" } },
+      "required": ["connector", "next"]
+    },
+
+    "summary": {
+      "properties": { "type": { "const": "summary" }, "text": { "type": "string" },
+                      "fields": { "type": "array", "items": { "type": "string" } },
+                      "confirmLabel": { "type": "string" }, "next": { "$ref": "#/$defs/id" } },
+      "required": ["next"]
+    },
+
+    "submit": {
+      "properties": { "type": { "const": "submit" }, "connector": { "type": "string" },
+                      "onSuccess": { "$ref": "#/$defs/id" }, "onError": { "$ref": "#/$defs/id" } },
+      "required": ["connector", "onSuccess"]
+    },
+
+    "end": {
+      "properties": { "type": { "const": "end" }, "text": { "type": "string" } }
+    }
+  }
+}

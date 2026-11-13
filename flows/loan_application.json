@@ -1,0 +1,97 @@
+{
+  "flowId": "loan_application",
+  "version": 1,
+  "name": "Personal loan application",
+  "start": "welcome",
+  "bindings": {
+    "email":          { "apex": "P10_EMAIL",          "dom": "#email" },
+    "applicant_name": { "apex": "P10_APPLICANT_NAME", "dom": "#applicant_name" },
+    "customer_id":    { "apex": "P10_CUSTOMER_ID",    "dom": "#customer_id" },
+    "amount":         { "apex": "P10_AMOUNT",         "dom": "#amount" },
+    "purpose":        { "apex": "P10_PURPOSE",        "dom": "#purpose" },
+    "annual_income":  { "apex": "P10_ANNUAL_INCOME",  "dom": "#annual_income" },
+    "start_date":     { "apex": "P10_START_DATE",     "dom": "#start_date" },
+    "contact_ok":     { "apex": "P10_CONTACT_OK",     "dom": "#contact_ok" },
+    "phone":          { "apex": "P10_PHONE",          "dom": "#phone" },
+    "reference":      { "apex": "P10_REFERENCE",      "dom": "#reference" }
+  },
+  "nodes": [
+    { "id": "welcome", "type": "message",
+      "text": "Hi! I'll help you apply for a personal loan. It only takes a minute.",
+      "next": "ask_email" },
+
+    { "id": "ask_email", "type": "ask", "slot": "email", "label": "Email",
+      "prompt": "First, what's your email address?",
+      "input": { "kind": "email", "placeholder": "name@company.com" },
+      "validators": [ { "type": "server", "connector": "check_email" } ],
+      "next": "find_customer" },
+
+    { "id": "find_customer", "type": "lookup", "connector": "lookup_customer", "next": "known_customer" },
+
+    { "id": "known_customer", "type": "condition",
+      "branches": [ { "when": { "slot": "applicant_name", "op": "notEmpty" }, "next": "ask_amount" } ],
+      "else": "ask_name" },
+
+    { "id": "ask_name", "type": "ask", "slot": "applicant_name", "label": "Full name",
+      "prompt": "Thanks. What's your full name?",
+      "input": { "kind": "text", "minLength": 2, "maxLength": 100, "placeholder": "First and last name" },
+      "next": "ask_amount" },
+
+    { "id": "ask_amount", "type": "ask", "slot": "amount", "label": "Loan amount",
+      "prompt": "How much would you like to borrow, {{applicant_name}}?",
+      "input": { "kind": "number", "min": 1000, "max": 500000, "prefix": "$", "placeholder": "e.g. 25000 or 25k" },
+      "next": "ask_purpose" },
+
+    { "id": "ask_purpose", "type": "ask", "slot": "purpose", "label": "Purpose",
+      "prompt": "What's the loan for?",
+      "input": { "kind": "choice", "options": [
+        { "value": "HOME", "label": "Home improvement" },
+        { "value": "CAR", "label": "Car" },
+        { "value": "EDU", "label": "Education" },
+        { "value": "DEBT", "label": "Debt consolidation" },
+        { "value": "OTHER", "label": "Something else" } ] },
+      "next": "is_large_loan" },
+
+    { "id": "is_large_loan", "type": "condition",
+      "branches": [ { "when": { "slot": "amount", "op": ">", "value": 100000 }, "next": "ask_income" } ],
+      "else": "ask_start" },
+
+    { "id": "ask_income", "type": "ask", "slot": "annual_income", "label": "Annual income",
+      "prompt": "Loans over $100,000 need an affordability check. What's your annual income before tax?",
+      "input": { "kind": "number", "min": 0, "prefix": "$", "placeholder": "e.g. 85000" },
+      "validators": [ { "type": "server", "connector": "check_affordability" } ],
+      "next": "ask_start" },
+
+    { "id": "ask_start", "type": "ask", "slot": "start_date", "label": "Funds needed by",
+      "prompt": "When do you need the funds?",
+      "input": { "kind": "date", "minDate": "today", "minMessage": "That date is in the past. Please pick today or a later date." },
+      "next": "ask_contact" },
+
+    { "id": "ask_contact", "type": "ask", "slot": "contact_ok", "label": "Phone contact OK",
+      "prompt": "Can an advisor call you about this application?",
+      "input": { "kind": "yesno" },
+      "next": "wants_call" },
+
+    { "id": "wants_call", "type": "condition",
+      "branches": [ { "when": { "slot": "contact_ok", "op": "=", "value": "Y" }, "next": "ask_phone" } ],
+      "else": "review" },
+
+    { "id": "ask_phone", "type": "ask", "slot": "phone", "label": "Phone",
+      "prompt": "What's the best number to reach you?",
+      "input": { "kind": "text", "placeholder": "+1 555 123 4567" },
+      "validators": [ { "type": "regex", "pattern": "^\\+?[0-9 ()-]{7,20}$",
+                        "message": "That doesn't look like a phone number. Use digits, spaces, ( ) or -." } ],
+      "next": "review" },
+
+    { "id": "review", "type": "summary",
+      "text": "Here's what I have. Please check it before I submit:",
+      "confirmLabel": "Confirm & submit",
+      "next": "submit_app" },
+
+    { "id": "submit_app", "type": "submit", "connector": "create_application",
+      "onSuccess": "done", "onError": "review" },
+
+    { "id": "done", "type": "end",
+      "text": "All done! Your reference is {{reference}}. We'll email {{email}} within 2 business days." }
+  ]
+}
