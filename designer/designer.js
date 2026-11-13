@@ -18,7 +18,14 @@
   // The designer mounts into <div id="fcd-root" class="fcd"></div> (standalone page or APEX region).
   const ROOT = document.getElementById('fcd-root');
   if (!ROOT) { console.error('[FlowChat Designer] No element with id "fcd-root" found.'); return; }
-  const SAMPLE_URL = ROOT.dataset.sampleUrl || '../flows/loan_application.json';
+  // Where the sample flows live: data-flows-base (e.g. "#APP_FILES#" in APEX), else the folder of
+  // data-sample-url, else ../flows/.
+  const FLOWS_BASE = ROOT.dataset.flowsBase ||
+    (ROOT.dataset.sampleUrl ? ROOT.dataset.sampleUrl.replace(/[^/]*$/, '') : '../flows/');
+  const SAMPLES = [
+    { file: 'loan_application.json', label: 'Loan application', desc: 'Create: ask, branch, summary, submit' },
+    { file: 'update_application.json', label: 'Update application', desc: 'Search & update: find, change, save' }
+  ];
   const STANDALONE = document.body.classList.contains('fcd-page');
 
   // Every <button> is type="button": inside APEX the page is one big <form>, and a default
@@ -29,7 +36,7 @@
     <span class="flow-title" id="fcd-flowTitle"></span>
     <button type="button" class="tb" id="fcd-btnNew" title="Start an empty flow">New</button>
     <button type="button" class="tb" id="fcd-btnOpen" title="Open a flow .json file">Open…</button>
-    <button type="button" class="tb" id="fcd-btnSample" title="Load the loan application sample">Sample</button>
+    <button type="button" class="tb" id="fcd-btnSample" title="Load a sample flow">Samples ▾</button>
     <span class="sep"></span>
     <button type="button" class="tb" id="fcd-btnUndo" title="Undo (Ctrl+Z)">Undo</button>
     <button type="button" class="tb" id="fcd-btnRedo" title="Redo (Ctrl+Y)">Redo</button>
@@ -68,19 +75,21 @@
         <button type="button" data-tab="props" class="active" role="tab">Properties</button>
         <button type="button" data-tab="check" role="tab">Checklist <span class="badge" id="fcd-probBadge">0</span></button>
         <button type="button" data-tab="test" role="tab">Test</button>
+        <button type="button" data-tab="data" role="tab" title="Data source catalog">Data</button>
         <button type="button" data-tab="json" role="tab">JSON</button>
       </nav>
       <div class="tab-body" id="fcd-tab-props"></div>
       <div class="tab-body" id="fcd-tab-check" hidden></div>
+      <div class="tab-body" id="fcd-tab-data" hidden></div>
       <div class="tab-body" id="fcd-tab-test" hidden>
         <div class="test-bar">
           <button type="button" class="btn primary" id="fcd-btnRunTest">Restart test</button>
           <span class="test-note" id="fcd-testNote">Runs the current draft in your browser. Connectors return the mock responses below.</span>
         </div>
         <flow-chat class="sim" id="fcd-simChat" manual-start adapter="none" heading="Test run" subheading="Simulating the current draft"></flow-chat>
-        <h4 class="sub">Captured answers</h4>
+        <h4 class="sub">Captured answers & records</h4>
         <pre class="state" id="fcd-simState">{}</pre>
-        <h4 class="sub">Connector mocks</h4>
+        <h4 class="sub">Mocks</h4>
         <div id="fcd-mocks"></div>
       </div>
       <div class="tab-body" id="fcd-tab-json" hidden>
@@ -111,17 +120,62 @@
     submit:    { label: 'Submit',    color: '#16a34a', desc: 'Re-validate everything and save via a connector.',
                  make: (id) => ({ id, type: 'submit', connector: '' }) },
     end:       { label: 'End',       color: '#475569', desc: 'Finish the conversation.',
-                 make: (id) => ({ id, type: 'end', text: 'All done!' }) }
+                 make: (id) => ({ id, type: 'end', text: 'All done!' }) },
+    findRecord: { label: 'Find record', color: '#0d9488', group: 'data', desc: 'Search a data source; pick among matches; load one.',
+                 make: (id) => ({ id, type: 'findRecord', source: '', as: 'rec', criteria: [], maxResults: 10,
+                                  card: { title: '' }, prompts: { many: 'I found {{count}} matching records. Which one?' } }) },
+    changeFields: { label: 'Change fields', color: '#db2777', group: 'data', desc: 'Let the user change fields of the loaded record.',
+                 make: (id) => ({ id, type: 'changeFields', record: '', prompt: 'What would you like to change?', fields: [] }) },
+    saveChanges: { label: 'Save changes', color: '#059669', group: 'data', desc: 'Save only changed fields, with conflict detection.',
+                 make: (id) => ({ id, type: 'saveChanges', record: '' }) }
   };
 
   const PORT_TITLES = {
     next: 'Then go to', onNotFound: 'If nothing is found, go to', onSuccess: 'On success, go to',
-    onError: 'On error, go to', 'else': 'Otherwise go to'
+    onError: 'On error, go to', 'else': 'Otherwise go to',
+    found: 'When a record is loaded, go to', notFound: 'If nothing matches, go to',
+    tooMany: 'If too many match, go to', cancelled: 'If the user picks "None of these", go to',
+    done: 'When the user clicks Done, go to', noChanges: 'If nothing was changed, go to',
+    saved: 'After saving, go to', conflict: 'On a conflict (record changed meanwhile), go to',
+    forbidden: 'If not allowed, go to', error: 'On any other error, go to'
   };
+  const PORT_HINTS = {
+    tooMany: 'Optional. Defaults to the not-found path.', cancelled: 'Optional. Defaults to the not-found path.',
+    noChanges: 'Optional. Defaults to the Done path.',
+    conflict: 'Usually back to the review summary: the latest values are reloaded with the user\'s edits on top.',
+    forbidden: 'Optional. Without it the conversation ends as failed.', error: 'Optional. Without it the conversation ends as failed.'
+  };
+
+  // Default data source catalog: mirrors db/06_demo_data_source.sql so the update sample works in Test.
+  const DEFAULT_CATALOG = {
+    loan_apps: {
+      objectName: 'fc_demo_loan_apps', keyColumn: 'app_id', versionColumn: 'version', rowFilter: '',
+      fields: [
+        { field: 'reference', column: 'REFERENCE', type: 'VARCHAR2', searchable: true, ops: 'eq', updatable: false },
+        { field: 'email', column: 'EMAIL', type: 'VARCHAR2', searchable: true, ops: 'eq', updatable: false },
+        { field: 'purpose', column: 'PURPOSE', type: 'VARCHAR2', searchable: false, ops: 'eq', updatable: false },
+        { field: 'status', column: 'STATUS', type: 'VARCHAR2', searchable: false, ops: 'eq', updatable: false },
+        { field: 'amount', column: 'AMOUNT', type: 'NUMBER', searchable: false, ops: 'eq', updatable: true },
+        { field: 'phone', column: 'PHONE', type: 'VARCHAR2', searchable: false, ops: 'eq', updatable: true, mask: 'last4' },
+        { field: 'start_date', column: 'START_DATE', type: 'DATE', searchable: false, ops: 'eq', updatable: true },
+        { field: 'contact_ok', column: 'CONTACT_OK', type: 'VARCHAR2', searchable: false, ops: 'eq', updatable: true }
+      ],
+      sampleRows: [
+        { _key: 1041, _version: 1, reference: 'LN-01041', email: 'jane.doe@example.com', purpose: 'Car', status: 'NEW',
+          amount: 200000, phone: '+1 555 123 4567', start_date: '2026-12-31', contact_ok: 'Y' },
+        { _key: 988, _version: 3, reference: 'LN-00988', email: 'jane.doe@example.com', purpose: 'Home improvement', status: 'APPROVED',
+          amount: 15000, phone: '+1 555 123 4567', start_date: '2026-11-30', contact_ok: 'N' },
+        { _key: 1050, _version: 1, reference: 'LN-01050', email: 'raj.kumar@example.com', purpose: 'Education', status: 'NEW',
+          amount: 50000, phone: '+44 20 7946 0000', start_date: '2027-01-15', contact_ok: 'Y' }
+      ]
+    }
+  };
+  const SEARCH_OPS = [['eq', 'equals'], ['starts', 'starts with'], ['contains', 'contains'], ['gte', '≥'], ['lte', '≤']];
+  const FIELD_TYPES = ['VARCHAR2', 'NUMBER', 'DATE'];
 
   // ======================================================================== state
   const S = {
-    flow: null, sel: null, view: { x: 60, y: 50, z: 1 }, mocks: {},
+    flow: null, sel: null, view: { x: 60, y: 50, z: 1 }, mocks: {}, catalog: null, dataSel: null,
     undo: [], redo: [], lastKey: null, lastTime: 0, tab: 'props', drag: null, testStale: false
   };
 
@@ -177,6 +231,11 @@
       case 'summary': return [{ key: 'next', label: 'confirm' }];
       case 'lookup': return [{ key: 'next', label: 'next' }, { key: 'onNotFound', label: 'not found', optional: true }];
       case 'submit': return [{ key: 'onSuccess', label: 'success' }, { key: 'onError', label: 'error', optional: true }];
+      case 'findRecord': return [{ key: 'found', label: 'found' }, { key: 'notFound', label: 'not found' },
+        { key: 'tooMany', label: 'too many', optional: true }, { key: 'cancelled', label: 'none of these', optional: true }];
+      case 'changeFields': return [{ key: 'done', label: 'done' }, { key: 'noChanges', label: 'no changes', optional: true }];
+      case 'saveChanges': return [{ key: 'saved', label: 'saved' }, { key: 'conflict', label: 'conflict', optional: true },
+        { key: 'forbidden', label: 'forbidden', optional: true }, { key: 'error', label: 'error', optional: true }];
       case 'condition':
         return (n.branches || []).map((b, i) => ({ key: 'branch:' + i, label: condText(b.when) || 'branch ' + (i + 1) }))
           .concat([{ key: 'else', label: 'else' }]);
@@ -220,8 +279,49 @@
   function knownSlots() {
     const s = askSlots();
     Object.keys(S.flow.bindings || {}).forEach((k) => { if (s.indexOf(k) < 0) s.push(k); });
+    recordFields().forEach((k) => { if (s.indexOf(k) < 0) s.push(k); });
     return s;
   }
+
+  // ---- data source helpers
+  function catalog() { return S.catalog || (S.catalog = clone(DEFAULT_CATALOG)); }
+  function sourceDef(id) { return id ? catalog()[id] || null : null; }
+  function sourceField(srcId, field) {
+    const src = sourceDef(srcId);
+    return src ? (src.fields || []).find((f) => f.field === field) || null : null;
+  }
+  function findNodes() { return S.flow.nodes.filter((n) => n.type === 'findRecord'); }
+  function aliases() {
+    const out = [];
+    findNodes().forEach((n) => { if (n.as && out.indexOf(n.as) < 0) out.push(n.as); });
+    return out;
+  }
+  function sourceForAlias(alias) {
+    const f = findNodes().find((n) => n.as === alias);
+    return f ? f.source : null;
+  }
+  // "alias.field" names a flow can use once a record is loaded.
+  function recordFields() {
+    const out = [];
+    findNodes().forEach((n) => {
+      if (!n.as) return;
+      const src = sourceDef(n.source);
+      (src ? src.fields : []).forEach((f) => out.push(n.as + '.' + f.field));
+    });
+    S.flow.nodes.forEach((n) => {
+      if (n.type === 'changeFields' && n.record) (n.fields || []).forEach((f) => {
+        const k = n.record + '.' + f.field;
+        if (f.field && out.indexOf(k) < 0) out.push(k);
+      });
+    });
+    return out;
+  }
+  function sourceUses() {
+    const out = {};
+    findNodes().forEach((n) => { if (n.source) out[n.source] = true; });
+    return Object.keys(out);
+  }
+  function inputKindFor(type) { return type === 'NUMBER' ? 'number' : type === 'DATE' ? 'date' : 'text'; }
   function uniqueSlot(base) {
     const used = knownSlots();
     let i = 1;
@@ -263,7 +363,8 @@
       if (n.type === 'ask' && n.slot === oldSlot) n.slot = newSlot;
       ['text', 'prompt'].forEach((k) => { if (typeof n[k] === 'string') n[k] = n[k].replace(re, '{{' + newSlot + '}}'); });
       (n.branches || []).forEach((b) => fixCond(b.when));
-      if (n.fields) n.fields = n.fields.map((s) => (s === oldSlot ? newSlot : s));
+      if (n.type === 'summary' && n.fields) n.fields = n.fields.map((s) => (s === oldSlot ? newSlot : s));
+      (n.criteria || []).forEach((c) => { if (c.slot === oldSlot) c.slot = newSlot; });
     });
     if (f.bindings && f.bindings[oldSlot] && !f.bindings[newSlot]) {
       f.bindings[newSlot] = f.bindings[oldSlot];
@@ -361,7 +462,7 @@
   function save() {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
-      try { localStorage.setItem(STORE_KEY, JSON.stringify({ flow: S.flow, mocks: S.mocks })); } catch (e) { /* storage unavailable */ }
+      try { localStorage.setItem(STORE_KEY, JSON.stringify({ flow: S.flow, mocks: S.mocks, catalog: S.catalog })); } catch (e) { /* storage unavailable */ }
     }, 300);
   }
   function loadSaved() {
@@ -426,10 +527,23 @@
     if (!byId(f.start)) add('error', 'The flow has no valid start node.');
 
     const slots = knownSlots();
+    const als = aliases();
     const placeholders = (text, nodeId) => {
-      String(text || '').replace(/\{\{\s*(\w+)\s*\}\}/g, (_, k) => {
-        if (slots.indexOf(k) < 0) add('warning', '{{' + k + '}} is not a known field.', nodeId);
+      String(text || '').replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_, k) => {
+        const dot = k.indexOf('.');
+        // alias.field of a source missing from the catalog can't be checked; only flag unknown aliases then
+        const unchecked = dot > 0 && als.indexOf(k.slice(0, dot)) >= 0 && !sourceDef(sourceForAlias(k.slice(0, dot)));
+        if (slots.indexOf(k) < 0 && !unchecked) add('warning', '{{' + k + '}} is not a known field.', nodeId);
         return _;
+      });
+    };
+    const checkValidators = (vals, nodeId) => {
+      (vals || []).forEach((v) => {
+        if (v.type === 'regex') {
+          try { new RegExp(v.pattern); } catch (e) { add('error', 'Invalid pattern: ' + v.pattern, nodeId); }
+          if (/\(\?[=!<]/.test(v.pattern || '')) add('warning', 'Pattern uses a lookahead/lookbehind, which Oracle regex does not support.', nodeId);
+        }
+        if (v.type === 'server' && !v.connector) add('error', 'Server check has no connector.', nodeId);
       });
     };
     const checkCond = (c, nodeId) => {
@@ -455,13 +569,7 @@
           placeholders(n.prompt, n.id);
           if (spec.kind === 'choice' && !(spec.options || []).length) add('error', 'Choice question has no options.', n.id);
           if (spec.kind === 'number' && isFilled(spec.min) && isFilled(spec.max) && spec.min > spec.max) add('error', 'Minimum is greater than maximum.', n.id);
-          (n.validators || []).forEach((v) => {
-            if (v.type === 'regex') {
-              try { new RegExp(v.pattern); } catch (e) { add('error', 'Invalid pattern: ' + v.pattern, n.id); }
-              if (/\(\?[=!<]/.test(v.pattern || '')) add('warning', 'Pattern uses a lookahead/lookbehind, which Oracle regex does not support.', n.id);
-            }
-            if (v.type === 'server' && !v.connector) add('error', 'Server check has no connector.', n.id);
-          });
+          checkValidators(n.validators, n.id);
           break;
         }
         case 'lookup': case 'submit':
@@ -471,8 +579,76 @@
           if (!(n.branches || []).length) add('warning', 'Condition has no branches.', n.id);
           (n.branches || []).forEach((b) => checkCond(b.when, n.id));
           break;
-        case 'message': case 'end': case 'summary':
+        case 'message': case 'end':
           placeholders(n.text, n.id);
+          break;
+        case 'summary':
+          placeholders(n.text, n.id);
+          if (n.mode === 'changes') {
+            if (!n.record) add('error', 'This changes summary has no record selected.', n.id);
+            else if (als.indexOf(n.record) < 0) add('error', 'No Find record loads a record called "' + n.record + '".', n.id);
+          }
+          break;
+        case 'findRecord': {
+          const src = sourceDef(n.source);
+          const crit = n.criteria || [];
+          if (!n.source) add('error', 'Find record has no data source.', n.id);
+          else if (!src) add('warning', 'Data source "' + n.source + '" is not in the designer catalog, so its fields can\'t be checked. Add it in the Data tab.', n.id);
+          if (!/^[a-z][a-z0-9_]{0,49}$/.test(n.as || '')) add('error', 'Record alias must use lowercase letters, digits and _.', n.id);
+          else if (findNodes().filter((x) => x.as === n.as).length > 1) add('error', 'Another Find record already uses the alias "' + n.as + '".', n.id);
+          if (!crit.length) add('error', 'Find record has no search criteria.', n.id);
+          crit.forEach((c) => {
+            if (!c.field || !c.slot) { add('error', 'A search criterion is incomplete.', n.id); return; }
+            const sf = sourceField(n.source, c.field);
+            if (src && (!sf || !sf.searchable)) add('error', 'Field "' + c.field + '" is not searchable in ' + n.source + '.', n.id);
+            else if (sf && String(sf.ops || 'eq').split(',').map((s) => s.trim()).indexOf(c.op || 'eq') < 0) {
+              add('error', '"' + c.field + '" does not allow the "' + (c.op || 'eq') + '" search.', n.id);
+            }
+            if (askSlots().indexOf(c.slot) < 0) add('warning', 'Criterion uses "' + c.slot + '", which is never asked.', n.id);
+          });
+          if (crit.length && crit.every((c) => c.optional)) add('warning', 'Every criterion is optional; with no answers the search goes straight to "not found".', n.id);
+          Object.keys(n.prompts || {}).forEach((k) => placeholders(String(n.prompts[k]).replace(/\{\{\s*count\s*\}\}/g, ''), n.id));
+          if (src) {
+            const names = src.fields.map((f) => f.field);
+            [(n.card || {}).title, (n.card || {}).subtitle].forEach((t) => String(t || '').replace(/\{\{\s*([\w.]+)\s*\}\}/g, (m, k) => {
+              if (names.indexOf(k) < 0) add('warning', 'Result card uses {{' + k + '}}, which is not a field of ' + n.source + '.', n.id);
+              return m;
+            }));
+          }
+          break;
+        }
+        case 'changeFields': {
+          const srcId = sourceForAlias(n.record);
+          const seen = {};
+          if (!n.record) add('error', 'Change fields has no record selected.', n.id);
+          else if (als.indexOf(n.record) < 0) add('error', 'No Find record loads a record called "' + n.record + '".', n.id);
+          if (!(n.fields || []).length) add('error', 'Change fields has no fields.', n.id);
+          (n.fields || []).forEach((fd) => {
+            if (!fd.field) { add('error', 'A field has no source field selected.', n.id); return; }
+            if (seen[fd.field]) add('error', 'Field "' + fd.field + '" is listed twice.', n.id);
+            seen[fd.field] = true;
+            const sf = sourceField(srcId, fd.field);
+            if (sourceDef(srcId) && !sf) add('error', '"' + fd.field + '" is not a field of ' + srcId + '.', n.id);
+            else if (sf && !sf.updatable) add('error', '"' + fd.field + '" is not updatable in ' + srcId + '; the server would refuse the change.', n.id);
+            const spec = fd.input || {};
+            if (spec.kind === 'choice' && !(spec.options || []).length) add('error', 'Choice field "' + fd.field + '" has no options.', n.id);
+            checkValidators(fd.validators, n.id);
+            if (fd.editableWhen) checkCond(fd.editableWhen, n.id);
+            placeholders(fd.prompt, n.id);
+          });
+          [n.prompt, n.cardTitle, n.againPrompt].forEach((t) => placeholders(t, n.id));
+          if (n.record && !f.nodes.some((x) => x.type === 'saveChanges' && x.record === n.record)) {
+            add('warning', 'No Save changes node saves "' + n.record + '", so edits are never stored.', n.id);
+          }
+          break;
+        }
+        case 'saveChanges':
+          if (!n.record) add('error', 'Save changes has no record selected.', n.id);
+          else if (als.indexOf(n.record) < 0) add('error', 'No Find record loads a record called "' + n.record + '".', n.id);
+          else if (!f.nodes.some((x) => x.type === 'changeFields' && x.record === n.record)) {
+            add('warning', 'No Change fields node edits "' + n.record + '", so there is never anything to save.', n.id);
+          }
+          if (!n.conflict && !n.error) add('warning', 'Neither "conflict" nor "error" is connected: if someone else changes the record meanwhile, the conversation ends as failed.', n.id);
           break;
       }
     });
@@ -540,6 +716,10 @@
       case 'ask': return n.prompt;
       case 'condition': return (n.branches || []).length ? null : 'No branches yet';
       case 'lookup': case 'submit': return n.connector ? 'Calls ' + n.connector : '';
+      case 'findRecord': return n.source ? 'Search ' + n.source + (n.as ? ' → ' + n.as : '') : '';
+      case 'changeFields': return n.record ? 'Edit ' + (n.fields || []).length + ' field(s) of ' + n.record : '';
+      case 'saveChanges': return n.record ? 'Save changes to ' + n.record : '';
+      case 'summary': return n.mode === 'changes' ? 'Review changes to ' + (n.record || '?') : n.text;
       default: return n.text;
     }
   }
@@ -566,6 +746,8 @@
         if ((n.validators || []).length) chips.push(h('span', { class: 'chip', text: n.validators.length + ' check' + (n.validators.length > 1 ? 's' : '') }));
       }
       if (n.type === 'condition') (n.branches || []).forEach((b, i) => chips.push(h('span', { class: 'chip', text: (i + 1) + ': ' + (condText(b.when) || '?') })));
+      if (n.type === 'findRecord') (n.criteria || []).forEach((c) => chips.push(h('span', { class: 'chip', text: c.field + ' ' + (c.op || 'eq') + ' ' + c.slot + (c.optional ? '?' : '') })));
+      if (n.type === 'changeFields') (n.fields || []).forEach((f) => chips.push(h('span', { class: 'chip slot', text: f.field || '?' })));
       if (chips.length) el.append(h('div', { class: 'nchips' }, chips));
       const ps = ports(n);
       ps.forEach((p, i) => {
@@ -894,13 +1076,14 @@
       h('p', { class: 'pdesc', text: t.desc }),
       idField(n)
     );
-    const editors = { message: textEditor, end: textEditor, ask: askEditor, condition: condEditor, lookup: connEditor, submit: connEditor, summary: summaryEditor };
+    const editors = { message: textEditor, end: textEditor, ask: askEditor, condition: condEditor, lookup: connEditor, submit: connEditor,
+                      summary: summaryEditor, findRecord: findEditor, changeFields: changeEditor, saveChanges: saveEditor };
     body.append(editors[n.type](n));
     if (n.type !== 'condition' && n.type !== 'end') {
       body.append(h('h4', { class: 'sub', text: 'Connections' }));
       ports(n).forEach((p) => body.append(F(n.type === 'summary' ? 'After confirm, go to' : PORT_TITLES[p.key], targetSelect(n, p.key),
         p.key === 'onNotFound' ? 'Optional. Used when the connector returns found: false.' :
-        p.key === 'onError' ? 'Optional. Without it a failed submit ends the conversation.' : null)));
+        p.key === 'onError' ? 'Optional. Without it a failed submit ends the conversation.' : PORT_HINTS[p.key] || null)));
     }
     const probs = analyze().list.filter((x) => x.nodeId === n.id);
     if (probs.length) {
@@ -963,34 +1146,7 @@
     const prompt = bound(() => n.prompt, (v) => setOrDelete(n, 'prompt', v), { multiline: true, key: n.id + '.prompt' });
     wrap.append(F('Question', prompt), slotChips(prompt));
 
-    wrap.append(h('h4', { class: 'sub', text: 'Answer' }));
-    wrap.append(h('div', { class: 'grid2' },
-      F('Type', sel(KINDS, kind, (v) => mutate(() => {
-        n.input = { kind: v, required: spec.required, placeholder: spec.placeholder };
-        Object.keys(n.input).forEach((k) => n.input[k] === undefined && delete n.input[k]);
-        if (v === 'choice') n.input.options = spec.options || [{ value: 'A', label: 'Option A' }, { value: 'B', label: 'Option B' }];
-      }, { panel: true }))),
-      kind === 'choice' || kind === 'yesno' || kind === 'date' ? h('span') :
-        F('Placeholder', bound(() => spec.placeholder, (v) => setIn('placeholder', v), { key: n.id + '.ph' }))));
-    wrap.append(checkbox('Required', spec.required !== false, (c) => mutate(() => setIn('required', c ? null : false))));
-
-    if (kind === 'number') {
-      wrap.append(h('div', { class: 'grid2' },
-        F('Minimum', bound(() => spec.min, (v) => setIn('min', numOrNull(v)), { type: 'number', key: n.id + '.min' })),
-        F('Maximum', bound(() => spec.max, (v) => setIn('max', numOrNull(v)), { type: 'number', key: n.id + '.max' }))),
-        F('Display prefix', bound(() => spec.prefix, (v) => setIn('prefix', v), { key: n.id + '.prefix', placeholder: 'e.g. $' }),
-          'Shown in the summary. Users can type 25k, $1,250 etc.'));
-    } else if (kind === 'date') {
-      wrap.append(h('div', { class: 'grid2' },
-        F('Earliest', bound(() => spec.minDate, (v) => setIn('minDate', v), { key: n.id + '.mind', placeholder: 'today / 2026-01-01' })),
-        F('Latest', bound(() => spec.maxDate, (v) => setIn('maxDate', v), { key: n.id + '.maxd', placeholder: 'YYYY-MM-DD' }))));
-    } else if (kind === 'text' || kind === 'email') {
-      wrap.append(h('div', { class: 'grid2' },
-        F('Min length', bound(() => spec.minLength, (v) => setIn('minLength', numOrNull(v)), { type: 'number', key: n.id + '.minl' })),
-        F('Max length', bound(() => spec.maxLength, (v) => setIn('maxLength', numOrNull(v)), { type: 'number', key: n.id + '.maxl' }))));
-    } else if (kind === 'choice') {
-      wrap.append(optionsEditor(n));
-    }
+    wrap.append(answerEditor(n, n.id));
 
     wrap.append(validatorsEditor(n));
     wrap.append(bindingEditor(n.slot));
@@ -1006,14 +1162,52 @@
     return wrap;
   }
 
-  function optionsEditor(n) {
+  // Answer type + constraints for anything with an .input spec (Ask nodes, Change-fields fields).
+  function answerEditor(o, kp) {
+    const spec = o.input || { kind: 'text' };
+    const kind = spec.kind || 'text';
+    const setIn = (k, v) => { o.input = o.input || { kind: 'text' }; setOrDelete(o.input, k, v); };
+    const box = h('div');
+    box.append(h('h4', { class: 'sub', text: 'Answer' }));
+    box.append(h('div', { class: 'grid2' },
+      F('Type', sel(KINDS, kind, (v) => mutate(() => {
+        o.input = { kind: v, required: spec.required, placeholder: spec.placeholder };
+        Object.keys(o.input).forEach((k) => o.input[k] === undefined && delete o.input[k]);
+        if (v === 'choice') o.input.options = spec.options || [{ value: 'A', label: 'Option A' }, { value: 'B', label: 'Option B' }];
+      }, { panel: true }))),
+      kind === 'choice' || kind === 'yesno' || kind === 'date' ? h('span') :
+        F('Placeholder', bound(() => spec.placeholder, (v) => setIn('placeholder', v), { key: kp + '.ph' }))));
+    box.append(checkbox('Required', spec.required !== false, (c) => mutate(() => setIn('required', c ? null : false))));
+
+    if (kind === 'number') {
+      box.append(h('div', { class: 'grid2' },
+        F('Minimum', bound(() => spec.min, (v) => setIn('min', numOrNull(v)), { type: 'number', key: kp + '.min' })),
+        F('Maximum', bound(() => spec.max, (v) => setIn('max', numOrNull(v)), { type: 'number', key: kp + '.max' }))),
+        F('Display prefix', bound(() => spec.prefix, (v) => setIn('prefix', v), { key: kp + '.prefix', placeholder: 'e.g. $' }),
+          'Shown in the summary. Users can type 25k, $1,250 etc.'));
+    } else if (kind === 'date') {
+      box.append(h('div', { class: 'grid2' },
+        F('Earliest', bound(() => spec.minDate, (v) => setIn('minDate', v), { key: kp + '.mind', placeholder: 'today / 2026-01-01' })),
+        F('Latest', bound(() => spec.maxDate, (v) => setIn('maxDate', v), { key: kp + '.maxd', placeholder: 'YYYY-MM-DD' }))));
+    } else if (kind === 'text' || kind === 'email') {
+      box.append(h('div', { class: 'grid2' },
+        F('Min length', bound(() => spec.minLength, (v) => setIn('minLength', numOrNull(v)), { type: 'number', key: kp + '.minl' })),
+        F('Max length', bound(() => spec.maxLength, (v) => setIn('maxLength', numOrNull(v)), { type: 'number', key: kp + '.maxl' }))));
+    } else if (kind === 'choice') {
+      box.append(optionsEditor(o, kp));
+    }
+    return box;
+  }
+
+  function optionsEditor(n, keyPrefix) {
+    const kp = keyPrefix || n.id;
     const opts = (n.input && n.input.options) || [];
     const box = h('div', { class: 'card' }, h('div', { class: 'card-h' }, h('span', { class: 'grow', text: 'Options' }),
       h('span', { class: 'hint', text: 'value · label' })));
     opts.forEach((o, i) => {
       box.append(h('div', { class: 'rowx' },
-        bound(() => o.value, (v) => { o.value = v; }, { mono: true, key: n.id + '.ov' + i, placeholder: 'VALUE' }),
-        bound(() => o.label, (v) => setOrDelete(o, 'label', v), { key: n.id + '.ol' + i, placeholder: 'Label shown' }),
+        bound(() => o.value, (v) => { o.value = v; }, { mono: true, key: kp + '.ov' + i, placeholder: 'VALUE' }),
+        bound(() => o.label, (v) => setOrDelete(o, 'label', v), { key: kp + '.ol' + i, placeholder: 'Label shown' }),
         h('button', { class: 'x', title: 'Up', text: '↑', disabled: i === 0, onclick: () => mutate(() => { opts.splice(i - 1, 0, opts.splice(i, 1)[0]); }, { panel: true }) }),
         h('button', { class: 'x', title: 'Remove', text: '×', onclick: () => mutate(() => opts.splice(i, 1), { panel: true }) })));
     });
@@ -1023,7 +1217,8 @@
     return box;
   }
 
-  function validatorsEditor(n) {
+  function validatorsEditor(n, keyPrefix) {
+    const kp = keyPrefix || n.id;
     const vals = n.validators || [];
     const box = h('div', null, h('h4', { class: 'sub', text: 'Extra checks' }));
     vals.forEach((v, i) => {
@@ -1031,13 +1226,13 @@
         h('span', { class: 'grow', text: v.type === 'regex' ? 'Pattern (regex)' : 'Server check (connector)' }),
         h('button', { class: 'x', text: '×', title: 'Remove', onclick: () => mutate(() => { vals.splice(i, 1); if (!vals.length) delete n.validators; }, { panel: true }) })));
       if (v.type === 'regex') {
-        card.append(F(null, bound(() => v.pattern, (x) => { v.pattern = x; }, { mono: true, key: n.id + '.vp' + i, placeholder: '^[0-9]{5}$' }),
+        card.append(F(null, bound(() => v.pattern, (x) => { v.pattern = x; }, { mono: true, key: kp + '.vp' + i, placeholder: '^[0-9]{5}$' }),
           'Must work in both JavaScript and Oracle: avoid lookaheads.'));
       } else {
-        card.append(F(null, connectorInput(() => v.connector, (x) => { v.connector = x; }, n.id + '.vc' + i),
+        card.append(F(null, connectorInput(() => v.connector, (x) => { v.connector = x; }, kp + '.vc' + i),
           'Connector returns {"valid": true|false, "message": "…"}.'));
       }
-      card.append(F('Error message', bound(() => v.message, (x) => setOrDelete(v, 'message', x), { key: n.id + '.vm' + i,
+      card.append(F('Error message', bound(() => v.message, (x) => setOrDelete(v, 'message', x), { key: kp + '.vm' + i,
         placeholder: v.type === 'server' ? '(uses the connector message)' : "That value isn't in the expected format." })));
       box.append(card);
     });
@@ -1156,6 +1351,13 @@
 
   function summaryEditor(n) {
     const ta = bound(() => n.text, (v) => setOrDelete(n, 'text', v), { multiline: true, key: n.id + '.text' });
+    const modeSel = F('Shows', sel([['answers', 'All answers (create flows)'], ['changes', 'Changes to a record: old → new (update flows)']],
+      n.mode || 'answers', (v) => mutate(() => { if (v === 'changes') { n.mode = 'changes'; delete n.fields; } else { delete n.mode; delete n.record; } }, { panel: true })));
+    if (n.mode === 'changes') {
+      return h('div', null, modeSel, F('Record', recordSelect(n, 'record')),
+        F('Intro text', ta, 'Default: "Please confirm these changes:"'), slotChips(ta),
+        F('Confirm button label', bound(() => n.confirmLabel, (v) => setOrDelete(n, 'confirmLabel', v), { key: n.id + '.cl', placeholder: 'Save changes' })));
+    }
     const fields = n.fields || [];
     const box = h('div', { class: 'card' }, h('div', { class: 'card-h', text: 'Fields to show' }));
     askSlots().forEach((s) => box.append(checkbox(s, fields.indexOf(s) >= 0, (c) => mutate(() => {
@@ -1164,9 +1366,241 @@
       if (cur.length) n.fields = askSlots().filter((x) => cur.indexOf(x) >= 0); else delete n.fields;
     }))));
     box.append(h('div', { class: 'hint', text: 'Nothing ticked = every answered question, in flow order.' }));
-    return h('div', null, F('Intro text', ta), slotChips(ta),
+    return h('div', null, modeSel, F('Intro text', ta), slotChips(ta),
       F('Confirm button label', bound(() => n.confirmLabel, (v) => setOrDelete(n, 'confirmLabel', v), { key: n.id + '.cl', placeholder: 'Confirm & submit' })),
       box);
+  }
+
+  // ---- data nodes ---------------------------------------------------------------------------
+  // Rename a record alias everywhere: findRecord.as, record refs, alias.field placeholders,
+  // conditions and bindings.
+  function renameAlias(oldA, newA) {
+    const f = S.flow, pre = oldA + '.';
+    const re = new RegExp('\\{\\{\\s*' + oldA + '\\.', 'g');
+    const fixText = (t) => (typeof t === 'string' ? t.replace(re, '{{' + newA + '.') : t);
+    const fixCond = (c) => {
+      if (!c) return;
+      if (c.slot && c.slot.indexOf(pre) === 0) c.slot = newA + '.' + c.slot.slice(pre.length);
+      (c.all || c.any || []).forEach(fixCond);
+      if (c.not) fixCond(c.not);
+    };
+    f.nodes.forEach((n) => {
+      if (n.type === 'findRecord' && n.as === oldA) n.as = newA;
+      if (n.record === oldA) n.record = newA;
+      ['text', 'prompt', 'cardTitle', 'againPrompt'].forEach((k) => { n[k] = fixText(n[k]); });
+      if (n.prompts) Object.keys(n.prompts).forEach((k) => { n.prompts[k] = fixText(n.prompts[k]); });
+      (n.branches || []).forEach((b) => fixCond(b.when));
+      if (n.type === 'changeFields') (n.fields || []).forEach((fd) => { fixCond(fd.editableWhen); fd.prompt = fixText(fd.prompt); });
+    });
+    Object.keys(f.bindings || {}).forEach((k) => {
+      if (k.indexOf(pre) === 0) { f.bindings[newA + '.' + k.slice(pre.length)] = f.bindings[k]; delete f.bindings[k]; }
+    });
+  }
+
+  function humanize(field) { return String(field || '').replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase()); }
+
+  // {{field}} insert chips for result-card templates (raw source field names).
+  function fieldChips(src, target) {
+    if (!src || !(src.fields || []).length) return null;
+    return h('div', { class: 'chips-ins', title: 'Insert a field of the data source' },
+      src.fields.map((f) => h('button', {
+        type: 'button', text: '{{' + f.field + '}}' + (f.mask ? ' •' : ''),
+        onclick: () => {
+          const pos = target.selectionStart != null ? target.selectionStart : target.value.length;
+          target.value = target.value.slice(0, pos) + '{{' + f.field + '}}' + target.value.slice(target.selectionEnd || pos);
+          target.dispatchEvent(new Event('input'));
+          target.focus();
+        }
+      })));
+  }
+
+  function aliasInput(n) {
+    const inp = h('input', { class: 'in mono', value: n.as || '', placeholder: 'app' });
+    inp.addEventListener('change', () => {
+      const v = inp.value.trim();
+      if (v === n.as) return;
+      if (!/^[a-z][a-z0-9_]{0,49}$/.test(v)) { toast('Alias: lowercase letters, digits and _, starting with a letter.'); inp.value = n.as || ''; return; }
+      if (aliases().indexOf(v) >= 0) { toast('Another Find record already uses "' + v + '".'); inp.value = n.as || ''; return; }
+      const old = n.as;
+      mutate(() => { if (old) renameAlias(old, v); else n.as = v; }, { panel: true });
+    });
+    return inp;
+  }
+
+  function recordSelect(n, key) {
+    const als = aliases();
+    const opts = [['', '— choose a record —']].concat(als.map((a) => [a, a + '  (' + (sourceForAlias(a) || '?') + ')']));
+    if (n[key] && als.indexOf(n[key]) < 0) opts.push([n[key], n[key] + ' (not loaded by any Find record)']);
+    return sel(opts, n[key] || '', (v) => mutate(() => setOrDelete(n, key, v), { panel: true }), { mono: true });
+  }
+
+  function findEditor(n) {
+    const wrap = h('div');
+    const ids = Object.keys(catalog());
+    const srcOpts = [['', '— choose a data source —']].concat(ids.map((s) => [s, s]));
+    if (n.source && ids.indexOf(n.source) < 0) srcOpts.push([n.source, n.source + ' (not in catalog)']);
+    const src = sourceDef(n.source);
+    wrap.append(h('div', { class: 'grid2' },
+      F('Data source', sel(srcOpts, n.source || '', (v) => mutate(() => setOrDelete(n, 'source', v), { panel: true }), { mono: true })),
+      F('Record alias', aliasInput(n))));
+    wrap.append(h('p', { class: 'hint' }, 'Loaded fields are available as ', h('code', { text: '{{' + (n.as || 'alias') + '.field}}' }),
+      ' and in conditions. ', h('button', { class: 'lnk', text: 'Manage data sources →', onclick: () => setTab('data') })));
+
+    // criteria
+    wrap.append(h('h4', { class: 'sub', text: 'Search criteria' }));
+    const crit = n.criteria || [];
+    const searchable = src ? src.fields.filter((f) => f.searchable) : [];
+    const asks = askSlots();
+    if (src && !searchable.length) wrap.append(h('p', { class: 'hint', text: 'No field of ' + n.source + ' is searchable. Mark some in the Data tab.' }));
+    crit.forEach((c, i) => {
+      const fOpts = [['', 'field…']].concat((src ? searchable : []).map((f) => [f.field, f.field]));
+      if (c.field && !fOpts.some((o) => o[0] === c.field)) fOpts.push([c.field, c.field + (src ? ' (not searchable)' : '')]);
+      const sf = sourceField(n.source, c.field);
+      const allowed = sf ? String(sf.ops || 'eq').split(',').map((s) => s.trim()) : SEARCH_OPS.map((o) => o[0]);
+      const opOpts = SEARCH_OPS.filter((o) => allowed.indexOf(o[0]) >= 0 || o[0] === (c.op || 'eq'));
+      const slotOpts = [['', 'answer…']].concat(asks.map((s) => [s, s]));
+      if (c.slot && asks.indexOf(c.slot) < 0) slotOpts.push([c.slot, c.slot + ' (not asked)']);
+      wrap.append(h('div', { class: 'card' },
+        h('div', { class: 'rowx' },
+          sel(fOpts, c.field || '', (v) => mutate(() => { c.field = v; }, { panel: true }), { mono: true }),
+          sel(opOpts, c.op || 'eq', (v) => mutate(() => { if (v === 'eq') delete c.op; else c.op = v; })),
+          sel(slotOpts, c.slot || '', (v) => mutate(() => { c.slot = v; }), { mono: true }),
+          h('button', { class: 'x', text: '×', title: 'Remove', onclick: () => mutate(() => crit.splice(i, 1), { panel: true }) })),
+        checkbox('Optional: skip it when the answer is empty', c.optional, (ch) => mutate(() => setOrDelete(c, 'optional', ch || null)))));
+    });
+    wrap.append(h('button', { class: 'lnk', text: '+ Add criterion', onclick: () => mutate(() => {
+      n.criteria = crit;
+      const used = crit.map((c) => c.field);
+      const nextField = searchable.find((f) => used.indexOf(f.field) < 0) || searchable[0];
+      crit.push({ field: nextField ? nextField.field : '', op: 'eq', slot: asks.find((s) => nextField && s === nextField.field) || asks[0] || '' });
+    }, { panel: true }) }));
+    wrap.append(h('div', { class: 'grid2', style: 'margin-top:10px' },
+      F('Max results', bound(() => n.maxResults, (v) => setOrDelete(n, 'maxResults', numOrNull(v)), { type: 'number', key: n.id + '.maxr', placeholder: '10' }),
+        'More matches go to "too many".'),
+      F('Min criteria', bound(() => n.minCriteria, (v) => setOrDelete(n, 'minCriteria', numOrNull(v)), { type: 'number', key: n.id + '.minc', placeholder: '1' }),
+        'Fewer filled criteria = not found.')));
+    wrap.append(checkbox('Load directly when exactly one record matches', n.autoPick !== false, (ch) => mutate(() => setOrDelete(n, 'autoPick', ch ? null : false))));
+    wrap.append(checkbox('Offer "None of these" when picking', n.allowNone !== false, (ch) => mutate(() => setOrDelete(n, 'allowNone', ch ? null : false))));
+
+    // result card
+    wrap.append(h('h4', { class: 'sub', text: 'Result card (when several match)' }));
+    const cardSet = (k) => (v) => { n.card = n.card || {}; setOrDelete(n.card, k, v); if (!Object.keys(n.card).length) delete n.card; };
+    const t1 = bound(() => (n.card || {}).title, cardSet('title'), { key: n.id + '.ct', placeholder: '{{reference}} · {{status}}' });
+    const t2 = bound(() => (n.card || {}).subtitle, cardSet('subtitle'), { key: n.id + '.cs' });
+    wrap.append(F('Title', t1), fieldChips(src, t1), F('Subtitle', t2), fieldChips(src, t2),
+      h('p', { class: 'hint', text: 'Fields marked • are masked: only their last 4 characters appear on cards.' }));
+
+    // messages
+    const pr = (k, ph) => bound(() => (n.prompts || {})[k], (v) => {
+      n.prompts = n.prompts || {}; setOrDelete(n.prompts, k, v); if (!Object.keys(n.prompts).length) delete n.prompts;
+    }, { key: n.id + '.p' + k, placeholder: ph });
+    wrap.append(h('details', { class: 'adv' }, h('summary', { text: 'Messages' }),
+      F('Several matches', pr('many', 'I found {{count}} matching records. Which one?'), 'Use {{count}} for the number of matches.'),
+      F('No match', pr('none', "I couldn't find a matching record.")),
+      F('Too many matches', pr('tooMany', "That matches too many records. Let's narrow it down.")),
+      F('After loading', pr('found', 'Found {{' + (n.as || 'rec') + '.reference}}.')),
+      F('After "None of these"', pr('cancelled', 'Okay.'))));
+    return wrap;
+  }
+
+  // A single "editable when" comparison (or JSON for anything more complex).
+  function editableWhenEditor(fd, key) {
+    const c = fd.editableWhen;
+    const toggle = checkbox('Only editable when…', !!c, (ch) => mutate(() => {
+      if (ch) fd.editableWhen = { slot: '', op: '=', value: '' }; else { delete fd.editableWhen; delete fd.lockedMessage; }
+    }, { panel: true }));
+    if (!c) return toggle;
+    const box = h('div', null, toggle);
+    if (c.all || c.any || c.not) {
+      const ta = h('textarea', { class: 'in mono', rows: 3 });
+      ta.value = JSON.stringify(c);
+      ta.addEventListener('change', () => { try { const w = JSON.parse(ta.value); mutate(() => { fd.editableWhen = w; }, { panel: true }); } catch (e) { ta.classList.add('bad'); } });
+      box.append(ta);
+    } else {
+      const slots = knownSlots();
+      const slotOpts = [['', 'field…']].concat(slots.map((s) => [s, s]));
+      if (c.slot && slots.indexOf(c.slot) < 0) slotOpts.push([c.slot, c.slot + ' (unknown)']);
+      const valIn = h('input', { class: 'in', placeholder: 'value' });
+      valIn.value = Array.isArray(c.value) ? c.value.join(', ') : (c.value === undefined ? '' : c.value);
+      valIn.hidden = c.op === 'empty' || c.op === 'notEmpty';
+      valIn.addEventListener('input', () => mutate(() => {
+        c.value = c.op === 'in' ? valIn.value.split(',').map((x) => numify(x.trim())).filter((x) => x !== '') : numify(valIn.value);
+      }, { key: key + '.ewv' }));
+      box.append(h('div', { class: 'rowx' },
+        sel(slotOpts, c.slot || '', (v) => mutate(() => { c.slot = v; }), { mono: true }),
+        sel(OPS, c.op || '=', (v) => mutate(() => { c.op = v; if (v === 'empty' || v === 'notEmpty') delete c.value; }, { panel: true })),
+        valIn));
+    }
+    box.append(F('Message when locked', bound(() => fd.lockedMessage, (v) => setOrDelete(fd, 'lockedMessage', v),
+      { key: key + '.lm', placeholder: 'This field cannot be changed right now.' })));
+    return box;
+  }
+
+  const openFieldCards = new Set();
+  function changeEditor(n) {
+    const wrap = h('div');
+    const srcId = sourceForAlias(n.record), src = sourceDef(srcId);
+    wrap.append(F('Record', recordSelect(n, 'record'), 'The record loaded by a Find record node.'));
+    const ct = bound(() => n.cardTitle, (v) => setOrDelete(n, 'cardTitle', v), { key: n.id + '.ct', placeholder: 'Current details' });
+    const pr = bound(() => n.prompt, (v) => setOrDelete(n, 'prompt', v), { key: n.id + '.pr', placeholder: 'What would you like to change?' });
+    wrap.append(F('Card title', ct), slotChips(ct), F('Prompt', pr),
+      h('div', { class: 'grid2' },
+        F('After each change', bound(() => n.againPrompt, (v) => setOrDelete(n, 'againPrompt', v), { key: n.id + '.ag', placeholder: 'Got it. Anything else?' })),
+        F('Done button', bound(() => n.doneLabel, (v) => setOrDelete(n, 'doneLabel', v), { key: n.id + '.dl', placeholder: 'Done' }))));
+
+    wrap.append(h('h4', { class: 'sub', text: 'Editable fields' }));
+    if (!n.record) wrap.append(h('p', { class: 'hint', text: 'Choose a record first.' }));
+    const flds = n.fields || [];
+    flds.forEach((fd, i) => {
+      const kp = n.id + '.f' + i;
+      const sf = sourceField(srcId, fd.field);
+      const fOpts = [['', 'field…']].concat((src ? src.fields : []).map((x) => [x.field, x.field + (x.updatable ? '' : ' (read-only)')]));
+      if (fd.field && !fOpts.some((o) => o[0] === fd.field)) fOpts.push([fd.field, fd.field + (src ? ' (not in source)' : '')]);
+      const det = h('details', { class: 'card' });
+      det.open = openFieldCards.has(kp);
+      det.addEventListener('toggle', () => { if (det.open) openFieldCards.add(kp); else openFieldCards.delete(kp); });
+      const warn = sf && !sf.updatable ? ' ⚠ read-only' : '';
+      det.append(h('summary', { class: 'card-h', style: 'cursor:pointer' },
+        h('span', { class: 'grow mono', text: (fd.field || '(no field)') + warn }),
+        h('span', { class: 'chip', text: (fd.input && fd.input.kind) || 'text' }),
+        fd.editableWhen ? h('span', { class: 'chip', text: 'conditional' }) : null,
+        h('button', { class: 'x', text: '↑', title: 'Move up', disabled: i === 0, onclick: (e) => { e.preventDefault(); mutate(() => { flds.splice(i - 1, 0, flds.splice(i, 1)[0]); }, { panel: true }); } }),
+        h('button', { class: 'x', text: '×', title: 'Remove field', onclick: (e) => { e.preventDefault(); mutate(() => flds.splice(i, 1), { panel: true }); } })));
+      det.append(h('div', { class: 'grid2' },
+        F('Source field', sel(fOpts, fd.field || '', (v) => mutate(() => {
+          fd.field = v;
+          const x = sourceField(srcId, v);
+          if (!fd.label || fd.label === humanize(fd.field)) fd.label = humanize(v);
+          if (x && (!fd.input || !fd.input.kind || fd.input.kind === 'text')) fd.input = { kind: inputKindFor(x.type) };
+        }, { panel: true }), { mono: true })),
+        F('Label', bound(() => fd.label, (v) => setOrDelete(fd, 'label', v), { key: kp + '.lb' }))));
+      det.append(F('Question (optional)', bound(() => fd.prompt, (v) => setOrDelete(fd, 'prompt', v),
+        { key: kp + '.pq', placeholder: (fd.label || 'Field') + ' is currently …. What should it be?' })));
+      det.append(answerEditor(fd, kp), validatorsEditor(fd, kp), h('h4', { class: 'sub', text: 'Lock' }), editableWhenEditor(fd, kp));
+      wrap.append(det);
+    });
+    if (n.record) {
+      wrap.append(h('button', { class: 'lnk', text: '+ Add field', onclick: () => mutate(() => {
+        n.fields = flds;
+        const used = flds.map((f) => f.field);
+        const next = src && src.fields.find((x) => x.updatable && used.indexOf(x.field) < 0);
+        flds.push(next ? { field: next.field, label: humanize(next.field), input: { kind: inputKindFor(next.type) } } : { field: '', input: { kind: 'text' } });
+        openFieldCards.add(n.id + '.f' + (flds.length - 1));
+      }, { panel: true }) }));
+    }
+    return wrap;
+  }
+
+  function saveEditor(n) {
+    return h('div', null,
+      F('Record', recordSelect(n, 'record')),
+      F('Message after saving', bound(() => n.savedText, (v) => setOrDelete(n, 'savedText', v), { key: n.id + '.st', placeholder: '(none)' })),
+      F('Conflict message', bound(() => n.conflictText, (v) => setOrDelete(n, 'conflictText', v), { multiline: true, rows: 2, key: n.id + '.cft',
+        placeholder: 'Someone else changed this record after you opened it…' })),
+      h('div', { class: 'card' }, h('div', { class: 'hint', style: 'margin:0' },
+        'Re-validates every changed field, then updates only those columns, guarded by the record version. ',
+        'Fields not marked updatable in the data source are refused by the server whatever the flow says. ',
+        'Each save is written to FC_EVENTS with before/after values.')));
   }
 
   function edgePanel() {
@@ -1244,7 +1678,8 @@
       const askers = S.flow.nodes.filter((n) => n.type === 'ask' && n.slot === s).map((n) => n.id);
       const b = S.flow.bindings[s] || {};
       const c = cv.cov[s];
-      const label = askers.length ? (c === 'always' ? 'every path' : c === 'sometimes' ? 'some paths' : 'unreachable') : 'set by connector';
+      const label = askers.length ? (c === 'always' ? 'every path' : c === 'sometimes' ? 'some paths' : 'unreachable')
+        : (s.indexOf('.') > 0 ? 'from record' : 'set by connector');
       tbl.append(h('tr', null,
         h('td', { class: 'mono' }, s, b.required ? h('span', { title: 'Required on form', text: ' *' }) : null),
         h('td', { class: 'mono', text: askers.join(', ') || '—' }),
@@ -1270,12 +1705,14 @@
   };
   const mockFor = (id, role) => (S.mocks[id] !== undefined ? S.mocks[id] : JSON.stringify(ROLE_PRESETS[role][0][1], null, 2));
 
+  let testSources = {};
   function renderMocks() {
     const box = $('mocks');
     box.textContent = '';
     const uses = connectorUses();
     const ids = Object.keys(uses);
-    if (!ids.length) { box.append(h('p', { class: 'hint', text: 'This flow calls no connectors.' })); return; }
+    const srcs = sourceUses();
+    if (!ids.length && !srcs.length) { box.append(h('p', { class: 'hint', text: 'This flow calls no connectors or data sources.' })); return; }
     ids.forEach((id) => {
       const role = uses[id];
       const ta = h('textarea', { class: 'in', rows: 4, spellcheck: 'false' });
@@ -1290,6 +1727,87 @@
         }))),
         ta));
     });
+    srcs.forEach((id) => {
+      const src = sourceDef(id);
+      const card = h('div', { class: 'card mock' },
+        h('div', { class: 'card-h' }, h('span', { class: 'mono grow', text: id }), h('span', { class: 'chip', text: 'data source' })));
+      if (!src) {
+        card.append(h('p', { class: 'hint', text: 'Not in the catalog, so the test can\'t simulate it. Add it in the Data tab.' }));
+      } else {
+        const live = testSources[id];
+        card.append(h('p', { class: 'hint', text: (live ? live.rows.length : (src.sampleRows || []).length) +
+          ' sample row(s), reset on every test restart. Edit them in the Data tab.' }));
+        const pre = h('pre', { class: 'state', 'data-src': id });
+        pre.textContent = rowsText(id);
+        card.append(h('div', { class: 'rowx' },
+          h('button', { class: 'btn', text: 'Simulate another user editing the loaded record', onclick: () => bumpLoaded(id) }),
+          h('button', { class: 'lnk', text: 'Edit rows →', onclick: () => { S.dataSel = id; setTab('data'); } })), pre);
+      }
+      box.append(card);
+    });
+  }
+
+  function rowsText(id) {
+    const live = testSources[id];
+    const rows = live ? live.rows : (sourceDef(id) || {}).sampleRows || [];
+    return rows.map((r) => JSON.stringify(r)).join('\n') || '(no rows)';
+  }
+
+  // Bump the version of the record the test conversation has loaded, like a concurrent save.
+  function bumpLoaded(id) {
+    const st = testEngine && testEngine.getState($('simChat').sessionId);
+    const live = testSources[id];
+    const rec = st && Object.values(st.records || {}).find((r) => r.source === id);
+    if (!live || !rec) { toast('Load a record in the test chat first.'); return; }
+    const row = live.rows.find((r) => String(r._key) === String(rec.key));
+    if (!row) { toast('The loaded record is not in the sample rows.'); return; }
+    if ('_version' in row) {
+      row._version = Number(row._version || 1) + 1;   // a concurrent save: same data, newer version
+    } else {
+      // no version column: conflicts are detected on the original values of the changed fields
+      const changed = Object.keys(recordChanges(rec));
+      if (!changed.length) { toast('Change a field in the test chat first; without a version column only changed fields are checked.'); return; }
+      const k = changed[0];
+      row[k] = typeof row[k] === 'number' ? row[k] + 1 : String(row[k] == null ? '' : row[k]) + '*';
+    }
+    refreshTestPanels();
+    toast('Another "user" saved ' + rec.key + '. Saving now will hit a conflict.');
+  }
+  function recordChanges(rec) {
+    const out = {};
+    Object.keys(rec.current || {}).forEach((k) => { if (String(rec.current[k]) !== String(rec.original[k])) out[k] = rec.current[k]; });
+    return out;
+  }
+
+  function refreshTestPanels() {
+    const st = testEngine && testEngine.getState($('simChat').sessionId);
+    const view = st ? { answers: st.slots } : {};
+    if (st && Object.keys(st.records || {}).length) {
+      view.records = {};
+      Object.keys(st.records).forEach((a) => {
+        const r = st.records[a];
+        view.records[a] = { key: r.key, version: r.version, changed: recordChanges(r), current: r.current };
+      });
+    }
+    $('simState').textContent = JSON.stringify(view, null, 2);
+    ROOT.querySelectorAll('pre[data-src]').forEach((pre) => { pre.textContent = rowsText(pre.dataset.src); });
+  }
+
+  function buildTestSources() {
+    testSources = {};
+    sourceUses().forEach((id) => {
+      const src = sourceDef(id);
+      if (!src) return;
+      const fields = {};
+      (src.fields || []).forEach((f) => { fields[f.field] = { searchable: !!f.searchable, updatable: !!f.updatable, mask: f.mask || null }; });
+      const rows = clone(src.sampleRows || []).map((r, i) => {
+        const row = Object.assign({ _key: i + 1 }, r);
+        if (src.versionColumn && row._version == null) row._version = 1;
+        return row;
+      });
+      testSources[id] = FlowChatEngine.createMemorySource({ rows, key: '_key', versionField: src.versionColumn ? '_version' : null, fields });
+    });
+    return testSources;
   }
 
   function runTest() {
@@ -1302,13 +1820,14 @@
         try { return JSON.parse(txt); } catch (e) { throw new Error('The test mock for "' + id + '" is not valid JSON.'); }
       };
     });
-    testEngine = FlowChatEngine.createEngine({ flows: [flow], connectors });
+    testEngine = FlowChatEngine.createEngine({ flows: [flow], connectors, dataSources: buildTestSources() });
     const chat = $('simChat');
     chat.setAttribute('flow', flow.flowId || 'draft');
     chat.configure({ transport: new FlowChat.LocalTransport(testEngine), adapter: new FlowChat.NoneAdapter() });
     chat.start();
     S.testStale = false;
     updateTestNote();
+    renderMocks();
     $('simState').textContent = '{}';
   }
 
@@ -1326,10 +1845,189 @@
   function setTab(tab) {
     S.tab = tab;
     ROOT.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
-    ['props', 'check', 'test', 'json'].forEach((t) => { $('tab-' + t).hidden = t !== tab; });
+    ['props', 'check', 'test', 'data', 'json'].forEach((t) => { $('tab-' + t).hidden = t !== tab; });
     if (tab === 'check') renderCheck();
     if (tab === 'json') renderJson();
+    if (tab === 'data') renderData();
     if (tab === 'test') { renderMocks(); if (!testEngine) runTest(); }
+  }
+
+  // ======================================================================== data tab (catalog)
+  // The designer's copy of the server registry (FC_DATA_SOURCES / FC_DATA_SOURCE_FIELDS). Catalog edits
+  // are saved with the draft but are not part of the flow, so they aren't in undo history.
+  function catalogChanged(rerender) {
+    save();
+    renderCanvas();
+    renderCheck();
+    S.testStale = true;
+    updateTestNote();
+    if (rerender) renderData();
+  }
+
+  function registrationSql(id, src) {
+    const q = (v) => (v === null || v === undefined || v === '' ? 'null' : "'" + String(v).replace(/'/g, "''") + "'");
+    const lines = [
+      '-- Registers data source "' + id + '" (generated by FlowChat Designer ' + new Date().toISOString().slice(0, 10) + ')',
+      'set define off',
+      'delete from fc_data_sources where source_id = ' + q(id) + ';   -- fields cascade',
+      'insert into fc_data_sources (source_id, source_type, object_name, key_column, version_column, row_filter)',
+      '  values (' + [q(id), "'TABLE'", q(src.objectName), q(src.keyColumn), q(src.versionColumn), q(src.rowFilter)].join(', ') + ');'
+    ];
+    (src.fields || []).forEach((f) => {
+      lines.push('insert into fc_data_source_fields (source_id, field, column_name, data_type, searchable, search_ops, updatable, mask)');
+      lines.push('  values (' + [q(id), q(f.field), q(String(f.column || f.field).toUpperCase()), q(f.type || 'VARCHAR2'),
+        q(f.searchable ? 'Y' : 'N'), q(f.ops || 'eq'), q(f.updatable ? 'Y' : 'N'), q(f.mask)].join(', ') + ');');
+    });
+    lines.push('commit;', '');
+    return lines.join('\n');
+  }
+
+  function renderData() {
+    const body = $('tab-data');
+    if (S.tab !== 'data') return;
+    body.textContent = '';
+    const cat = catalog();
+    const ids = Object.keys(cat);
+    if (!S.dataSel || !cat[S.dataSel]) S.dataSel = ids[0] || null;
+    const used = sourceUses();
+
+    body.append(h('div', { class: 'ptitle', text: 'Data sources' }),
+      h('p', { class: 'pdesc', text: 'The designer\'s copy of the server registry (FC_DATA_SOURCES). It drives the pickers and checks for Find record and Change fields, and its sample rows are used by the Test tab. "Registration SQL" creates the same definition on the server.' }));
+
+    const fileIn = h('input', { type: 'file', accept: '.json,application/json', hidden: true });
+    fileIn.addEventListener('change', () => {
+      const file = fileIn.files[0];
+      if (!file) return;
+      file.text().then((txt) => {
+        const imp = JSON.parse(txt);
+        if (!imp || typeof imp !== 'object' || Array.isArray(imp)) throw new Error('expected an object of data sources');
+        Object.keys(imp).forEach((k) => { if (!imp[k] || !Array.isArray(imp[k].fields)) throw new Error('"' + k + '" has no fields array'); });
+        Object.assign(cat, imp);
+        S.dataSel = Object.keys(imp)[0] || S.dataSel;
+        catalogChanged(true);
+        toast('Imported ' + Object.keys(imp).length + ' data source(s)');
+      }).catch((e) => toast('Could not import: ' + e.message));
+    });
+    body.append(fileIn, h('div', { class: 'rowx' },
+      sel(ids.length ? ids.map((i) => [i, i + (used.indexOf(i) >= 0 ? '  (used in flow)' : '')]) : [['', '(none)']],
+        S.dataSel || '', (v) => { S.dataSel = v; renderData(); }, { mono: true }),
+      h('button', { class: 'btn', text: '+ New', onclick: () => {
+        const id = (window.prompt('Data source id (lowercase letters, digits, _):', 'my_source') || '').trim();
+        if (!id) return;
+        if (!/^[a-z][a-z0-9_]{0,99}$/.test(id)) { toast('Use lowercase letters, digits and _.'); return; }
+        if (cat[id]) { toast('That id already exists.'); return; }
+        cat[id] = { objectName: '', keyColumn: 'id', versionColumn: '', rowFilter: '',
+                    fields: [{ field: 'id', column: 'ID', type: 'NUMBER', searchable: true, ops: 'eq', updatable: false }], sampleRows: [] };
+        S.dataSel = id;
+        catalogChanged(true);
+      } })),
+      h('div', { class: 'rowx', style: 'margin-top:4px' },
+        h('button', { class: 'lnk', text: 'Import…', onclick: () => fileIn.click() }), h('span', { class: 'hint', text: '·' }),
+        h('button', { class: 'lnk', text: 'Export catalog', onclick: () => download('flowchat-data-sources.json', JSON.stringify(cat, null, 2), 'application/json') })));
+
+    if (!S.dataSel) { body.append(h('p', { class: 'hint', text: 'No data sources yet.' })); return; }
+    const id = S.dataSel, src = cat[id];
+    const set = (k) => (v) => { src[k] = v; catalogChanged(false); };
+    const txt = (k, ph, mono) => {
+      const el = h('input', { class: 'in' + (mono ? ' mono' : ''), placeholder: ph || '' });
+      el.value = src[k] || '';
+      el.addEventListener('change', () => set(k)(el.value.trim()));
+      return el;
+    };
+
+    body.append(h('h4', { class: 'sub', text: 'Definition: ' + id }),
+      F('Table or view', txt('objectName', 'schema.table', true)),
+      h('div', { class: 'grid2' },
+        F('Key column', txt('keyColumn', 'ID', true)),
+        F('Version column', txt('versionColumn', '(optional)', true), 'NUMBER, incremented on update')),
+      F('Row filter (trusted SQL)', (() => {
+        const ta = h('textarea', { class: 'in mono', rows: 2, placeholder: "t.email = lower(:APP_USER)" });
+        ta.value = src.rowFilter || '';
+        ta.addEventListener('change', () => set('rowFilter')(ta.value.trim()));
+        return ta;
+      })(), 'Added to every search, load and update. :APP_USER is the signed-in APEX user. Not simulated in Test.'));
+
+    body.append(h('h4', { class: 'sub', text: 'Fields' }));
+    (src.fields || []).forEach((f, i) => {
+      const fin = (k, ph, w) => {
+        const el = h('input', { class: 'in mono', placeholder: ph, style: w ? 'max-width:' + w : null });
+        el.value = f[k] || '';
+        el.addEventListener('change', () => {
+          const v = el.value.trim();
+          if (k === 'field' && !/^[a-z][a-z0-9_]{0,99}$/.test(v)) { toast('Field names: lowercase letters, digits and _.'); el.value = f.field; return; }
+          f[k] = k === 'column' ? v.toUpperCase() : v;
+          catalogChanged(k === 'field');
+        });
+        return el;
+      };
+      const cb = (k, label) => {
+        const box = h('input', { type: 'checkbox', checked: !!f[k] });
+        box.addEventListener('change', () => { f[k] = box.checked; catalogChanged(false); });
+        return h('label', { class: 'check', style: 'margin:0' }, box, label);
+      };
+      body.append(h('div', { class: 'card' },
+        h('div', { class: 'rowx' },
+          fin('field', 'field'), fin('column', 'COLUMN'),
+          sel(FIELD_TYPES, f.type || 'VARCHAR2', (v) => { f.type = v; catalogChanged(false); }),
+          h('button', { class: 'x', text: '×', title: 'Remove field', onclick: () => { src.fields.splice(i, 1); catalogChanged(true); } })),
+        h('div', { class: 'rowx', style: 'flex-wrap:wrap;gap:10px' },
+          cb('searchable', 'searchable'), fin('ops', 'eq,starts', '110px'), cb('updatable', 'updatable'),
+          sel([['', 'no mask'], ['last4', 'mask: last 4']], f.mask || '', (v) => { if (v) f.mask = v; else delete f.mask; catalogChanged(false); }))));
+    });
+    body.append(h('button', { class: 'lnk', text: '+ Add field', onclick: () => {
+      src.fields = src.fields || [];
+      src.fields.push({ field: 'field_' + (src.fields.length + 1), column: 'FIELD_' + (src.fields.length + 1), type: 'VARCHAR2', searchable: false, ops: 'eq', updatable: false });
+      catalogChanged(true);
+    } }));
+
+    body.append(h('h4', { class: 'sub', text: 'Sample rows (Test tab)' }));
+    const rows = h('textarea', { class: 'in mono', rows: 8, spellcheck: 'false', style: 'font-size:11.5px' });
+    rows.value = JSON.stringify(src.sampleRows || [], null, 1);
+    rows.addEventListener('change', () => {
+      try {
+        const v = JSON.parse(rows.value);
+        if (!Array.isArray(v)) throw new Error('expected an array');
+        src.sampleRows = v; rows.classList.remove('bad'); catalogChanged(false);
+      } catch (e) { rows.classList.add('bad'); toast('Sample rows: ' + e.message); }
+    });
+    body.append(rows, h('p', { class: 'hint', text: 'Objects keyed by field name. Optional "_key" (record key) and "_version". These are only for testing in the designer.' }));
+
+    body.append(h('div', { class: 'actions' },
+      h('button', { class: 'btn primary', text: 'Registration SQL', onclick: () => {
+        if (!src.objectName || !src.keyColumn) { toast('Set the table and key column first.'); return; }
+        download(id + '_data_source.sql', registrationSql(id, src), 'text/plain');
+      } }),
+      h('button', { class: 'btn danger', text: 'Delete source', onclick: () => {
+        if (used.indexOf(id) >= 0 && !window.confirm('"' + id + '" is used by this flow. Delete it from the catalog anyway?')) return;
+        delete cat[id]; S.dataSel = null; catalogChanged(true);
+      } })));
+  }
+
+  // Samples menu
+  let sampleMenu = null;
+  function toggleSamples() {
+    if (sampleMenu) { sampleMenu.remove(); sampleMenu = null; return; }
+    const btn = $('btnSample'), r = btn.getBoundingClientRect(), rr = ROOT.getBoundingClientRect();
+    sampleMenu = h('div', { class: 'quick', style: 'left:' + (r.left - rr.left) + 'px;top:' + (r.bottom - rr.top + 4) + 'px;z-index:20' },
+      h('div', { text: 'Load a sample flow' }),
+      SAMPLES.map((s) => h('button', { onclick: () => { toggleSamples(); loadSample(s); } },
+        h('span', null, h('b', { text: s.label }), h('br'), h('small', { class: 'hint', text: s.desc })))));
+    ROOT.append(sampleMenu);
+    setTimeout(() => document.addEventListener('pointerdown', function close(e) {
+      if (sampleMenu && !sampleMenu.contains(e.target) && e.target !== btn) { sampleMenu.remove(); sampleMenu = null; }
+      document.removeEventListener('pointerdown', close);
+    }), 0);
+  }
+  function loadSample(s) {
+    fetch(FLOWS_BASE + s.file).then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then((f) => {
+        // make sure the sample's data sources exist in the catalog
+        const cat = catalog();
+        (f.nodes || []).forEach((n) => { if (n.type === 'findRecord' && n.source && !cat[n.source] && DEFAULT_CATALOG[n.source]) cat[n.source] = clone(DEFAULT_CATALOG[n.source]); });
+        testEngine = null;
+        replaceFlow(checkShape(f), 'Loaded the ' + s.label + ' sample');
+      })
+      .catch((err) => toast('Could not load the sample: ' + err.message));
   }
 
   function renderTitle() {
@@ -1379,9 +2077,7 @@
       file.text().then((txt) => replaceFlow(checkShape(JSON.parse(txt)), 'Opened ' + file.name))
         .catch((err) => toast('Could not open: ' + err.message));
     };
-    $('btnSample').onclick = () => fetch(SAMPLE_URL).then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then((f) => replaceFlow(checkShape(f), 'Loaded the loan application sample'))
-      .catch((err) => toast('Could not load the sample: ' + err.message));
+    $('btnSample').onclick = toggleSamples;
     $('btnUndo').onclick = undo;
     $('btnRedo').onclick = redo;
     $('btnLayout').onclick = () => { mutate(() => autoLayout()); fitView(); };
@@ -1396,10 +2092,7 @@
     };
     ROOT.querySelectorAll('.tabs button').forEach((b) => { b.onclick = () => setTab(b.dataset.tab); });
     $('btnRunTest').onclick = runTest;
-    $('simChat').addEventListener('fc-turn', () => {
-      const st = testEngine && testEngine.getState($('simChat').sessionId);
-      $('simState').textContent = JSON.stringify(st ? st.slots : {}, null, 2);
-    });
+    $('simChat').addEventListener('fc-turn', refreshTestPanels);
     $('btnApplyJson').onclick = () => {
       try { replaceFlow(checkShape(JSON.parse($('jsonText').value)), 'JSON applied'); }
       catch (e) { toast('Not applied: ' + e.message); }
@@ -1436,8 +2129,13 @@
 
   function buildPalette() {
     const pal = $('palette');
+    let group = null;
     Object.keys(TYPES).forEach((type) => {
       const t = TYPES[type];
+      if ((t.group || 'conv') !== group) {
+        group = t.group || 'conv';
+        if (group === 'data') pal.append(h('h3', { text: 'Find & update data', style: 'margin-top:14px' }));
+      }
       pal.append(h('button', {
         class: 'pal', draggable: true, style: '--c:' + t.color, title: 'Click to add, or drag onto the canvas',
         onclick: () => {
@@ -1463,10 +2161,14 @@
     const saved = loadSaved();
     let restored = false;
     if (saved && saved.flow) {
-      try { S.flow = checkShape(saved.flow); S.mocks = saved.mocks || {}; restored = true; } catch (e) { S.flow = null; }
+      try {
+        S.flow = checkShape(saved.flow); S.mocks = saved.mocks || {};
+        S.catalog = saved.catalog || null;
+        restored = true;
+      } catch (e) { S.flow = null; }
     }
     if (!S.flow) {
-      try { S.flow = checkShape(await fetch(SAMPLE_URL).then((r) => r.json())); }
+      try { S.flow = checkShape(await fetch(FLOWS_BASE + SAMPLES[0].file).then((r) => r.json())); }
       catch (e) { S.flow = blankFlow(); }
     }
     normalize();

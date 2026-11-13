@@ -28,7 +28,7 @@
 }
 
 .fcd {
-  position: relative; display: grid; grid-template-rows: auto 1fr;
+  position: relative; display: grid; grid-template-rows: auto 1fr; grid-template-columns: minmax(0, 1fr);
   height: var(--fcd-height, 80vh); min-height: 520px; overflow: hidden;
   background: var(--bg); color: var(--text);
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; text-align: left;
@@ -49,7 +49,8 @@
 .fcd .sep { width: 1px; height: 22px; background: var(--border); margin: 0 4px; }
 
 /* ---------- layout */
-.fcd .main { display: grid; grid-template-columns: 180px minmax(0, 1fr) 400px; min-height: 0; }
+.fcd .main { display: grid; grid-template-columns: 180px minmax(0, 1fr) 400px; min-height: 0; min-width: 0; }
+.fcd .tab-body { min-width: 0; }
 .fcd .palette { background: var(--panel); border-right: 1px solid var(--border); padding: 12px 10px; overflow: auto; }
 .fcd .palette h3, .fcd .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); margin: 0 0 8px; font-weight: 600; }
 .fcd .pal { display: flex; gap: 9px; align-items: flex-start; width: 100%; text-align: left; border: 1px solid var(--border); background: var(--panel-2);
@@ -110,7 +111,8 @@
 .fcd .quick button:hover { background: var(--chip); }
 
 /* ---------- side panel */
-.fcd .panel { background: var(--panel); border-left: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+.fcd .panel { background: var(--panel); border-left: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.fcd .tab-body > *, .fcd .card { min-width: 0; max-width: 100%; }
 .fcd .tabs { display: flex; border-bottom: 1px solid var(--border); padding: 0 8px; flex: none; }
 .fcd .tabs button { border: 0; background: none; padding: 10px 10px 9px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; border-radius: 0; font-size: 13px; display: flex; gap: 6px; align-items: center; }
 .fcd .tabs button.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 550; }
@@ -177,7 +179,8 @@
 .fcd .test-note { font-size: 12px; color: var(--muted); }
 .fcd .test-note.stale { color: var(--warn); }
 .fcd flow-chat.sim { --fc-height: 430px; --fc-radius: 12px; margin-bottom: 14px; }
-.fcd pre.state { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 9px; font-size: 11.5px; max-height: 200px; overflow: auto; margin: 0; color: var(--text); }
+.fcd pre.state { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 9px; font-size: 11.5px; max-height: 200px; overflow: auto; margin: 0; color: var(--text); max-width: 100%; }
+.fcd .mock pre.state { margin-top: 8px; max-height: 140px; font-size: 11px; }
 .fcd .mock textarea { font-family: var(--mono); font-size: 12px; min-height: 70px; }
 
 .fcd .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px); background: var(--text); color: var(--bg);
@@ -186,7 +189,7 @@
 
 @media (max-width: 1000px) {
   .fcd { height: auto; overflow: visible; grid-template-rows: auto auto; }
-  .fcd .main { grid-template-columns: 1fr; }
+  .fcd .main { grid-template-columns: minmax(0, 1fr); }
   .fcd .palette { border-right: 0; border-bottom: 1px solid var(--border); display: flex; gap: 6px; overflow-x: auto; padding: 8px; }
   .fcd .palette h3, .fcd .palette .tips { display: none; }
   .fcd .pal { width: auto; min-width: 120px; margin: 0; }

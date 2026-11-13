@@ -50,6 +50,29 @@ With the same server running, open <http://localhost:8765/designer/>.
   binding to get a warning whenever some path skips that field.
 - **Test:** runs the current draft in the built-in chat. Each connector returns an editable mock
   response, with presets such as Accept/Reject or Found/Not found.
+- **Search and update steps:** the palette's *Find & update data* group adds **Find record**,
+  **Change fields** and **Save changes**. Their editors use the Data tab's catalog:
+  - Search criteria can only use searchable fields, with each field's allowed operators.
+  - Result-card templates get field chips (masked fields are marked •).
+  - Field cards offer only updatable fields, with answer type, checks and an "only editable when…" lock.
+  - The Summary node gets a *Changes to a record* mode.
+- **Data tab:** the designer's copy of the server registry (`FC_DATA_SOURCES`). For each source it
+  holds the table, key, version column, row filter, fields (searchable, operators, updatable, mask)
+  and sample rows for testing.
+  - **Registration SQL** downloads the inserts that create the source on the server.
+  - **Import** and **Export** share a catalog as JSON.
+  - Catalog edits are saved with your draft, but aren't covered by Undo.
+- **Checklist for data steps:** flags, among other things:
+  - non-searchable criteria and disallowed operators,
+  - read-only fields offered for editing,
+  - unknown records or aliases and duplicate aliases,
+  - a search with no criteria,
+  - a Change fields step with no Save changes after it,
+  - a Save changes step whose conflict and error exits are both unconnected.
+- **Testing data steps:** the Test tab runs Find, Change and Save against the catalog's sample
+  rows, which reset on each restart. "Simulate another user editing the loaded record" bumps the
+  loaded record's version, so the next save takes the conflict path.
+- **Samples ▾** loads either sample flow (create or update).
 - **Save:** your draft autosaves in this browser. **Export JSON** downloads the definition.
   **Publish SQL** downloads a script that publishes it as a new version
   (`fc_engine.publish_flow`). **Open…** loads a `.json` file, and **JSON** lets you edit the raw definition.
@@ -61,7 +84,8 @@ Node positions are stored as `ui: {x, y}` on each node. Both engines ignore them
 ### Hosting the designer on an APEX page
 
 1. **Static Application Files:** upload `widget/flowchat-engine.js`, `widget/flowchat.js`,
-   `designer/designer.js` and `designer/designer.css`. Optionally upload `flows/loan_application.json` too.
+   `designer/designer.js` and `designer/designer.css`. Optionally upload `flows/loan_application.json`
+   and `flows/update_application.json` too, so the Samples menu works.
 2. **Page > CSS > File URLs:** `#APP_FILES#designer.css`
 3. **Page > JavaScript > File URLs**, in this order:
    ```
@@ -71,7 +95,7 @@ Node positions are stored as `ui: {x, y}` on each node. Both engines ignore them
    ```
 4. **A Static Content region** (template *Blank with Attributes* works best) whose source is just:
    ```html
-   <div id="fcd-root" data-sample-url="#APP_FILES#loan_application.json"
+   <div id="fcd-root" data-flows-base="#APP_FILES#"
         style="--fcd-height: calc(100vh - 140px)"></div>
    ```
    The script draws the whole designer into that div. Don't paste the markup from
@@ -258,8 +282,12 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 - **The PL/SQL (`FC_ENGINE`, `FC_DATA`) has not been compiled yet.** No Oracle instance was
   available when it was written. It mirrors the JavaScript engine rule for rule, but expect a
   small round of compile fixes on first install.
-- **The designer doesn't support the search/update nodes yet** (Phase B). It won't open
-  `update_application.json`; edit that flow as JSON for now.
+- **The designer's data source catalog is local** (Phase B). It isn't read from the database yet.
+  Keep it in step with `FC_DATA_SOURCES` through Registration SQL and Import/Export. Phase C will
+  load it from APEX and offer "create from table".
+- **Re-upload changed files:** after updating `designer.js` or `designer.css` in APEX, re-upload
+  them. APEX versions static file URLs, so browsers pick up the change. On a plain web server,
+  force-reload to avoid a cached copy.
 - The designer publishes through a downloaded SQL script. Saving directly to the database
   (an ORDS endpoint for drafts and versions) is the natural next step.
 - Not in Phase 1: resuming a conversation after a reload, line-item (repeat)
