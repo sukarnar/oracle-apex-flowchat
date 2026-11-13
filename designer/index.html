@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlowChat Designer</title>
+<link rel="stylesheet" href="designer.css">
+</head>
+<body>
+  <header class="bar">
+    <span class="brand">FlowChat Designer</span>
+    <span class="flow-title" id="flowTitle"></span>
+    <button class="tb" id="btnNew" title="Start an empty flow">New</button>
+    <button class="tb" id="btnOpen" title="Open a flow .json file">Open…</button>
+    <button class="tb" id="btnSample" title="Load the loan application sample">Sample</button>
+    <span class="sep"></span>
+    <button class="tb" id="btnUndo" title="Undo (Ctrl+Z)">Undo</button>
+    <button class="tb" id="btnRedo" title="Redo (Ctrl+Y)">Redo</button>
+    <button class="tb" id="btnLayout" title="Arrange nodes top to bottom">Auto-layout</button>
+    <span class="sep"></span>
+    <button class="tb" id="btnExport" title="Download the flow definition">Export JSON</button>
+    <button class="tb primary" id="btnPublish" title="Download a SQL script that publishes this flow to Oracle">Publish SQL</button>
+    <input type="file" id="fileInput" accept=".json,application/json" hidden>
+  </header>
+
+  <div class="main">
+    <aside class="palette" id="palette">
+      <h3>Add a step</h3>
+    </aside>
+
+    <section class="canvas" id="canvas" aria-label="Flow canvas">
+      <div class="world" id="world">
+        <svg class="edges" id="edges" aria-hidden="true">
+          <defs>
+            <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" style="fill: var(--edge)"></path>
+            </marker>
+            <marker id="arrSel" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" style="fill: var(--accent)"></path>
+            </marker>
+          </defs>
+          <g id="edgeLayer"></g>
+        </svg>
+        <div id="nodes"></div>
+      </div>
+      <div class="zoom">
+        <button id="zoomOut" title="Zoom out">−</button>
+        <span id="zoomLabel">100%</span>
+        <button id="zoomIn" title="Zoom in">+</button>
+        <button id="zoomFit" title="Fit to screen">⤢</button>
+      </div>
+    </section>
+
+    <aside class="panel">
+      <nav class="tabs" role="tablist">
+        <button data-tab="props" class="active" role="tab">Properties</button>
+        <button data-tab="check" role="tab">Checklist <span class="badge" id="probBadge">0</span></button>
+        <button data-tab="test" role="tab">Test</button>
+        <button data-tab="json" role="tab">JSON</button>
+      </nav>
+      <div class="tab-body" id="tab-props"></div>
+      <div class="tab-body" id="tab-check" hidden></div>
+      <div class="tab-body" id="tab-test" hidden>
+        <div class="test-bar">
+          <button class="btn primary" id="btnRunTest">Restart test</button>
+          <span class="test-note" id="testNote">Runs the current draft in your browser. Connectors return the mock responses below.</span>
+        </div>
+        <flow-chat class="sim" id="simChat" manual-start heading="Test run" subheading="Simulating the current draft"></flow-chat>
+        <h4 class="sub">Captured answers</h4>
+        <pre class="state" id="simState">{}</pre>
+        <h4 class="sub">Connector mocks</h4>
+        <div id="mocks"></div>
+      </div>
+      <div class="tab-body" id="tab-json" hidden>
+        <p class="pdesc">This is the definition the engine runs. You can edit it directly; click Apply to load your changes.</p>
+        <textarea class="in mono" id="jsonText" spellcheck="false" style="min-height: 60vh; font-size: 12px;"></textarea>
+        <div class="actions">
+          <button class="btn primary" id="btnApplyJson">Apply</button>
+          <button class="btn" id="btnCopyJson">Copy</button>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="../widget/flowchat-engine.js"></script>
+  <script src="../widget/flowchat.js"></script>
+  <script src="designer.js"></script>
+</body>
+</html>

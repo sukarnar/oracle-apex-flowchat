@@ -8,6 +8,7 @@ answer on the server, branches on the answers, and fills the page's existing for
 ```
 flows/      loan_application.json   sample flow (the "program")
             flow.schema.json        JSON Schema for flow definitions (for the future designer / CI)
+designer/   index.html              visual flow designer (no dependencies)
 widget/     flowchat.js             <flow-chat> Web Component + transports + adapters (no dependencies)
             flowchat-engine.js      reference engine in JS (demo, simulator, Node backends)
 db/         install.sql             runs 01..05 in order (06 ORDS is optional)
@@ -27,6 +28,28 @@ tools/      build-seed.js           flow JSON -> SQL publish script
 python -m http.server 8765
 ```
 Then open <http://localhost:8765/demo/>. The flow is fetched over HTTP, so opening the file directly won't work.
+
+## 1b. Design flows visually
+
+With the same server running, open <http://localhost:8765/designer/>.
+
+- **Build:** click or drag steps from the palette. Drag a node's bottom dot onto another node to
+  connect them; drop it on empty canvas to add a connected step there. Select a node to edit it
+  in **Properties**: question, answer type, limits, choice options, extra checks, form binding
+  (APEX item / DOM selector), branch conditions and connections.
+- **Checklist:** lists errors and warnings (unconnected steps, missing connectors, unknown
+  `{{fields}}`, invalid patterns, unreachable nodes). Its field table shows whether each field is
+  asked on **every path, some paths, or none** before submit. Tick "Required on the form" on a
+  binding to get a warning whenever some path skips that field.
+- **Test:** runs the current draft in the built-in chat. Each connector returns an editable mock
+  response, with presets such as Accept/Reject or Found/Not found.
+- **Save:** your draft autosaves in this browser. **Export JSON** downloads the definition.
+  **Publish SQL** downloads a script that publishes it as a new version
+  (`fc_engine.publish_flow`). **Open…** loads a `.json` file, and **JSON** lets you edit the raw definition.
+- Renaming a field (slot) updates every condition, `{{placeholder}}`, summary list and binding in
+  the flow. It does **not** update your PL/SQL connectors, which read slots by name.
+
+Node positions are stored as `ui: {x, y}` on each node. Both engines ignore them.
 
 ## 2. Install in Oracle
 
@@ -146,7 +169,9 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 - **The PL/SQL engine has not been compiled yet.** No Oracle instance was available when it was
   written. It mirrors the JavaScript engine rule for rule, but expect a small round of compile
   fixes on first install.
-- Not in Phase 1: the visual designer, resuming a conversation after a reload, line-item (repeat)
+- The designer publishes through a downloaded SQL script. Saving directly to the database
+  (an ORDS endpoint for drafts and versions) is the natural next step.
+- Not in Phase 1: resuming a conversation after a reload, line-item (repeat)
   nodes, file uploads, LLM extraction from free text, PII masking in `FC_EVENTS`, and a
   packaged APEX region plugin. The Static Content region approach above is the stand-in for the plugin.
 - When an edit replays the flow, lookups are not re-run. For example, if you change the email,

@@ -16,7 +16,8 @@
         "type": "object",
         "properties": {
           "apex": { "type": "string", "description": "APEX page item name, e.g. P10_EMAIL" },
-          "dom":  { "type": "string", "description": "CSS selector of an input/select/checkbox" }
+          "dom":  { "type": "string", "description": "CSS selector of an input/select/checkbox" },
+          "required": { "type": "boolean", "description": "Designer hint: warn if some path to submit skips this field" }
         },
         "additionalProperties": { "type": "string" }
       }
@@ -29,7 +30,11 @@
     "node": {
       "type": "object",
       "required": ["id", "type"],
-      "properties": { "id": { "$ref": "#/$defs/id" } },
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "ui": { "type": "object", "description": "Designer canvas position; ignored by the engines",
+                "properties": { "x": { "type": "number" }, "y": { "type": "number" } } }
+      },
       "oneOf": [
         { "$ref": "#/$defs/message" }, { "$ref": "#/$defs/ask" }, { "$ref": "#/$defs/condition" },
         { "$ref": "#/$defs/lookup" },  { "$ref": "#/$defs/summary" }, { "$ref": "#/$defs/submit" },
