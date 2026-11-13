@@ -1,5 +1,7 @@
 # FlowChat: conversational forms driven by a flow definition (Phase 1)
 
+**Author:** Sukarna Chinchod
+
 A chat widget you can drop into any page. It asks the questions defined in a flow, validates every
 answer on the server, branches on the answers, and fills the page's existing form as it goes.
 
