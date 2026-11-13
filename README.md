@@ -12,9 +12,11 @@ flows/      loan_application.json    sample "create" flow (collect answers, subm
 designer/   index.html               visual flow designer (no dependencies)
 widget/     flowchat.js              <flow-chat> Web Component + transports + adapters (no dependencies)
             flowchat-engine.js       reference engine in JS (demo, simulator, Node backends)
-db/         install.sql              runs 01..07 and 09 in order (08 ORDS is optional)
+db/         install.sql              first-time install: runs 01..07 and 09 in order (08 ORDS is optional)
+            reinstall_packages.sql   re-creates FC_DATA, FC_ENGINE, FC_DESIGNER only (upgrades, compile fixes)
             01_tables.sql            FC_FLOWS, FC_FLOW_VERSIONS, FC_CONNECTORS, FC_SESSIONS, FC_EVENTS
-            02_data_sources.sql      FC_DATA_SOURCES (+ fields) registry and the FC_DATA package
+            02_data_sources.sql      FC_DATA_SOURCES (+ fields) registry tables
+            02b_fc_data.sql          FC_DATA package (search / get / update); re-runnable
             03/04_fc_engine.*        PL/SQL engine (server-authoritative)
             05_demo_connectors.sql   sample lookup / validator / submit connectors + demo tables
             06_demo_data_source.sql  exposes the demo table as the "loan_apps" data source

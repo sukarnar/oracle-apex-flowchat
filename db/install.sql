@@ -7,8 +7,10 @@ whenever sqlerror exit failure rollback
 
 prompt == Repository and runtime tables
 @@01_tables.sql
-prompt == Data source registry + FC_DATA (search / get / update)
+prompt == Data source registry
 @@02_data_sources.sql
+prompt == FC_DATA (search / get / update)
+@@02b_fc_data.sql
 show errors package body fc_data
 prompt == Engine
 @@03_fc_engine.pks
