@@ -12,7 +12,7 @@
   function boot() {
 
   // ======================================================================== constants
-  const VERSION = '1.5.0 (phase D: verify step, lookup lists)';
+  const VERSION = '1.5.1 (phase D: verify step, lookup lists)';
   const NODE_W = 230;
   const STORE_KEY = 'flowchat-designer:v1';
 
@@ -1434,7 +1434,33 @@
     return wrap;
   }
 
+  // Re-reads FC_LOVS (lists inserted after the designer loaded). Quiet unless opts.toast.
+  let lovReloadAt = 0;
+  async function reloadLovs(opts) {
+    if (!BACKEND) return;
+    lovReloadAt = Date.now();
+    try { S.dbLovs = (await BACKEND.call('listLovs')) || []; } catch (e) {
+      if (opts && opts.toast) toast('Could not read FC_LOVS: ' + e.message, 7000);
+      return;
+    }
+    renderProps();
+    renderCheck();
+    if (opts && opts.toast) toast(S.dbLovs.length + ' lookup list(s) in FC_LOVS (enabled ones only).');
+  }
+
   function lovInput(get, set, key) {
+    if (BACKEND && S.dbLovs) {
+      // Database mode: pick from the lists registered in FC_LOVS (a datalist would hide every entry
+      // that doesn't match the text already in the box).
+      const cur = get() || '';
+      const opts = [['', '— choose a list —']];
+      S.dbLovs.forEach((l) => opts.push([l.id, l.id + (l.description ? ' — ' + l.description : '')]));
+      if (cur && !dbLov(cur)) opts.push([cur, cur + ' (not in FC_LOVS)']);
+      const el = sel(opts, cur, (v) => mutate(() => set(v), { panel: true }), { mono: true });
+      el.classList.add('grow');
+      return h('div', { class: 'rowx' }, el,
+        h('button', { class: 'x', title: 'Reload lists from FC_LOVS', text: '↻', onclick: () => reloadLovs({ toast: true }) }));
+    }
     const listId = 'fcd-lovlist';
     let dl = document.getElementById(listId);
     if (!dl) { dl = h('datalist', { id: listId }); ROOT.append(dl); }
@@ -2332,6 +2358,7 @@
       S.dbConnectors = res[1] || [];
       // Older FC_DESIGNER packages have no listLovs: then lookup lists simply aren't checked.
       try { S.dbLovs = (await BACKEND.call('listLovs')) || []; } catch (e) { S.dbLovs = null; }
+      lovReloadAt = Date.now();
       save();
       renderCanvas();
       renderCheck();
@@ -2883,6 +2910,8 @@
     if (BACKEND) {
       renderDbStatus();
       await loadDbMeta();
+      // Coming back from SQL Workshop (or any other tab): pick up lists added to FC_LOVS meanwhile.
+      window.addEventListener('focus', () => { if (S.dbLovs && Date.now() - lovReloadAt > 5000) reloadLovs(); });
       if (!restored) openDialog();
     } else if (window.apex && window.apex.server) {
       // On an APEX page but database mode is off: say why Save draft / Publish are missing.

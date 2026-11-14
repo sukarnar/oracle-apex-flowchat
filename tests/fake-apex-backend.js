@@ -256,6 +256,13 @@
     log: [],
     get db() { return load(); },
     reset: function () { localStorage.removeItem(KEY); seedPromise = null; return ready(); },
+    // Like an INSERT into FC_LOVS from SQL Workshop while the designer is open.
+    addLov: function (lov) {
+      return ready().then(function (db) {
+        db.lovs = (db.lovs || []).filter(function (l) { return l.id !== lov.id; }).concat([lov]);
+        store(db);
+      });
+    },
     otherDesignerSaves: function (flowId) {
       return ready().then(function () {
         var db = load(), f = db.flows[flowId];
