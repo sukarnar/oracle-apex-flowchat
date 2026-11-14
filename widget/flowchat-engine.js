@@ -28,6 +28,10 @@
  *   fn returns (or resolves to) [{value, label}]   (at most 500 are used)
  * Lists are fetched again on every turn (never cached across turns), so they are always current.
  * A list whose parameters aren't all answered yet has no options.
+ *
+ * Signed-in user: options.appUser (a string, or fn({sessionId, flowId}) -> string) is available to
+ * prompts and conditions as the built-in {{app_user}}. Set it from your server's authentication,
+ * never from the browser. A slot or context value named app_user never overrides it.
  */
 (function (global) {
   'use strict';
@@ -228,6 +232,8 @@
       fields: fields,
       rows: rows,
       search: function (req) {
+        // Same rule as FC_DATA: no criteria is only allowed when a row filter limits the rows.
+        if (!(req.criteria || []).length && !def.rowFilter) throw new Error('A search with no criteria needs a row filter on the data source.');
         return rows.filter(function (r) { return visible(r, req) && req.criteria.every(function (c) { return match(r, c); }); })
           .slice(0, req.limit || 50)
           .map(function (r) { return { key: r[keyField], values: values(r, true) }; });
@@ -348,6 +354,7 @@
     function touch(ctx, slot) { if (ctx.updates.indexOf(slot) < 0) ctx.updates.push(slot); }
 
     // Slots plus "alias.field" for every loaded record: what placeholders and conditions see.
+    // Plus the built-in app_user (the signed-in user), which no slot or context value can override.
     function view(ctx) {
       var v = Object.assign({}, ctx.st.slots);
       var recs = ctx.st.records;
@@ -355,7 +362,13 @@
         var cur = recs[a].current || {};
         Object.keys(cur).forEach(function (f) { v[a + '.' + f] = cur[f]; });
       });
+      v.app_user = appUserOf(ctx);
       return v;
+    }
+    function appUserOf(ctx) {
+      var u = typeof options.appUser === 'function'
+        ? options.appUser({ sessionId: ctx.sid, flowId: ctx.flow.flowId }) : options.appUser;
+      return isFilled(u) ? String(u) : null;
     }
 
     function seedContext(ctx) {
@@ -538,11 +551,12 @@
         say(ctx, 'error', "I can't look that up until it has been verified.");
         return failed(ctx);
       }
-      (node.criteria || []).forEach(function (c) {
+      // byRowFilter: no criteria; the data source's row filter (e.g. owner = :APP_USER) picks the rows.
+      if (!node.byRowFilter) (node.criteria || []).forEach(function (c) {
         var val = v[c.slot];
         if (isFilled(val)) criteria.push({ field: c.field, op: c.op || 'eq', value: val });
       });
-      if (criteria.length < (node.minCriteria || 1)) {
+      if (!node.byRowFilter && criteria.length < (node.minCriteria || 1)) {
         say(ctx, 'text', interpolate(prompts.none || "I couldn't find a matching record.", v));
         return node.notFound;
       }

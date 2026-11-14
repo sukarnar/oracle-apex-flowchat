@@ -78,6 +78,7 @@
           "properties": { "field": { "type": "string" }, "op": { "enum": ["eq", "starts", "contains", "gte", "lte"] },
                           "slot": { "type": "string" }, "optional": { "type": "boolean" } } } },
         "minCriteria": { "type": "integer", "minimum": 1, "default": 1 },
+        "byRowFilter": { "type": "boolean", "default": false, "description": "No criteria: the data source's row filter alone picks the rows (e.g. the signed-in user's records via :APP_USER). Refused by the server if the source has no row filter" },
         "requireVerified": { "type": "string", "description": "Slot that must have passed a Verify step with its current value; otherwise the search is refused" },
         "maxResults": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 },
         "autoPick": { "type": "boolean", "default": true, "description": "Load directly when exactly one record matches" },
@@ -89,7 +90,8 @@
         "found": { "$ref": "#/$defs/id" }, "notFound": { "$ref": "#/$defs/id" },
         "tooMany": { "$ref": "#/$defs/id" }, "cancelled": { "$ref": "#/$defs/id" }
       },
-      "required": ["source", "as", "criteria", "found"]
+      "required": ["source", "as", "found"],
+      "anyOf": [{ "required": ["criteria"] }, { "required": ["byRowFilter"], "properties": { "byRowFilter": { "const": true } } }]
     },
 
     "changeFields": {

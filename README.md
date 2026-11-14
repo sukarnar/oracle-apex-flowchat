@@ -38,6 +38,8 @@ tests/      engine.test.js           node tests/engine.test.js
             update.test.js           node tests/update.test.js
             verify.test.js           node tests/verify.test.js
             lov.test.js              node tests/lov.test.js
+            mine.test.js             node tests/mine.test.js (Find record by row filter only)
+            appuser.test.js          node tests/appuser.test.js (built-in {{app_user}})
             apex-embed-test.html     designer inside a page-wide form, like APEX
             apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
             fake-apex-backend.js     emulates the FC_DESIGNER Ajax protocol in the browser (testing only)
@@ -257,6 +259,12 @@ reference is in `flows/flow.schema.json`, and `flows/loan_application.json` uses
   payload to a URL.
 - **Context:** values passed at start (the `context` attribute) whose names match a slot
   pre-fill that slot.
+- **Signed-in user:** `{{app_user}}` is built in and works in any message, prompt or condition
+  (`{"slot": "app_user", "op": "=", "value": "ADMIN"}`) with no field or binding. In APEX, FC_ENGINE
+  fills it from the APEX session (`APP_USER`), so the browser can't change it. A slot or context value
+  named `app_user` never overrides it, and the designer reserves the name. With the JavaScript engine,
+  pass `createEngine({ appUser: 'JSMITH' })` (or a function) from your server's authentication. The
+  designer's Test tab uses your own APEX user, or `TEST_USER` outside APEX.
 
 ### Lookup lists (choice options from the database)
 
@@ -338,6 +346,14 @@ defines in `FC_DATA_SOURCES` and `FC_DATA_SOURCE_FIELDS` (see `db/06_demo_data_s
   - Several matches show result cards to pick from (`card.title` and `card.subtitle` use the row's masked values).
   - More than `maxResults` matches goes to `tooMany`.
   - The loaded record's fields are then available as `{{as.field}}`, in conditions, and in bindings such as `"app.phone": {...}`.
+  - **The signed-in user's records** (`"byRowFilter": true`, no `criteria`): nothing is asked; the data
+    source's `row_filter` alone picks the rows, for example `upper(t.username) = upper(:APP_USER)`.
+    `:APP_USER` is bound by the database from the APEX session, so the browser can't change whose
+    records are found. One row loads straight away; several show the pick cards; none goes to
+    `notFound`. The server refuses a search with no criteria on a source without a row filter, so it
+    can never return the whole table. A PL/SQL source's search function is called with empty
+    `criteria` and must limit the rows itself (`appUser` is in the payload). In the designer: Find record
+    → **Find: The signed-in user's records**.
 - **changeFields**: shows the record's current values and a chip for each field. The user edits any
   number of fields, and each one is validated exactly like an Ask (`input`, `validators`). Use
   `editableWhen` to lock a field conditionally, for example the amount once the status isn't `NEW`.
@@ -430,8 +446,9 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 35 unit tests (`tests/engine.test.js`,
-  `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`), plus manual end-to-end runs of the demos.
+- The JavaScript engine and widget are tested: 45 unit tests (`tests/engine.test.js`,
+  `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
+  `tests/appuser.test.js`), plus manual end-to-end runs of the demos.
 - **The Phase D PL/SQL (Verify step and lookup lists in `FC_ENGINE`, `FC_DATA`, `FC_DESIGNER`,
   `02c_lovs.sql`, `10_verify_demo.sql`, `12_lov_demo.sql`) has not been compiled yet.** It mirrors the
   JavaScript engine, which is tested. Expect possible small compile fixes when you run `upgrade_phase_d.sql`.

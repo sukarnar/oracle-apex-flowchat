@@ -248,8 +248,10 @@ create or replace package body fc_data as
       end if;
       add_bind(l_binds, 'c' || i, l_val);
     end loop;
-    if l_where is null then
-      raise_application_error(-20042, 'A search needs at least one criterion.');
+    -- No criteria is only allowed when the source's row filter limits the rows (e.g. to :APP_USER),
+    -- so a search can never return the whole table.
+    if l_where is null and l_src.row_filter is null then
+      raise_application_error(-20042, 'A search with no criteria needs a row filter on data source "' || p_source || '".');
     end if;
 
     l_sql := 'select to_char(t.' || dbms_assert.simple_sql_name(l_src.key_column) || '), ' || values_expr(l_fields) ||

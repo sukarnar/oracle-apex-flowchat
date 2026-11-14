@@ -163,6 +163,8 @@ create or replace package body fc_engine as
   end input_spec;
 
   -- Slots plus "alias.field" for every loaded record: what placeholders and conditions see.
+  -- Plus the built-in app_user: the signed-in APEX user, read from the APEX session on the
+  -- server, so no slot, context value or browser request can override it.
   function vals (c in out nocopy t_ctx) return json_object_t is
     l_v     json_object_t := copy(c.slots);
     l_alias json_key_list := c.records.get_keys;
@@ -182,6 +184,7 @@ create or replace package body fc_engine as
         end if;
       end loop;
     end if;
+    l_v.put('app_user', coalesce(sys_context('APEX$SESSION', 'APP_USER'), user));
     return l_v;
   end vals;
 
@@ -866,6 +869,10 @@ create or replace package body fc_engine as
       add_msg(c, 'error', 'I can''t look that up until it has been verified.');
       return failed(c);
     end if;
+    -- byRowFilter: no criteria; the data source's row filter (e.g. owner = :APP_USER) picks the rows.
+    if nvl(str(p_node, 'byRowFilter'), 'false') = 'true' then
+      l_cdef := json_array_t();
+    end if;
     for i in 0 .. l_cdef.get_size - 1 loop
       l_cd  := treat(l_cdef.get(i) as json_object_t);
       l_val := str(l_v, str(l_cd, 'slot'));
@@ -877,7 +884,7 @@ create or replace package body fc_engine as
         l_crit.append(l_c);
       end if;
     end loop;
-    if l_crit.get_size < nvl(to_num(str(p_node, 'minCriteria')), 1) then
+    if nvl(str(p_node, 'byRowFilter'), 'false') <> 'true' and l_crit.get_size < nvl(to_num(str(p_node, 'minCriteria')), 1) then
       add_msg(c, 'text', interpolate(nvl(str(l_prompts, 'none'), c_not_found), l_v));
       return str(p_node, 'notFound');
     end if;

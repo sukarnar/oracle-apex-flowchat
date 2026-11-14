@@ -12,8 +12,9 @@
   function boot() {
 
   // ======================================================================== constants
-  const VERSION = '1.5.2 (phase D: verify step, lookup lists)';
+  const VERSION = '1.6.0 (phase D: verify step, lookup lists)';
   const NODE_W = 230;
+  const BUILTIN_USER = 'app_user';   // {{app_user}}: the signed-in user, filled in by the server
   const STORE_KEY = 'flowchat-designer:v1';
 
   // The designer mounts into <div id="fcd-root" class="fcd"></div> (standalone page or APEX region).
@@ -633,13 +634,17 @@
     if (!byId(f.start)) add('error', 'The flow has no valid start node.');
 
     const slots = knownSlots();
+    if (slots.indexOf(BUILTIN_USER) >= 0) {
+      add('error', 'A field is named "' + BUILTIN_USER + '", which is reserved for the signed-in user. Rename it.',
+        (f.nodes.find((n) => n.slot === BUILTIN_USER) || {}).id);
+    }
     const als = aliases();
-    const placeholders = (text, nodeId) => {
+    const placeholders =(text, nodeId) => {
       String(text || '').replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_, k) => {
         const dot = k.indexOf('.');
         // alias.field of a source missing from the catalog can't be checked; only flag unknown aliases then
         const unchecked = dot > 0 && als.indexOf(k.slice(0, dot)) >= 0 && !sourceDef(sourceForAlias(k.slice(0, dot)));
-        if (slots.indexOf(k) < 0 && !unchecked) add('warning', '{{' + k + '}} is not a known field.', nodeId);
+        if (slots.indexOf(k) < 0 && !unchecked && k !== BUILTIN_USER) add('warning', '{{' + k + '}} is not a known field.', nodeId);
         return _;
       });
     };
@@ -733,10 +738,22 @@
         }
         case 'findRecord': {
           const src = sourceDef(n.source);
-          const crit = n.criteria || [];
+          const crit = n.byRowFilter ? [] : (n.criteria || []);
+          const rf = String((src && src.rowFilter) || '');
+          if (n.byRowFilter && src) {
+            if (src.sourceType === 'PLSQL') {
+              add('warning', 'Data source "' + n.source + '" is PL/SQL: its search function gets no criteria and must limit the rows to the user itself (appUser in the payload).', n.id);
+            } else if (!rf.trim()) {
+              add('error', 'Data source "' + n.source + '" has no row filter, so it can\'t find "the signed-in user\'s records". Set one in the Data tab, e.g. upper(t.username) = upper(:APP_USER).', n.id);
+            } else if (!/:(APP_USER|FC_VERIFIED)\b/i.test(rf)) {
+              add('warning', 'The row filter of "' + n.source + '" doesn\'t use :APP_USER or :FC_VERIFIED, so every user gets the same records.', n.id);
+            }
+          }
           if (n.requireVerified) {
             if (verifiedSlots().indexOf(n.requireVerified) < 0) add('error', 'No Verify step checks "' + n.requireVerified + '".', n.id);
-            else if (!crit.some((c) => c.slot === n.requireVerified && (c.op || 'eq') === 'eq' && !c.optional)) {
+            else if (n.byRowFilter) {
+              if (src && src.sourceType !== 'PLSQL' && rf.trim() && !/:FC_VERIFIED\b/i.test(rf)) add('error', 'The row filter of "' + n.source + '" must use :FC_VERIFIED, so the records are limited to the verified identity.', n.id);
+            } else if (!crit.some((c) => c.slot === n.requireVerified && (c.op || 'eq') === 'eq' && !c.optional)) {
               add('error', 'Add a required "equals" criterion on "' + n.requireVerified + '", so the search is limited to the verified identity.', n.id);
             }
           } else if (verifiedSlots().length) {
@@ -746,7 +763,7 @@
           else if (!src) add('warning', 'Data source "' + n.source + '" is not in the designer catalog, so its fields can\'t be checked. Add it in the Data tab.', n.id);
           if (!/^[a-z][a-z0-9_]{0,49}$/.test(n.as || '')) add('error', 'Record alias must use lowercase letters, digits and _.', n.id);
           else if (findNodes().filter((x) => x.as === n.as).length > 1) add('error', 'Another Find record already uses the alias "' + n.as + '".', n.id);
-          if (!crit.length) add('error', 'Find record has no search criteria.', n.id);
+          if (!crit.length && !n.byRowFilter) add('error', 'Find record has no search criteria. Add one, or choose "The signed-in user\'s records".', n.id);
           crit.forEach((c) => {
             if (!c.field || !c.slot) { add('error', 'A search criterion is incomplete.', n.id); return; }
             const sf = sourceField(n.source, c.field);
@@ -1212,11 +1229,11 @@
   }
 
   function slotChips(target) {
-    const slots = knownSlots();
-    if (!slots.length) return null;
+    const slots = knownSlots().filter((s) => s !== BUILTIN_USER).concat([BUILTIN_USER]);
     return h('div', { class: 'chips-ins', title: 'Insert a captured answer' },
       slots.map((s) => h('button', {
         type: 'button', text: '{{' + s + '}}',
+        title: s === BUILTIN_USER ? 'The signed-in APEX user (APP_USER), filled in by the server' : null,
         onclick: () => {
           const pos = target.selectionStart != null ? target.selectionStart : target.value.length;
           target.value = target.value.slice(0, pos) + '{{' + s + '}}' + target.value.slice(target.selectionEnd || pos);
@@ -1579,7 +1596,7 @@
 
   function condEditor(n) {
     const wrap = h('div');
-    const slots = knownSlots();
+    const slots = knownSlots().filter((s) => s !== BUILTIN_USER).concat([BUILTIN_USER]);
     (n.branches || []).forEach((b, i) => {
       const card = h('div', { class: 'card' });
       const parsed = parseWhen(b.when);
@@ -1739,13 +1756,29 @@
     wrap.append(h('p', { class: 'hint' }, 'Loaded fields are available as ', h('code', { text: '{{' + (n.as || 'alias') + '.field}}' }),
       ' and in conditions. ', h('button', { class: 'lnk', text: 'Manage data sources →', onclick: () => setTab('data') })));
 
-    // criteria
-    wrap.append(h('h4', { class: 'sub', text: 'Search criteria' }));
+    // which records: criteria, or the source's row filter alone (e.g. the signed-in user\'s records)
+    wrap.append(h('h4', { class: 'sub', text: 'Which records' }));
+    wrap.append(F('Find', sel([['criteria', 'Records matching search criteria'], ['mine', 'The signed-in user\'s records (row filter only)']],
+      n.byRowFilter ? 'mine' : 'criteria', (v) => mutate(() => {
+        if (v === 'mine') { n.byRowFilter = true; delete n.criteria; delete n.minCriteria; }
+        else { delete n.byRowFilter; n.criteria = n.criteria || []; }
+      }, { panel: true }))));
+    if (n.byRowFilter) {
+      const rf = String((src && src.rowFilter) || '').trim();
+      wrap.append(h('p', { class: 'hint' + (src && !rf && src.sourceType !== 'PLSQL' ? ' warn' : '') },
+        !src ? 'Choose a data source. Its row filter decides which records are found; no questions are asked.'
+          : src.sourceType === 'PLSQL' ? 'PL/SQL source: its search function is called with no criteria and must return only the user\'s records.'
+          : rf ? h('span', null, 'No questions are asked. Found: the rows of ' + n.source + ' where ', h('code', { text: rf }),
+                 '. :APP_USER is the signed-in APEX user, bound by the database.')
+          : 'This data source has no row filter yet, so it can\'t be used this way. Add one in the Data tab, e.g. upper(t.username) = upper(:APP_USER).'));
+      if (src && rf) wrap.append(h('p', { class: 'hint', text: 'In the Test tab the sample rows stand in for the user\'s rows.' }));
+    }
     const crit = n.criteria || [];
     const searchable = src ? src.fields.filter((f) => f.searchable) : [];
     const asks = askSlots();
-    if (src && !searchable.length) wrap.append(h('p', { class: 'hint', text: 'No field of ' + n.source + ' is searchable. Mark some in the Data tab.' }));
-    crit.forEach((c, i) => {
+    if (!n.byRowFilter) wrap.append(h('h4', { class: 'sub', text: 'Search criteria' }));
+    if (!n.byRowFilter && src && !searchable.length) wrap.append(h('p', { class: 'hint', text: 'No field of ' + n.source + ' is searchable. Mark some in the Data tab.' }));
+    if (!n.byRowFilter) crit.forEach((c, i) => {
       const fOpts = [['', 'field…']].concat((src ? searchable : []).map((f) => [f.field, f.field]));
       if (c.field && !fOpts.some((o) => o[0] === c.field)) fOpts.push([c.field, c.field + (src ? ' (not searchable)' : '')]);
       const sf = sourceField(n.source, c.field);
@@ -1761,7 +1794,7 @@
           h('button', { class: 'x', text: '×', title: 'Remove', onclick: () => mutate(() => crit.splice(i, 1), { panel: true }) })),
         checkbox('Optional: skip it when the answer is empty', c.optional, (ch) => mutate(() => setOrDelete(c, 'optional', ch || null)))));
     });
-    wrap.append(h('button', { class: 'lnk', text: '+ Add criterion', onclick: () => mutate(() => {
+    if (!n.byRowFilter) wrap.append(h('button', { class: 'lnk', text: '+ Add criterion', onclick: () => mutate(() => {
       n.criteria = crit;
       const used = crit.map((c) => c.field);
       const nextField = searchable.find((f) => used.indexOf(f.field) < 0) || searchable[0];
@@ -1770,6 +1803,7 @@
     wrap.append(h('div', { class: 'grid2', style: 'margin-top:10px' },
       F('Max results', bound(() => n.maxResults, (v) => setOrDelete(n, 'maxResults', numOrNull(v)), { type: 'number', key: n.id + '.maxr', placeholder: '10' }),
         'More matches go to "too many".'),
+      n.byRowFilter ? h('span') :
       F('Min criteria', bound(() => n.minCriteria, (v) => setOrDelete(n, 'minCriteria', numOrNull(v)), { type: 'number', key: n.id + '.minc', placeholder: '1' }),
         'Fewer filled criteria = not found.')));
     wrap.append(checkbox('Load directly when exactly one record matches', n.autoPick !== false, (ch) => mutate(() => setOrDelete(n, 'autoPick', ch ? null : false))));
@@ -1975,6 +2009,7 @@
       const v = newIn.value.trim();
       if (!/^[a-z][a-z0-9_]{0,99}$/.test(v)) { toast('Field names: lowercase letters, digits and _.'); return; }
       if (all.indexOf(v) >= 0) { toast('That field already exists.'); return; }
+      if (v === BUILTIN_USER) { toast('{{' + BUILTIN_USER + '}} is built in: it is always the signed-in user, so it needs no field.'); return; }
       mutate(() => { f.bindings[v] = { dom: '#' + v }; }, { panel: true });
     } })));
     const nodesN = f.nodes.length, asks = askSlots().length;
@@ -2155,7 +2190,9 @@
         if (src.versionColumn && row._version == null) row._version = 1;
         return row;
       });
-      testSources[id] = FlowChatEngine.createMemorySource({ rows, key: '_key', versionField: src.versionColumn ? '_version' : null, fields });
+      testSources[id] = FlowChatEngine.createMemorySource({ rows, key: '_key', versionField: src.versionColumn ? '_version' : null, fields,
+        // The row filter is SQL and can't run here: the sample rows stand in for the rows it would return.
+        rowFilter: String(src.rowFilter || '').trim() || src.sourceType === 'PLSQL' ? () => true : null });
     });
     return testSources;
   }
@@ -2206,7 +2243,9 @@
         return res;
       };
     });
-    testEngine = FlowChatEngine.createEngine({ flows: [flow], connectors, dataSources: buildTestSources(), lovs: buildTestLovs() });
+    // {{app_user}}: the designer's own APEX user when it runs inside APEX, else a stand-in.
+    const appUser = (window.apex && apex.env && apex.env.APP_USER) || 'TEST_USER';
+    testEngine = FlowChatEngine.createEngine({ flows: [flow], connectors, dataSources: buildTestSources(), lovs: buildTestLovs(), appUser });
     const chat = $('simChat');
     chat.setAttribute('flow', flow.flowId || 'draft');
     chat.configure({ transport: new FlowChat.LocalTransport(testEngine), adapter: new FlowChat.NoneAdapter() });
