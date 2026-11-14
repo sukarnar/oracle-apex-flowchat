@@ -188,6 +188,7 @@
     lovOptions: function (db, p) {
       var l = (db.lovs || []).find(function (x) { return x.id === p.id; });
       if (!l) fail('error', 'Unknown or disabled lookup list "' + p.id + '".');
+      if (l.rows) return clone(l.rows);   // test-only: fixed options for a list added by FakeApex.addLov
       var fn = window.FlowChatDemoLovs && window.FlowChatDemoLovs[p.id];
       return fn ? fn({ lov: p.id, params: p.params || {} }) : [];
     }
@@ -262,6 +263,9 @@
         db.lovs = (db.lovs || []).filter(function (l) { return l.id !== lov.id; }).concat([lov]);
         store(db);
       });
+    },
+    removeLov: function (id) {
+      return ready().then(function (db) { db.lovs = (db.lovs || []).filter(function (l) { return l.id !== id; }); store(db); });
     },
     otherDesignerSaves: function (flowId) {
       return ready().then(function () {

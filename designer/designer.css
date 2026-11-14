@@ -222,3 +222,4 @@
   .fcd .flow-title { max-width: 100%; order: 10; flex-basis: 100%; }
 }
 @media (prefers-reduced-motion: reduce) { .fcd * { transition: none !important; } }
+.fcd .hint.warn { color: var(--warn); }

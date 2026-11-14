@@ -12,7 +12,7 @@
   function boot() {
 
   // ======================================================================== constants
-  const VERSION = '1.5.1 (phase D: verify step, lookup lists)';
+  const VERSION = '1.5.2 (phase D: verify step, lookup lists)';
   const NODE_W = 230;
   const STORE_KEY = 'flowchat-designer:v1';
 
@@ -1435,16 +1435,18 @@
   }
 
   // Re-reads FC_LOVS (lists inserted after the designer loaded). Quiet unless opts.toast.
-  let lovReloadAt = 0;
+  let lovReloadAt = 0, lovError = null;
   async function reloadLovs(opts) {
     if (!BACKEND) return;
     lovReloadAt = Date.now();
-    try { S.dbLovs = (await BACKEND.call('listLovs')) || []; } catch (e) {
+    try { S.dbLovs = (await BACKEND.call('listLovs')) || []; lovError = null; } catch (e) {
+      lovError = e.message;
       if (opts && opts.toast) toast('Could not read FC_LOVS: ' + e.message, 7000);
       return;
     }
-    renderProps();
+    if (!(opts && opts.quiet)) renderProps();
     renderCheck();
+    if (S.tab === 'test') renderMocks();
     if (opts && opts.toast) toast(S.dbLovs.length + ' lookup list(s) in FC_LOVS (enabled ones only).');
   }
 
@@ -2044,6 +2046,10 @@
       if (lovLive(id)) {
         card.append(h('p', { class: 'hint', text: 'Options come from FC_LOVS in the database (read only).' }));
       } else {
+        if (BACKEND) card.append(h('p', { class: 'hint warn', text: !S.dbLovs
+          ? 'The designer could not read FC_LOVS' + (lovError ? ' (' + lovError + ')' : '') + '. Check that FC_DESIGNER compiled. Until then the test uses the options below only if you edit them.'
+          : 'Not in FC_LOVS (or not enabled). The test stops with an error unless you edit the options below.' }));
+        card.append(h('button', { class: 'lnk', text: '↻ Reload from FC_LOVS', onclick: () => reloadLovs({ toast: true }) }));
         const ta = h('textarea', { class: 'in', rows: 5, spellcheck: 'false' });
         ta.value = lovMockText(id);
         const check = () => {
@@ -2166,8 +2172,16 @@
   function buildTestLovs() {
     const out = {};
     Object.keys(lovUses()).forEach((id) => {
-      out[id] = (req) => {
+      out[id] = async (req) => {
+        if (BACKEND && !dbLov(id)) await reloadLovs({ quiet: true });   // added to FC_LOVS since the designer loaded?
         if (lovLive(id)) return BACKEND.call('lovOptions', { id, params: req.params });
+        if (BACKEND && S.mocks[lovMockKey(id)] === undefined) {
+          // Don't pretend: a list the database can't serve would fail the same way at runtime.
+          if (!S.dbLovs) throw new Error('The designer could not read FC_LOVS' + (lovError ? ' (' + lovError + ')' : '') +
+            '. Check that the FC_DESIGNER package compiled, or set test options for "' + id + '" in the Test tab.');
+          throw new Error('Lookup list "' + id + '" is not in FC_LOVS, or is not enabled. Ids are case-sensitive; the database has: ' +
+            (S.dbLovs.map((l) => l.id).join(', ') || 'none') + '.');
+        }
         let rows;
         try { rows = JSON.parse(lovMockText(id)); } catch (e) { throw new Error('The test options for "' + id + '" are not valid JSON.'); }
         if (!Array.isArray(rows)) throw new Error('The test options for "' + id + '" must be a JSON array.');
@@ -2357,7 +2371,7 @@
       });
       S.dbConnectors = res[1] || [];
       // Older FC_DESIGNER packages have no listLovs: then lookup lists simply aren't checked.
-      try { S.dbLovs = (await BACKEND.call('listLovs')) || []; } catch (e) { S.dbLovs = null; }
+      try { S.dbLovs = (await BACKEND.call('listLovs')) || []; lovError = null; } catch (e) { S.dbLovs = null; lovError = e.message; }
       lovReloadAt = Date.now();
       save();
       renderCanvas();
