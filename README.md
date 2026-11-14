@@ -256,7 +256,9 @@ reference is in `flows/flow.schema.json`, and `flows/loan_application.json` uses
 - **Connectors** are registered in `FC_CONNECTORS` and have the signature
   `function f(p_payload clob) return clob`. A validator returns `{valid,message}`, a lookup returns
   `{found,slots,message}`, and a submit returns `{ok,slots,message}`. Type `REST` POSTs the same
-  payload to a URL.
+  payload to a URL. The payload is `{sessionId, flowId, nodeId, slots, context, appUser}` (plus
+  `slot` and `value` for validators and lookups). `appUser` is the signed-in user, set by the server
+  from the APEX session, so a connector can trust it; `context` comes from the page and can't be trusted.
 - **Context:** values passed at start (the `context` attribute) whose names match a slot
   pre-fill that slot.
 - **Signed-in user:** `{{app_user}}` is built in and works in any message, prompt or condition
@@ -446,7 +448,7 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 45 unit tests (`tests/engine.test.js`,
+- The JavaScript engine and widget are tested: 46 unit tests (`tests/engine.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`), plus manual end-to-end runs of the demos.
 - **The Phase D PL/SQL (Verify step and lookup lists in `FC_ENGINE`, `FC_DATA`, `FC_DESIGNER`,

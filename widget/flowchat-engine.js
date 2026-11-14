@@ -31,7 +31,8 @@
  *
  * Signed-in user: options.appUser (a string, or fn({sessionId, flowId}) -> string) is available to
  * prompts and conditions as the built-in {{app_user}}. Set it from your server's authentication,
- * never from the browser. A slot or context value named app_user never overrides it.
+ * never from the browser. A slot or context value named app_user never overrides it. Every
+ * connector payload also carries it as appUser (null when not configured).
  */
 (function (global) {
   'use strict';
@@ -387,7 +388,8 @@
       var fn = connectors[name];
       if (!fn) return Promise.reject(new Error('Unknown connector "' + name + '"'));
       var payload = Object.assign({ sessionId: ctx.sid, flowId: ctx.flow.flowId,
-                                    slots: clone(ctx.st.slots), context: clone(ctx.st.context) }, extra);
+                                    slots: clone(ctx.st.slots), context: clone(ctx.st.context) }, extra,
+                                  { appUser: appUserOf(ctx) });   // last: server-set, never overridden
       return Promise.resolve(fn(payload)).then(function (r) { return r || {}; });
     }
 

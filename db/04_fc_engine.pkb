@@ -300,6 +300,8 @@ create or replace package body fc_engine as
     l.put('flowId', str(c.flow, 'flowId'));
     l.put('nodeId', p_node_id);
     l.put('slots', c.slots);
+    -- The signed-in user, from the APEX session (not from the browser), for REST and PL/SQL connectors.
+    l.put('appUser', coalesce(sys_context('APEX$SESSION', 'APP_USER'), user));
     if c.state.has('context') then l.put('context', c.state.get_object('context')); end if;
     if p_slot is not null then l.put('slot', p_slot); end if;
     if p_value is not null then l.put('value', p_value); end if;

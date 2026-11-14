@@ -52,5 +52,30 @@ const texts = (t) => t.messages.map((m) => m.text || '').join(' | ');
     const t = await eng.start('hello', {});
     assert.match(texts(t), /Welcome, \./);
   });
+  await test('connector payloads carry appUser, which context cannot override', async () => {
+    const seen = [];
+    const lflow = {
+      flowId: 'lk', start: 'ask', bindings: { app_user: { dom: '#u' } },
+      nodes: [
+        { id: 'ask', type: 'ask', slot: 'emp', prompt: 'Employee?', input: { kind: 'text' },
+          validators: [{ type: 'server', connector: 'check_emp' }], next: 'look' },
+        { id: 'look', type: 'lookup', connector: 'lookup_employee', next: 'done' },
+        { id: 'done', type: 'end', text: 'ok' }
+      ]
+    };
+    const eng = FC.createEngine({ flows: [lflow], appUser: 'JSMITH', connectors: {
+      check_emp: (p) => { seen.push(p); return { valid: true }; },
+      lookup_employee: (p) => { seen.push(p); return { found: true }; } } });
+    const t = await eng.start('lk', { app_user: 'ADMIN', appUser: 'ADMIN' });
+    await eng.input(t.sessionId, { value: 'E1' });
+    assert.ok(seen.length >= 2, 'both connectors called');
+    seen.forEach((p) => assert.strictEqual(p.appUser, 'JSMITH'));
+    const none = FC.createEngine({ flows: [lflow], connectors: { check_emp: (p) => { seen.push(p); return { valid: true }; },
+      lookup_employee: (p) => { seen.push(p); return { found: true }; } } });
+    seen.length = 0;
+    const t2 = await none.start('lk', {});
+    await none.input(t2.sessionId, { value: 'E1' });
+    seen.forEach((p) => assert.strictEqual(p.appUser, null));
+  });
   console.log(passed + ' passed');
 })();
