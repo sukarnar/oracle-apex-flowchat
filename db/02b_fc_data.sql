@@ -254,10 +254,13 @@ create or replace package body fc_data as
       raise_application_error(-20042, 'A search with no criteria needs a row filter on data source "' || p_source || '".');
     end if;
 
-    l_sql := 'select to_char(t.' || dbms_assert.simple_sql_name(l_src.key_column) || '), ' || values_expr(l_fields) ||
+    -- Aliased columns and ROWNUM (not FETCH FIRST): the row-limiting rewrite can lose unaliased
+    -- long select expressions, which DBMS_SQL reports as ORA-01007 on the second column.
+    l_sql := 'select to_char(t.' || dbms_assert.simple_sql_name(l_src.key_column) || ') fc_key, ' ||
+             values_expr(l_fields) || ' fc_vals' ||
              ' from ' || dbms_assert.qualified_sql_name(l_src.object_name) || ' t where 1 = 1' ||
              l_where || filter_sql(l_src) ||
-             ' fetch first ' || to_char(greatest(1, least(nvl(p_limit, 50), 200))) || ' rows only';
+             ' and rownum <= ' || to_char(greatest(1, least(nvl(p_limit, 50), 200)));
 
     l_cur := dbms_sql.open_cursor;
     begin
@@ -385,12 +388,12 @@ create or replace package body fc_data as
     load_source(p_source, l_src, l_fields);
     if l_src.source_type <> 'TABLE' then return l_out; end if;
 
-    l_sql := 'select to_char(t.' || dbms_assert.simple_sql_name(l_src.key_column) || '), ' ||
+    l_sql := 'select to_char(t.' || dbms_assert.simple_sql_name(l_src.key_column) || ') fc_key, ' ||
              case when l_src.version_column is not null
-                  then 'to_char(t.' || dbms_assert.simple_sql_name(l_src.version_column) || ')' else 'null' end || ', ' ||
-             values_expr(l_fields) ||
+                  then 'to_char(t.' || dbms_assert.simple_sql_name(l_src.version_column) || ')' else 'null' end || ' fc_ver, ' ||
+             values_expr(l_fields) || ' fc_vals' ||
              ' from ' || dbms_assert.qualified_sql_name(l_src.object_name) || ' t where 1 = 1' || filter_sql(l_src) ||
-             ' fetch first ' || to_char(greatest(1, least(nvl(p_limit, 20), 100))) || ' rows only';
+             ' and rownum <= ' || to_char(greatest(1, least(nvl(p_limit, 20), 100)));
 
     l_cur := dbms_sql.open_cursor;
     begin
@@ -442,10 +445,10 @@ create or replace package body fc_data as
       return json_object_t.parse(l_out);
     end if;
 
-    l_sql := 'select ' || values_expr(l_fields) || ', ' ||
+    l_sql := 'select ' || values_expr(l_fields) || ' fc_vals, ' ||
              case when l_src.version_column is not null
                   then 'to_char(t.' || dbms_assert.simple_sql_name(l_src.version_column) || ')'
-                  else 'null' end ||
+                  else 'null' end || ' fc_ver' ||
              ' from ' || dbms_assert.qualified_sql_name(l_src.object_name) || ' t' ||
              ' where t.' || dbms_assert.simple_sql_name(l_src.key_column) || ' = :k' || filter_sql(l_src);
     add_bind(l_binds, 'k', p_key);
