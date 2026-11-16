@@ -69,5 +69,23 @@ const flow = {
     assert.deepStrictEqual(got.slots, { channel: 'chat', source_page: 'P5' });
     assert.strictEqual(got.context.page, 'P5');
   });
+  await test('search criteria can use context values, Set values and app_user', async () => {
+    let crit = null;
+    const src = { search: (q) => { crit = q.criteria; return []; }, get: () => null };
+    const f = { flowId: 'fc', start: 's', nodes: [
+      { id: 's', type: 'set', assign: [{ slot: 'status', value: 'OPEN' }], next: 'find' },
+      { id: 'find', type: 'findRecord', source: 'emps', as: 'emp', criteria: [
+          { field: 'emp_id', op: 'eq', slot: 'context.emp_id' },
+          { field: 'status', op: 'eq', slot: 'status' },
+          { field: 'owner', op: 'eq', slot: 'app_user' }],
+        next: 'e', notFound: 'e' },
+      { id: 'e', type: 'end', text: 'ok' }] };
+    const eng = FC.createEngine({ flows: [f], appUser: 'JSMITH', dataSources: { emps: src } });
+    await eng.start('fc', { emp_id: 'E-42' });
+    assert.deepStrictEqual(crit, [
+      { field: 'emp_id', op: 'eq', value: 'E-42' },
+      { field: 'status', op: 'eq', value: 'OPEN' },
+      { field: 'owner', op: 'eq', value: 'JSMITH' }]);
+  });
   console.log(passed + ' passed');
 })();

@@ -1,0 +1,26 @@
+<!doctype html>
+<!-- Context check: shows which context values reach a flow. Serve the flowchat folder over HTTP
+     (python -m http.server) and open /demo/ctx-check.html. Runs the JS engine in the browser, no database. -->
+<html><head><meta charset="utf-8"><title>Context check</title></head>
+<body>
+  <input id="P10_DEPT" value="Finance">
+  <input id="P10_EMP_ID" value="E-42">
+  <input id="P10_REGION" value="West">
+  <flow-chat id="chat" flow="ctx_check" transport="local" adapter="dom"
+             context="dept:#P10_DEPT, emp_id:#P10_EMP_ID,region:#P10_REGION" manual-start></flow-chat>
+  <script src="../widget/flowchat-engine.js"></script>
+  <script src="../widget/flowchat.js"></script>
+  <script>
+    // dept and emp_id are declared, so they also fill the fields {{dept}} and {{emp_id}};
+    // region is not declared, so it is only readable as {{context.region}}.
+    const flow = { flowId: 'ctx_check', version: 1, start: 'm', context: ['dept', 'emp_id'], nodes: [
+      { id: 'm', type: 'message', text: 'dept={{context.dept}} emp={{context.emp_id}} region={{context.region}} | slots: {{dept}} {{emp_id}}', next: 'e' },
+      { id: 'e', type: 'end', text: 'done' } ] };
+    customElements.whenDefined('flow-chat').then(() => {
+      const engine = FlowChatEngine.createEngine({ flows: [flow] });
+      const chat = document.getElementById('chat');
+      chat.configure({ transport: new FlowChat.LocalTransport(engine) });
+      chat.start();
+    });
+  </script>
+</body></html>

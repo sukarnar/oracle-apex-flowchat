@@ -585,7 +585,7 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 64 unit tests (`tests/engine.test.js`,
+- The JavaScript engine and widget are tested: 65 unit tests (`tests/engine.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`), plus manual end-to-end runs of the demos.
 - **The Phase E PL/SQL (`FC_ENGINE`, `01_tables.sql`, `upgrade_phase_e.sql`, `14_seed_expense_flow.sql`)

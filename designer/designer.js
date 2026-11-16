@@ -378,6 +378,13 @@
     S.flow.nodes.forEach((n) => { if (n.type === 'set') (n.assign || []).forEach((a) => { if (a.slot && out.indexOf(a.slot) < 0) out.push(a.slot); }); });
     return out;
   }
+  // Values a search criterion can use: answers, Set values, context values, other records' fields
+  // and the signed-in user (never the node's own record, which isn't loaded yet).
+  function critValues(n) {
+    const own = (n && n.as) ? n.as + '.' : null;
+    return knownSlots().filter((x) => !(own && x.indexOf(own) === 0)).concat([BUILTIN_USER])
+      .filter((x, i, a) => a.indexOf(x) === i);
+  }
   function knownSlots() {
     const s = askSlots();
     setSlots().concat(contextNames()).forEach((k) => { if (s.indexOf(k) < 0) s.push(k); });
@@ -879,7 +886,10 @@
             else if (sf && String(sf.ops || 'eq').split(',').map((s) => s.trim()).indexOf(c.op || 'eq') < 0) {
               add('error', '"' + c.field + '" does not allow the "' + (c.op || 'eq') + '" search.', n.id);
             }
-            if (askSlots().indexOf(c.slot) < 0) add('warning', 'Criterion uses "' + c.slot + '", which is never asked.', n.id);
+            if (critValues(n).indexOf(c.slot) < 0) {
+              add('warning', 'Criterion uses "' + c.slot + '", which the flow never sets' +
+                (/^context\./.test(c.slot) ? ' (declare it under Context variables in flow settings).' : '.'), n.id);
+            }
           });
           if (crit.length && crit.every((c) => c.optional)) add('warning', 'Every criterion is optional; with no answers the search goes straight to "not found".', n.id);
           Object.keys(n.prompts || {}).forEach((k) => placeholders(String(n.prompts[k]).replace(/\{\{\s*count\s*\}\}/g, ''), n.id));
@@ -1909,6 +1919,7 @@
     const crit = n.criteria || [];
     const searchable = src ? src.fields.filter((f) => f.searchable) : [];
     const asks = askSlots();
+    const values = critValues(n);
     if (!n.byRowFilter) wrap.append(h('h4', { class: 'sub', text: 'Search criteria' }));
     if (!n.byRowFilter && src && !searchable.length) wrap.append(h('p', { class: 'hint', text: 'No field of ' + n.source + ' is searchable. Mark some in the Data tab.' }));
     if (!n.byRowFilter) crit.forEach((c, i) => {
@@ -1917,21 +1928,22 @@
       const sf = sourceField(n.source, c.field);
       const allowed = sf ? String(sf.ops || 'eq').split(',').map((s) => s.trim()) : SEARCH_OPS.map((o) => o[0]);
       const opOpts = SEARCH_OPS.filter((o) => allowed.indexOf(o[0]) >= 0 || o[0] === (c.op || 'eq'));
-      const slotOpts = [['', 'answer…']].concat(asks.map((s) => [s, s]));
-      if (c.slot && asks.indexOf(c.slot) < 0) slotOpts.push([c.slot, c.slot + ' (not asked)']);
+      const slotOpts = [['', 'value…']].concat(values.map((s) => [s, s]));
+      if (c.slot && values.indexOf(c.slot) < 0) slotOpts.push([c.slot, c.slot + ' (not set by this flow)']);
       wrap.append(h('div', { class: 'card' },
         h('div', { class: 'rowx' },
           sel(fOpts, c.field || '', (v) => mutate(() => { c.field = v; }, { panel: true }), { mono: true }),
           sel(opOpts, c.op || 'eq', (v) => mutate(() => { if (v === 'eq') delete c.op; else c.op = v; })),
           sel(slotOpts, c.slot || '', (v) => mutate(() => { c.slot = v; }), { mono: true }),
           h('button', { class: 'x', text: '×', title: 'Remove', onclick: () => mutate(() => crit.splice(i, 1), { panel: true }) })),
-        checkbox('Optional: skip it when the answer is empty', c.optional, (ch) => mutate(() => setOrDelete(c, 'optional', ch || null)))));
+        checkbox('Optional: skip it when the value is empty', c.optional, (ch) => mutate(() => setOrDelete(c, 'optional', ch || null)))));
     });
     if (!n.byRowFilter) wrap.append(h('button', { class: 'lnk', text: '+ Add criterion', onclick: () => mutate(() => {
       n.criteria = crit;
       const used = crit.map((c) => c.field);
       const nextField = searchable.find((f) => used.indexOf(f.field) < 0) || searchable[0];
-      crit.push({ field: nextField ? nextField.field : '', op: 'eq', slot: asks.find((s) => nextField && s === nextField.field) || asks[0] || '' });
+      crit.push({ field: nextField ? nextField.field : '', op: 'eq',
+        slot: values.find((s) => nextField && (s === nextField.field || s === 'context.' + nextField.field)) || asks[0] || '' });
     }, { panel: true }) }));
     wrap.append(h('div', { class: 'grid2', style: 'margin-top:10px' },
       F('Max results', bound(() => n.maxResults, (v) => setOrDelete(n, 'maxResults', numOrNull(v)), { type: 'number', key: n.id + '.maxr', placeholder: '10' }),
@@ -2179,7 +2191,7 @@
     if (!n.byRowFilter) {
       const crit = n.criteria || [];
       const fOpts = [['', 'field…']].concat((src ? src.fields.filter((x) => x.searchable) : []).map((x) => [x.field, x.field]));
-      const sOpts = [['', 'answer…']].concat(knownSlots().map((x) => [x, x]));
+      const sOpts = [['', 'value…']].concat(critValues(n).map((x) => [x, x]));
       crit.forEach((c, i) => {
         wrap.append(h('div', { class: 'rowx' },
           sel(fOpts.concat(c.field && !fOpts.some((o) => o[0] === c.field) ? [[c.field, c.field]] : []), c.field || '', (v) => mutate(() => { c.field = v; }), { mono: true }),
@@ -2391,11 +2403,15 @@
       h('p', { class: 'hint', text: 'Is each field asked on every path to ' + cv.goal + '? (' + cv.paths + ' path' + (cv.paths === 1 ? '' : 's') + ' analysed)' }));
     const tbl = h('table', { class: 'cov' }, h('tr', null, h('th', { text: 'Field' }), h('th', { text: 'Asked in' }), h('th', { text: 'Coverage' }), h('th', { text: 'Bound to' })));
     const counts = repeatNodes().map((n) => n.slot + '.count');
+    const setBy = setSlots(), ctxNames = contextNames();
     knownSlots().filter((s) => counts.indexOf(s) < 0).forEach((s) => {
       const askers = S.flow.nodes.filter((n) => (n.type === 'ask' || n.type === 'repeat') && n.slot === s).map((n) => n.id);
       const b = S.flow.bindings[s] || {};
       const c = cv.cov[s];
       const label = askers.length ? (c === 'always' ? 'every path' : c === 'sometimes' ? 'some paths' : 'unreachable')
+        : /^context\./.test(s) ? 'page context'
+        : setBy.indexOf(s) >= 0 ? 'Set values'
+        : ctxNames.indexOf(s) >= 0 ? 'page context'
         : (s.indexOf('.') > 0 ? 'from record' : 'set by connector');
       tbl.append(h('tr', null,
         h('td', { class: 'mono' }, s, b.required ? h('span', { title: 'Required on form', text: ' *' }) : null),
