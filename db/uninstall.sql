@@ -20,3 +20,5 @@ drop table fc_sessions purge;
 drop table fc_connectors purge;
 drop table fc_flow_versions purge;
 drop table fc_flows purge;
+
+exit

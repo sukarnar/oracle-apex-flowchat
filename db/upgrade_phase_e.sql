@@ -47,3 +47,5 @@ prompt == Sample flow expense_claim (Repeat, file answer, PII, debug)
 @@14_seed_expense_flow.sql
 
 prompt == Done. Debug rows:  select * from fc_events where direction = 'DBG' order by event_id desc;
+
+exit

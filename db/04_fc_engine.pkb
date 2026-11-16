@@ -2825,7 +2825,7 @@ create or replace package body fc_engine as
     l_type := lower(substr(nvl(str(p_file, 'mimeType'), 'application/octet-stream'), 1, 100));
     l_ext  := lower(regexp_substr(l_name, '\.[^.]+$'));
 
-    -- "accept": [".pdf", "image/*"] or ".pdf,image/*"
+    -- "accept": [".pdf", "image/<star>"] or ".pdf,image/<star>"  (<star> = an asterisk: any subtype)
     if p_spec.has('accept') then
       if p_spec.get('accept').is_array then
         l_arr := p_spec.get_array('accept');
@@ -2843,7 +2843,7 @@ create or replace package body fc_engine as
         if l_list is null then l_ok := false; end if;     -- there is a list: the file must match it
         l_list := l_list || case when l_list is not null then ', ' end || l_a;
         if (substr(l_a, 1, 1) = '.' and l_a = l_ext)
-           or (l_a like '%/*' and l_type like substr(l_a, 1, length(l_a) - 1) || '%')
+           or (substr(l_a, -2) = '/' || chr(42) and l_type like substr(l_a, 1, length(l_a) - 1) || '%')
            or l_a = l_type then
           l_ok := true;
         end if;

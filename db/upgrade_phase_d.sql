@@ -19,3 +19,5 @@ prompt == Lookup list demo (countries, branches)
 prompt == Sample flow loan_application (now asks for a country and a branch)
 @@13_seed_loan_flow.sql
 prompt == Done. Read the codes the demo "sends" with:  select * from fc_demo_outbox order by msg_id desc;
+
+exit

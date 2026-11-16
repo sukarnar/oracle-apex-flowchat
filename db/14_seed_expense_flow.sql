@@ -190,7 +190,7 @@ begin
         "kind": "file",
         "accept": [
           ".pdf",
-          "image/*"
+          "image/\u002a"
         ],
         "maxSizeKb": 5120
       },

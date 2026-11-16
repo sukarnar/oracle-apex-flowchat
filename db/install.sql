@@ -40,3 +40,5 @@ prompt == Phase E demo: expense_claim (line items, file answer, PII, debug)
 -- Optional REST API for non-APEX pages:
 -- @@08_ords_module.sql
 prompt == Done
+
+exit
