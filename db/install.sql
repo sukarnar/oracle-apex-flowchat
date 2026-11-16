@@ -33,6 +33,10 @@ prompt == Sample flow update_application_public
 @@11_seed_public_flow.sql
 prompt == Lookup list demo (countries, branches)
 @@12_lov_demo.sql
+prompt == Sample flow loan_application (country and branch lookup lists)
+@@13_seed_loan_flow.sql
+prompt == Phase E demo: expense_claim (line items, file answer, PII, debug)
+@@14_seed_expense_flow.sql
 -- Optional REST API for non-APEX pages:
 -- @@08_ords_module.sql
 prompt == Done

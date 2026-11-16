@@ -33,6 +33,26 @@
  * prompts and conditions as the built-in {{app_user}}. Set it from your server's authentication,
  * never from the browser. A slot or context value named app_user never overrides it. Every
  * connector payload also carries it as appUser (null when not configured).
+ *
+ * Versions: every registered definition is kept by flowId and version. start(flowId, context,
+ * {version: 3}) pins that version; without it the most recently registered definition is used.
+ *
+ * Debug: a flow with "debug": true (or options.debug / options.onDebug) reports each step, branch,
+ * connector call and search to options.onDebug(event) (console.debug when no callback is given).
+ * Events are masked like the database's FC_EVENTS rows: values of PII answers are redacted and
+ * one-time codes and file contents never appear.
+ *
+ * PII: "pii": true (or "last4") on an Ask node, a Change fields field or a Repeat field, or the
+ * flow's "piiSlots": [...], marks values that logs must never show in clear.
+ *
+ * Resume: input {command: "resume"} repeats the current question without changing anything, and
+ * re-sends every value as a field update (used by the widget after a page reload).
+ *
+ * Repeat (line items), Bulk update and File answers: see the node types "repeat" and
+ * "bulkUpdate" and the input kind "file". Uploaded files go to options.files =
+ * { save({sessionId, flowId, slot, name, mimeType, size, data}) -> id, remove({sessionId, fileId}) }
+ * (default: kept in memory, read them with engine.getFile(sessionId, fileId)). A file answer's
+ * slot value is {id, name, size, mimeType}; the content never travels in the session state.
  */
 (function (global) {
   'use strict';
@@ -93,16 +113,30 @@
     return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d ? isoDate(dt) : null;
   }
 
+  // A value as placeholder text: a list (Repeat) shows its count, a file its name.
+  function textOf(v) {
+    if (!isFilled(v)) return '';
+    if (Array.isArray(v)) return String(v.length);
+    if (typeof v === 'object') return isFilled(v.name) ? String(v.name) : JSON.stringify(v);
+    return String(v);
+  }
+
   // {{slot}} and {{record.field}} placeholders.
   function interpolate(text, values) {
     return String(text == null ? '' : text).replace(/\{\{\s*([\w.]+)\s*\}\}/g, function (_, k) {
-      return isFilled(values[k]) ? String(values[k]) : '';
+      return textOf(values[k]);
     });
+  }
+
+  function fileSize(n) {
+    n = Number(n) || 0;
+    return n < 1048576 ? Math.max(1, Math.round(n / 1024)) + ' KB' : (Math.round(n / 104857.6) / 10) + ' MB';
   }
 
   function displayFor(spec, v) {
     if (!isFilled(v)) return '';
     spec = spec || {};
+    if (spec.kind === 'file') return typeof v === 'object' ? (v.name || 'file') + ' (' + fileSize(v.size) + ')' : String(v);
     switch (spec.kind) {
       case 'number': return (spec.prefix || '') + formatNumber(v);
       case 'yesno': return v === 'Y' ? 'Yes' : v === 'N' ? 'No' : String(v);
@@ -155,9 +189,60 @@
         if (['y', 'yes', 'true', 'yeah', 'yep', 'sure', 'ok'].indexOf(t) >= 0) return { value: 'Y' };
         if (['n', 'no', 'false', 'nope'].indexOf(t) >= 0) return { value: 'N' };
         return { error: spec.parseMessage || 'Please answer yes or no.' };
+      case 'file':
+        return { error: spec.parseMessage || 'Please attach a file.' };
       default:
         return { value: s };
     }
+  }
+
+  // ---------------------------------------------------------------- files
+  var MAX_FILE_KB = 20480;
+  function acceptList(accept) {
+    var a = Array.isArray(accept) ? accept : String(accept || '').split(',');
+    return a.map(function (x) { return String(x).trim().toLowerCase(); }).filter(Boolean);
+  }
+  function acceptOk(accept, name, type) {
+    var list = acceptList(accept);
+    if (!list.length) return true;
+    var ext = (String(name).toLowerCase().match(/\.[^.]+$/) || [''])[0];
+    return list.some(function (a) {
+      if (a.charAt(0) === '.') return a === ext;
+      if (/\/\*$/.test(a)) return type.indexOf(a.slice(0, -1)) === 0;
+      return a === type;
+    });
+  }
+  // {name, mimeType, size, data(base64)} from the browser -> {value: {name, size, mimeType}, data} or {error}.
+  // The size is the decoded size; the type check uses the extension and the declared type
+  // (the browser can lie about both, so a connector that stores files should scan them).
+  function parseFile(spec, f) {
+    spec = spec || {};
+    if (!f || typeof f !== 'object' || !isFilled(f.data)) return { value: null };
+    var data = String(f.data).replace(/\s+/g, '');
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(data) || data.length % 4 === 1) return { error: 'That file could not be read. Please try again.' };
+    var size = Math.floor(data.length * 3 / 4) - (/==$/.test(data) ? 2 : /=$/.test(data) ? 1 : 0);
+    var maxKb = Math.min(Number(spec.maxSizeKb) || 5120, MAX_FILE_KB);
+    if (size <= 0) return { error: 'That file is empty.' };
+    if (size > maxKb * 1024) return { error: spec.sizeMessage || 'That file is too big. The limit is ' + fileSize(maxKb * 1024) + '.' };
+    var name = String(f.name || 'file').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(-200);
+    var type = String(f.mimeType || '').toLowerCase().slice(0, 100) || 'application/octet-stream';
+    if (!acceptOk(spec.accept, name, type)) {
+      return { error: spec.typeMessage || 'Please attach one of these file types: ' + acceptList(spec.accept).join(', ') + '.' };
+    }
+    return { value: { name: name, size: size, mimeType: type }, data: data };
+  }
+
+  // ---------------------------------------------------------------- PII masking
+  // Replaces every PII value (as it appears inside JSON text) with a mask.
+  function maskJsonText(text, pairs) {
+    var out = String(text);
+    pairs.slice().sort(function (a, b) { return b.v.length - a.v.length; }).forEach(function (p) {
+      var esc = JSON.stringify(p.v).slice(1, -1);
+      if (esc.length < 3) return;
+      var m = p.mode === 'last4' ? '••••' + p.v.slice(-4) : '[redacted]';
+      out = out.split(esc).join(m);
+    });
+    return out;
   }
 
   // ---------------------------------------------------------------- conditions
@@ -271,33 +356,136 @@
     var dataSources = Object.assign({}, options.dataSources);
     var lovs = Object.assign({}, options.lovs);
     var sessions = new Map();
+    var versions = {};                 // "flowId@version" -> definition
+    var memFiles = new Map();          // default file store: id -> {sessionId, name, size, mimeType, data}
 
-    function registerFlow(def) { flows[def.flowId] = clone(def); delete compiled[def.flowId]; }
+    function registerFlow(def) {
+      var d = clone(def);
+      flows[d.flowId] = d;             // the default: most recently registered
+      versions[d.flowId + '@' + (d.version || 1)] = d;
+      Object.keys(compiled).forEach(function (k) { if (k === d.flowId || k.indexOf(d.flowId + '@') === 0) delete compiled[k]; });
+    }
     function registerConnector(name, fn) { connectors[name] = fn; }
     function registerDataSource(name, src) { dataSources[name] = src; }
     function registerLov(name, fn) { lovs[name] = fn; }
     (options.flows || []).forEach(registerFlow);
 
-    function compile(flowId) {
-      if (compiled[flowId]) return compiled[flowId];
-      var flow = flows[flowId];
-      if (!flow) throw new Error('Unknown flow "' + flowId + '"');
-      var nodes = {}, slotNodes = {}, changeNodes = {}, findNodes = {};
+    // key = flowId (default definition) or "flowId@version" (a pinned version)
+    function compile(key) {
+      if (compiled[key]) return compiled[key];
+      var flow = key.indexOf('@') > 0 ? versions[key] : flows[key];
+      if (!flow) throw new Error('Unknown flow "' + key + '"');
+      var nodes = {}, slotNodes = {}, changeNodes = {}, findNodes = {}, repeatNodes = [];
       flow.nodes.forEach(function (n) {
         nodes[n.id] = n;
-        if (n.type === 'ask' && !slotNodes[n.slot]) slotNodes[n.slot] = n;
+        if ((n.type === 'ask' || n.type === 'repeat') && !slotNodes[n.slot]) slotNodes[n.slot] = n;
+        if (n.type === 'repeat') repeatNodes.push(n);
         if (n.type === 'changeFields' && !changeNodes[n.record]) changeNodes[n.record] = n;
         if (n.type === 'findRecord' && !findNodes[n.as]) findNodes[n.as] = n;
       });
-      return (compiled[flowId] = { flow: flow, nodes: nodes, slotNodes: slotNodes, changeNodes: changeNodes, findNodes: findNodes });
+      return (compiled[key] = { flow: flow, nodes: nodes, slotNodes: slotNodes, changeNodes: changeNodes,
+                                findNodes: findNodes, repeatNodes: repeatNodes });
     }
 
     function makeCtx(sid, st) {
-      var c = compile(st.flowId);
+      var c = compile(st.flowKey || st.flowId);
       st.records = st.records || {};
       st.results = st.results || {};
+      st.repeat = st.repeat || {};
+      st.bulk = st.bulk || {};
       return { sid: sid, st: st, flow: c.flow, nodes: c.nodes, slotNodes: c.slotNodes, changeNodes: c.changeNodes,
-               findNodes: c.findNodes, out: [], updates: [], replay: false, forceAsk: null, lovCache: {} };
+               findNodes: c.findNodes, repeatNodes: c.repeatNodes, out: [], updates: [], replay: false, forceAsk: null, lovCache: {} };
+    }
+
+    // ---- PII and debug
+    // [{v, mode}] for every value that logs must never show: PII answers, PII record fields and
+    // PII line-item fields, plus the flow's piiSlots.
+    function piiPairs(ctx) {
+      var out = [], st = ctx.st;
+      function add(v, mode) {
+        if (!isFilled(v)) return;
+        if (typeof v === 'object') { if (isFilled(v.name)) out.push({ v: String(v.name), mode: 'full' }); return; }
+        out.push({ v: String(v), mode: mode === 'last4' ? 'last4' : 'full' });
+      }
+      (ctx.flow.piiSlots || []).forEach(function (s) { add(st.slots[s], 'full'); });
+      ctx.flow.nodes.forEach(function (n) {
+        if (n.type === 'ask' && n.pii) add(st.slots[n.slot], n.pii);
+        if (n.type === 'changeFields' && st.records[n.record]) {
+          (n.fields || []).forEach(function (f) {
+            if (!f.pii) return;
+            add(st.records[n.record].current[f.field], f.pii);
+            add(st.records[n.record].original[f.field], f.pii);
+          });
+        }
+        if (n.type === 'repeat') {
+          var items = Array.isArray(st.slots[n.slot]) ? st.slots[n.slot] : [];
+          var draft = (st.repeat[n.id] || {}).draft || {};
+          (n.fields || []).forEach(function (f) {
+            if (!f.pii) return;
+            items.forEach(function (it) { add(it[f.field], f.pii); });
+            add(draft[f.field], f.pii);
+          });
+        }
+      });
+      return out;
+    }
+    function maskForLog(ctx, obj) {
+      var pairs = piiPairs(ctx);
+      return pairs.length ? JSON.parse(maskJsonText(JSON.stringify(obj), pairs)) : clone(obj);
+    }
+    // Is the value the user is answering right now a PII value?
+    function currentIsPii(ctx) {
+      var st = ctx.st, n = ctx.nodes[st.current];
+      if (!n) return false;
+      if (n.type === 'ask') return !!n.pii || (ctx.flow.piiSlots || []).indexOf(n.slot) >= 0;
+      if (n.type === 'changeFields' && st.editingField) { var f = fieldDef(n, st.editingField); return !!(f && f.pii); }
+      if (n.type === 'repeat' && st.repeat[n.id]) { var rf = (n.fields || [])[st.repeat[n.id].field]; return !!(rf && rf.pii); }
+      return false;
+    }
+    // The input as logs may show it: no one-time codes, no file contents, PII answers redacted.
+    function inputForLog(ctx, payload) {
+      var p = clone(payload) || {}, n = ctx.nodes[ctx.st.current];
+      if (n && n.type === 'verify' && 'value' in p) p.value = '(one-time code, not logged)';
+      if (p.file && typeof p.file === 'object') p.file = { name: p.file.name, mimeType: p.file.mimeType, data: '(file content, not logged)' };
+      if ('value' in p && currentIsPii(ctx)) p.value = '[redacted]';
+      if (p.file && currentIsPii(ctx)) p.file.name = '[redacted]';
+      return maskForLog(ctx, p);
+    }
+    function debugOn(ctx) { return !!(ctx.flow.debug || options.debug || options.onDebug); }
+    function dbg(ctx, ev) {
+      if (!debugOn(ctx)) return;
+      var e = maskForLog(ctx, Object.assign({ sessionId: ctx.sid, flowId: ctx.flow.flowId, version: ctx.st.version,
+                                               at: new Date().toISOString() }, ev));
+      if (typeof options.onDebug === 'function') options.onDebug(e);
+      else if (typeof console !== 'undefined' && console.debug) console.debug('[flowchat]', e);
+    }
+
+    // ---- files
+    async function saveFile(ctx, slot, meta, data) {
+      var req = { sessionId: ctx.sid, flowId: ctx.flow.flowId, slot: slot, name: meta.name, mimeType: meta.mimeType, size: meta.size, data: data };
+      if (options.files && typeof options.files.save === 'function') {
+        var r = await Promise.resolve(options.files.save(req));
+        var id = r && typeof r === 'object' ? r.id : r;
+        if (!isFilled(id)) throw new Error('The file store did not return an id.');
+        return String(id);
+      }
+      var fid = randomId();
+      memFiles.set(fid, req);
+      return fid;
+    }
+    async function removeFile(ctx, fileId) {
+      if (!isFilled(fileId)) return;
+      if (options.files && typeof options.files.remove === 'function') {
+        await Promise.resolve(options.files.remove({ sessionId: ctx.sid, fileId: fileId }));
+      } else memFiles.delete(fileId);
+    }
+    async function removeSessionFiles(ctx) {
+      var ids = [];
+      ctx.flow.nodes.forEach(function (n) {
+        var v = ctx.st.slots[n.slot];
+        if (n.type === 'ask' && n.input && n.input.kind === 'file' && v && v.id) ids.push(v.id);
+      });
+      for (var i = 0; i < ids.length; i++) await removeFile(ctx, ids[i]);
     }
 
     // ---- lookup lists
@@ -330,6 +518,11 @@
       for (var i = 0; i < nodes.length; i++) {
         var n = nodes[i];
         if (n.type === 'ask' && n.input && n.input.optionsFrom) await loadLov(ctx, n.input);
+        if (n.type === 'repeat') {
+          for (var k = 0; k < (n.fields || []).length; k++) {
+            if (n.fields[k].input && n.fields[k].input.optionsFrom) await loadLov(ctx, n.fields[k].input);
+          }
+        }
         if (n.type === 'changeFields' && ctx.st.records[n.record]) {
           for (var j = 0; j < (n.fields || []).length; j++) {
             var f = n.fields[j];
@@ -363,6 +556,10 @@
         var cur = recs[a].current || {};
         Object.keys(cur).forEach(function (f) { v[a + '.' + f] = cur[f]; });
       });
+      // A Repeat slot also exposes its number of items as "<slot>.count" (0 when none).
+      (ctx.repeatNodes || []).forEach(function (n) {
+        v[n.slot + '.count'] = Array.isArray(ctx.st.slots[n.slot]) ? ctx.st.slots[n.slot].length : 0;
+      });
       v.app_user = appUserOf(ctx);
       return v;
     }
@@ -390,7 +587,14 @@
       var payload = Object.assign({ sessionId: ctx.sid, flowId: ctx.flow.flowId,
                                     slots: clone(ctx.st.slots), context: clone(ctx.st.context) }, extra,
                                   { appUser: appUserOf(ctx) });   // last: server-set, never overridden
-      return Promise.resolve(fn(payload)).then(function (r) { return r || {}; });
+      var t0 = Date.now();
+      var logged = clone(payload);
+      if ('code' in logged) logged.code = '(one-time code, not logged)';
+      return Promise.resolve(fn(payload)).then(function (r) {
+        r = r || {};
+        dbg(ctx, { event: 'connector', node: extra && extra.nodeId, connector: name, ms: Date.now() - t0, payload: logged, response: r });
+        return r;
+      });
     }
 
     function source(name) {
@@ -414,9 +618,16 @@
         return f ? eff(ctx, f.input) : null;
       }
       var n = ctx.slotNodes[name];
-      return n ? eff(ctx, n.input) : null;
+      return n && n.type === 'ask' ? eff(ctx, n.input) : null;
     }
-    function displayValue(ctx, name) { return displayFor(specFor(ctx, name), view(ctx)[name]); }
+    function displayValue(ctx, name) {
+      var n = ctx.slotNodes[name];
+      if (n && n.type === 'repeat') {
+        var items = repeatItems(ctx, n);
+        return items.map(function (it, i) { return itemTitle(ctx, n, it, i); }).join('; ');
+      }
+      return displayFor(specFor(ctx, name), view(ctx)[name]);
+    }
 
     function fieldDef(changeNode, field) {
       return (changeNode.fields || []).find(function (f) { return f.field === field; }) || null;
@@ -436,8 +647,10 @@
 
     async function validate(ctx, node, value) {
       var spec = eff(ctx, node.input) || {};
-      if (!isFilled(value)) return spec.required === false ? null : (spec.requiredMessage || REQUIRED_MSG);
-      if (spec.kind === 'choice') {
+      if (!isFilled(value)) return spec.required === false ? null : (spec.requiredMessage || (spec.kind === 'file' ? 'Please attach a file.' : REQUIRED_MSG));
+      if (spec.kind === 'file') {
+        if (typeof value !== 'object') return 'Please attach a file.';
+      } else if (spec.kind === 'choice') {
         // Also catches an answer that a lookup list no longer offers (e.g. an earlier answer it depends on changed).
         if (!(spec.options || []).some(function (o) { return String(o.value) === String(value); })) {
           return spec.staleMessage || 'Please choose one of the options shown.';
@@ -476,6 +689,17 @@
       var nodes = ctx.flow.nodes;
       for (var i = 0; i < nodes.length; i++) {
         var n = nodes[i];
+        if (n.type === 'repeat' && ctx.st.history.indexOf(n.id) >= 0) {
+          var items = repeatItems(ctx, n);
+          if (items.length < repeatMin(n)) return { nodeId: n.id, error: interpolate((n.prompts || {}).tooFew || 'Please add at least {{min}}.', { min: repeatMin(n) }) };
+          for (var j = 0; j < items.length; j++) {
+            for (var k = 0; k < (n.fields || []).length; k++) {
+              var f = n.fields[k];
+              var e = await validate(ctx, repeatFieldNode(n, f), items[j][f.field]);
+              if (e) return { nodeId: n.id, error: itemTitle(ctx, n, items[j], j) + ': ' + e };
+            }
+          }
+        }
         if (n.type !== 'ask' || !isFilled(ctx.st.slots[n.slot])) continue;
         var err = await validate(ctx, n, ctx.st.slots[n.slot]);
         if (err) return { nodeId: n.id, error: err };
@@ -486,7 +710,7 @@
     function summaryMessage(ctx, node) {
       if (node.mode === 'changes') return changesMessage(ctx, node);
       var slots = node.fields || ctx.flow.nodes
-        .filter(function (n) { return n.type === 'ask' && isFilled(ctx.st.slots[n.slot]); })
+        .filter(function (n) { return (n.type === 'ask' || n.type === 'repeat') && isFilled(ctx.st.slots[n.slot]); })
         .map(function (n) { return n.slot; });
       var items = [];
       slots.forEach(function (s) {
@@ -535,8 +759,14 @@
           if (rec && Object.keys(recordChanges(rec)).length) done++;
           id = n.done;
         }
+        else if (n.type === 'repeat') {
+          total++;
+          if (repeatComplete(ctx, n)) done++;
+          id = n.next;
+        }
         else if (n.type === 'condition') id = pickBranch(n, v);
         else if (n.type === 'verify') id = n.verified;
+        else if (n.type === 'bulkUpdate') id = n.done;
         else if (n.type === 'message' || n.type === 'lookup') id = n.next;
         else break;
       }
@@ -545,25 +775,41 @@
     }
 
     // ---- data nodes
-    async function runFind(ctx, node) {
-      var st = ctx.st, v = view(ctx), prompts = node.prompts || {};
-      var criteria = [];
-      if (node.requireVerified && !isVerified(ctx, node.requireVerified)) {
-        // Never search for an identity that hasn't passed a Verify step (a flow design error).
-        say(ctx, 'error', "I can't look that up until it has been verified.");
-        return failed(ctx);
-      }
-      // byRowFilter: no criteria; the data source's row filter (e.g. owner = :APP_USER) picks the rows.
-      if (!node.byRowFilter) (node.criteria || []).forEach(function (c) {
+    // Search criteria from answered slots, or null when fewer than minCriteria are answered.
+    // byRowFilter: no criteria; the data source's row filter (e.g. owner = :APP_USER) picks the rows.
+    function criteriaFor(ctx, node) {
+      var v = view(ctx), criteria = [];
+      if (node.byRowFilter) return criteria;
+      (node.criteria || []).forEach(function (c) {
         var val = v[c.slot];
         if (isFilled(val)) criteria.push({ field: c.field, op: c.op || 'eq', value: val });
       });
-      if (!node.byRowFilter && criteria.length < (node.minCriteria || 1)) {
+      return criteria.length < (node.minCriteria || 1) ? null : criteria;
+    }
+    async function searchRows(ctx, node, criteria, limit) {
+      var rows = (await Promise.resolve(source(node.source).search({ criteria: criteria, limit: limit, context: dsContext(ctx).context, verified: verifiedValue(ctx) }))) || [];
+      dbg(ctx, { event: 'search', node: node.id, source: node.source, criteria: criteria, rows: rows.length });
+      return rows;
+    }
+    function verifiedGate(ctx, node) {
+      if (node.requireVerified && !isVerified(ctx, node.requireVerified)) {
+        // Never search for an identity that hasn't passed a Verify step (a flow design error).
+        say(ctx, 'error', "I can't look that up until it has been verified.");
+        return false;
+      }
+      return true;
+    }
+
+    async function runFind(ctx, node) {
+      var st = ctx.st, v = view(ctx), prompts = node.prompts || {};
+      if (!verifiedGate(ctx, node)) return failed(ctx);
+      var criteria = criteriaFor(ctx, node);
+      if (!criteria) {
         say(ctx, 'text', interpolate(prompts.none || "I couldn't find a matching record.", v));
         return node.notFound;
       }
       var max = node.maxResults || 10;
-      var rows = (await Promise.resolve(source(node.source).search({ criteria: criteria, limit: max + 1, context: dsContext(ctx).context, verified: verifiedValue(ctx) }))) || [];
+      var rows = await searchRows(ctx, node, criteria, max + 1);
       if (!rows.length) {
         say(ctx, 'text', interpolate(prompts.none || "I couldn't find a matching record.", v));
         return node.notFound;
@@ -627,6 +873,7 @@
       var src = source(rec.source), original = {};
       fieldsChanged.forEach(function (f) { original[f] = rec.original[f]; });
       var r = (await Promise.resolve(src.update({ key: rec.key, version: rec.version, original: original, changes: changes, context: dsContext(ctx).context, verified: verifiedValue(ctx) }))) || {};
+      dbg(ctx, { event: 'update', node: node.id, source: rec.source, key: rec.key, before: original, after: changes, result: r.status || 'error' });
       if (r.status === 'ok') {
         if (r.version !== undefined && r.version !== null) rec.version = r.version;
         rec.original = clone(rec.current);
@@ -650,6 +897,216 @@
       }
       say(ctx, 'error', r.message || 'Sorry, the changes could not be saved.');
       return node.error || failed(ctx);
+    }
+
+    // ---- repeat (line items / child rows): the slot holds an array of {field: value} objects
+    function repeatItems(ctx, node) { var v = ctx.st.slots[node.slot]; return Array.isArray(v) ? v : []; }
+    function repeatMin(node) { return isFilled(node.min) ? Math.max(parseInt(node.min, 10) || 0, 0) : 1; }
+    function repeatMax(node) { return Math.min(Math.max(parseInt(node.max, 10) || 20, 1), 100); }
+    // Finished: enough items, and Done was tapped (or items exist, for flows that skip ahead).
+    function repeatComplete(ctx, node) {
+      var n = repeatItems(ctx, node).length;
+      return n >= repeatMin(node) && (n > 0 || ctx.st.history.indexOf(node.id) >= 0) && !ctx.st.repeat[node.id];
+    }
+    function repeatFieldNode(node, f) {
+      return { id: node.id, slot: node.slot + '.' + f.field, input: f.input || { kind: 'text' }, validators: f.validators };
+    }
+    function itemTitle(ctx, node, item, i) {
+      var vals = { n: i + 1 };
+      (node.fields || []).forEach(function (f) { vals[f.field] = displayFor(eff(ctx, f.input), item[f.field]); });
+      if (node.itemTitle) return interpolate(node.itemTitle, vals);
+      return (node.fields || []).map(function (f) { return vals[f.field]; }).filter(isFilled).join(' · ') || ('Item ' + (i + 1));
+    }
+    function repeatVals(ctx, node, extra) {
+      var items = repeatItems(ctx, node);
+      return Object.assign(view(ctx), { count: items.length, min: repeatMin(node), max: repeatMax(node), n: items.length + 1,
+                                        item: node.itemLabel || 'item' }, extra || {});
+    }
+    function repeatCard(ctx, node) {
+      var items = repeatItems(ctx, node);
+      return { type: 'list', text: interpolate(node.listTitle || (node.label || 'Items') + ' ({{count}})', repeatVals(ctx, node)),
+               items: items.map(function (it, i) { return { index: i, title: itemTitle(ctx, node, it, i) }; }) };
+    }
+    function repeatPromptField(ctx, node) {
+      var rs = ctx.st.repeat[node.id], f = node.fields[rs.field];
+      say(ctx, 'text', interpolate(f.prompt || ((f.label || f.field) + ' for {{item}} {{n}}?'), repeatVals(ctx, node, rs.draft)));
+    }
+    // Shows the step as it stands: the question being answered, or the list with Add / Done.
+    function repeatShow(ctx, node) {
+      var st = ctx.st, pr = node.prompts || {}, items = repeatItems(ctx, node);
+      st.current = node.id;
+      if (st.repeat[node.id]) { repeatPromptField(ctx, node); return; }
+      if (items.length) ctx.out.push(repeatCard(ctx, node));
+      var text = items.length >= repeatMax(node) ? (pr.full || "That's the most I can take ({{max}}). Tap Done to continue.")
+        : items.length >= repeatMin(node) ? (pr.menu || 'Add another {{item}}, or tap Done.')
+        : items.length ? (pr.tooFew || 'Please add at least {{min}}.') : (pr.empty || 'Tap Add to add a {{item}}.');
+      say(ctx, 'text', interpolate(text, repeatVals(ctx, node)));
+    }
+    function repeatStartItem(ctx, node) {
+      ctx.st.repeat[node.id] = { draft: {}, field: 0 };
+      repeatPromptField(ctx, node);
+    }
+    async function handleRepeat(ctx, node, payload, cmd) {
+      var st = ctx.st, pr = node.prompts || {}, rs = st.repeat[node.id], items = repeatItems(ctx, node).slice();
+      if (rs) {
+        var f = node.fields[rs.field];
+        var parsed = parseValue(eff(ctx, f.input), payload.value);
+        var err = parsed.error || await validate(ctx, repeatFieldNode(node, f), parsed.value);
+        if (err) { say(ctx, 'error', err); return; }
+        rs.draft[f.field] = parsed.value;
+        if (rs.field + 1 < node.fields.length) { rs.field++; repeatPromptField(ctx, node); return; }
+        items.push(rs.draft);
+        delete st.repeat[node.id];
+        st.slots[node.slot] = items; touch(ctx, node.slot);
+        say(ctx, 'text', interpolate(pr.added || 'Added {{title}}.', repeatVals(ctx, node, { title: itemTitle(ctx, node, rs.draft, items.length - 1) })));
+        repeatShow(ctx, node);
+        return;
+      }
+      var val = String(payload.value || '').trim().toLowerCase();
+      if (cmd === 'add' || val === 'add' || val === String(node.addLabel || 'add another').toLowerCase()) {
+        if (items.length >= repeatMax(node)) { say(ctx, 'error', interpolate(pr.full || "That's the most I can take ({{max}}). Tap Done to continue.", repeatVals(ctx, node))); return; }
+        repeatStartItem(ctx, node);
+        return;
+      }
+      if (cmd === 'remove') {
+        var i = parseInt(payload.index, 10);
+        if (!(i >= 0 && i < items.length)) { say(ctx, 'error', 'There is no such item.'); return; }
+        var gone = itemTitle(ctx, node, items[i], i);
+        items.splice(i, 1);
+        if (items.length) st.slots[node.slot] = items; else delete st.slots[node.slot];
+        touch(ctx, node.slot);
+        say(ctx, 'text', interpolate(pr.removed || 'Removed {{title}}.', { title: gone }));
+        repeatShow(ctx, node);
+        return;
+      }
+      if (cmd === 'done' || val === 'done' || val === String(node.doneLabel || 'done').toLowerCase()) {
+        if (items.length < repeatMin(node)) { say(ctx, 'error', interpolate(pr.tooFew || 'Please add at least {{min}}.', repeatVals(ctx, node))); return; }
+        st.history.push(node.id);
+        if (st.editing) { st.editing = false; ctx.replay = true; await run(ctx, ctx.flow.start); }
+        else await run(ctx, node.next);
+        return;
+      }
+      say(ctx, 'error', 'Tap ' + (node.addLabel || 'Add another') + ' or ' + (node.doneLabel || 'Done') + '.');
+    }
+
+    // ---- bulk update: the same change applied to every record a search finds, after a confirmation
+    function bulkChanges(ctx, node) {
+      var v = view(ctx), out = {};
+      Object.keys(node.set || {}).forEach(function (f) {
+        var s = node.set[f];
+        if (s && typeof s === 'object' && isFilled(s.slot)) out[f] = isFilled(v[s.slot]) ? v[s.slot] : null;
+        else if (s && typeof s === 'object' && 'value' in s) out[f] = s.value;
+        else out[f] = s;
+      });
+      return out;
+    }
+    function bulkChangeText(node, changes) {
+      return Object.keys(changes).map(function (f) {
+        var s = node.set[f], label = (s && typeof s === 'object' && s.label) || f;
+        return label + ' = ' + (isFilled(changes[f]) ? textOf(changes[f]) : '(empty)');
+      }).join(', ');
+    }
+    function bulkConfirm(ctx, node) {
+      var b = ctx.st.bulk[node.id], pr = node.prompts || {};
+      var vals = Object.assign(view(ctx), { count: b.count, records: b.count === 1 ? 'record' : 'records', changes: b.changeText });
+      say(ctx, 'text', interpolate(pr.confirm || 'This will set {{changes}} on {{count}} {{records}}. Do you want to go ahead?', vals));
+      var items = b.preview.map(function (p, i) { return { index: i, title: p.title, subtitle: p.subtitle }; });
+      if (b.count > b.preview.length) items.push({ index: -1, title: '…and ' + (b.count - b.preview.length) + ' more' });
+      ctx.out.push({ type: 'list', text: interpolate(pr.listTitle || 'Records to change', vals), items: items });
+    }
+    async function runBulk(ctx, node) {
+      var st = ctx.st, v = view(ctx), pr = node.prompts || {};
+      if (!verifiedGate(ctx, node)) return failed(ctx);
+      var criteria = criteriaFor(ctx, node);
+      if (!criteria) { say(ctx, 'text', interpolate(pr.none || "I couldn't find any matching records.", v)); return node.none || failed(ctx); }
+      var max = Math.min(Math.max(parseInt(node.maxRows, 10) || 50, 1), 500);
+      var rows = await searchRows(ctx, node, criteria, max + 1);
+      if (!rows.length) { say(ctx, 'text', interpolate(pr.none || "I couldn't find any matching records.", v)); return node.none || failed(ctx); }
+      if (rows.length > max) {
+        say(ctx, 'text', interpolate(pr.tooMany || 'That matches more than {{max}} records, which is too many to change at once.', Object.assign(v, { max: max })));
+        return node.tooMany || node.none || failed(ctx);
+      }
+      var card = node.card || {}, changes = bulkChanges(ctx, node);
+      st.bulk[node.id] = { keys: rows.map(function (r) { return r.key; }), count: rows.length, changes: changes,
+                           changeText: bulkChangeText(node, changes),
+                           preview: rows.slice(0, 10).map(function (r) {
+                             return { title: interpolate(card.title || String(r.key), r.values), subtitle: card.subtitle ? interpolate(card.subtitle, r.values) : '' };
+                           }) };
+      st.current = node.id;
+      bulkConfirm(ctx, node);
+      return AWAIT;
+    }
+    // Each record is read again and updated with its own version, through the data source
+    // (so the updatable whitelist and the row filter apply to every row).
+    async function executeBulk(ctx, node, b) {
+      var src = source(node.source), res = { updated: 0, failed: 0, count: b.keys.length };
+      for (var i = 0; i < b.keys.length; i++) {
+        var key = b.keys[i];
+        var cur = await Promise.resolve(src.get({ key: key, context: dsContext(ctx).context, verified: verifiedValue(ctx) }));
+        if (!cur || !cur.values) { res.failed++; continue; }
+        var original = {}, changes = {};
+        Object.keys(b.changes).forEach(function (f) {
+          original[f] = cur.values[f] === undefined ? null : cur.values[f];
+          if (!same(cur.values[f], b.changes[f])) changes[f] = b.changes[f];
+        });
+        if (!Object.keys(changes).length) { res.updated++; continue; }
+        Object.keys(original).forEach(function (f) { if (!(f in changes)) delete original[f]; });
+        var r = (await Promise.resolve(src.update({ key: key, version: cur.version === undefined ? null : cur.version, original: original,
+                                                    changes: changes, context: dsContext(ctx).context, verified: verifiedValue(ctx) }))) || {};
+        if (r.status === 'ok') res.updated++; else res.failed++;
+      }
+      dbg(ctx, { event: 'bulkUpdate', node: node.id, source: node.source, changes: b.changes, count: res.count, updated: res.updated, failed: res.failed });
+      return res;
+    }
+    async function handleBulk(ctx, node, payload, cmd) {
+      var st = ctx.st, b = st.bulk[node.id], pr = node.prompts || {};
+      var val = String(payload.value || '').trim().toLowerCase();
+      var vals = Object.assign(view(ctx), { count: b.count });
+      var cancel = String(node.cancelLabel || 'cancel').toLowerCase();
+      var confirm = interpolate(node.confirmLabel || 'Update {{count}}', vals).toLowerCase();
+      if (cmd === 'cancel' || val === 'cancel' || val === 'no' || val === cancel) {
+        delete st.bulk[node.id];
+        say(ctx, 'text', pr.cancelled || "Okay, I didn't change anything.");
+        var back = node.cancelled || node.none;
+        if (back) await run(ctx, back); else failed(ctx);
+        return;
+      }
+      if (cmd === 'confirm' || /^(confirm|yes|y|ok|go|update)$/.test(val) || val === confirm) {
+        st.history.push(node.id);
+        var res = await executeBulk(ctx, node, b);
+        delete st.bulk[node.id];
+        Object.assign(vals, res);
+        if (res.failed) say(ctx, 'error', interpolate(pr.partial || 'I updated {{updated}} of {{count}} records. {{failed}} could not be changed (changed by someone else, or not allowed).', vals));
+        else say(ctx, 'text', interpolate(pr.done || 'Done. I updated {{updated}} of {{count}} records.', vals));
+        await run(ctx, res.failed && node.partial ? node.partial : node.done);
+        return;
+      }
+      say(ctx, 'error', 'Tap "' + interpolate(node.confirmLabel || 'Update {{count}}', vals) + '" to go ahead, or ' + (node.cancelLabel || 'Cancel') + '.');
+    }
+
+    // ---- resume: the current question again, unchanged (after a page reload)
+    function reprompt(ctx) {
+      var st = ctx.st, n = ctx.nodes[st.current], v = view(ctx);
+      Object.keys(v).forEach(function (k) { touch(ctx, k); });   // the page's fields were reset by the reload
+      say(ctx, 'text', interpolate(ctx.flow.resumeText || "Welcome back. Let's carry on where we left off.", v));
+      if (!n) return;
+      switch (n.type) {
+        case 'ask': say(ctx, 'text', interpolate(n.prompt, v)); break;
+        case 'summary': ctx.out.push(summaryMessage(ctx, n)); break;
+        case 'verify':
+          say(ctx, 'text', interpolate((n.prompts || {}).resume || 'Please enter the code I sent to {{' + n.slot + '}}.', verifyValues(ctx, n)));
+          break;
+        case 'findRecord':
+          say(ctx, 'text', interpolate((n.prompts || {}).many || 'I found {{count}} matching records. Which one?',
+                                       Object.assign({}, v, { count: (st.results[n.id] || []).length })));
+          break;
+        case 'changeFields':
+          if (st.editingField && fieldDef(n, st.editingField)) promptField(ctx, n, fieldDef(n, st.editingField));
+          else { ctx.out.push(recordCard(ctx, n)); say(ctx, 'text', interpolate(n.prompt || 'What would you like to change?', v)); }
+          break;
+        case 'repeat': repeatShow(ctx, n); break;
+        case 'bulkUpdate': if (st.bulk[n.id]) bulkConfirm(ctx, n); break;
+      }
     }
 
     function failed(ctx) { ctx.st.status = 'failed'; ctx.st.current = null; return null; }
@@ -749,13 +1206,34 @@
         if (++steps > MAX_STEPS) throw new Error('Flow exceeded ' + MAX_STEPS + ' steps. Check it for a loop.');
         var node = ctx.nodes[id], r, nxt;
         if (!node) throw new Error('Flow references unknown node "' + id + '".');
+        dbg(ctx, { event: 'node', node: id, type: node.type, replay: ctx.replay || undefined });
         switch (node.type) {
           case 'message':
             if (!ctx.replay) say(ctx, 'text', interpolate(node.text, view(ctx)));
             id = node.next;
             break;
           case 'condition':
-            id = pickBranch(node, view(ctx));
+            nxt = pickBranch(node, view(ctx));
+            dbg(ctx, { event: 'branch', node: id, next: nxt || null });
+            id = nxt;
+            break;
+          case 'repeat': {
+            var items = repeatItems(ctx, node);
+            if ((ctx.replay || node.skipIfFilled) && ctx.forceAsk !== id && repeatComplete(ctx, node)) { id = node.next; break; }
+            if (ctx.replay) st.editing = true;
+            ctx.replay = false; ctx.forceAsk = null;
+            st.current = id;
+            if (node.prompt) say(ctx, 'text', interpolate(node.prompt, repeatVals(ctx, node)));
+            if (!items.length && !st.repeat[id] && repeatMin(node) > 0) repeatStartItem(ctx, node);
+            else repeatShow(ctx, node);
+            return;
+          }
+          case 'bulkUpdate':
+            ctx.replay = false;
+            nxt = await runBulk(ctx, node);
+            if (nxt === AWAIT) return;
+            if (nxt === null && st.status === 'failed') return;
+            id = nxt;
             break;
           case 'lookup':
             if (ctx.replay) { id = node.next; break; }
@@ -768,7 +1246,10 @@
             var stale = false;
             if ((ctx.replay || node.skipIfFilled) && isFilled(st.slots[node.slot]) && ctx.forceAsk !== id) {
               // A lookup answer the list no longer offers (an answer it depends on changed) is asked again.
-              if (!(node.input && node.input.optionsFrom) || await stillOffered(ctx, node)) { id = node.next; break; }
+              if (!(node.input && node.input.optionsFrom) || await stillOffered(ctx, node)) {
+                dbg(ctx, { event: 'skip', node: id, reason: 'answered' });
+                id = node.next; break;
+              }
               stale = true;
             }
             // A question reached while replaying an edit keeps the replay going after it's answered.
@@ -886,6 +1367,24 @@
                               reason: ed ? null : (fd.lockedMessage || 'This field cannot be changed right now.') };
                    }) };
           }
+        } else if (n.type === 'repeat') {
+          var rs = st.repeat[n.id], items = repeatItems(ctx, n);
+          if (rs) {
+            var rf = n.fields[rs.field];
+            aw = { type: 'ask', nodeId: n.id, slot: n.slot + '.' + rf.field, label: rf.label || rf.field,
+                   input: turnInput(ctx, rf.input), value: null, item: items.length + 1 };
+            if (!aw.input.kind) aw.input.kind = 'text';
+          } else {
+            aw = { type: 'listMenu', nodeId: n.id, itemLabel: n.itemLabel || 'item',
+                   items: items.map(function (it, i) { return { index: i, title: itemTitle(ctx, n, it, i) }; }),
+                   canAdd: items.length < repeatMax(n), canDone: items.length >= repeatMin(n),
+                   addLabel: items.length ? (n.addLabel || 'Add another') : (n.firstAddLabel || 'Add'),
+                   doneLabel: n.doneLabel || 'Done', removeLabel: n.removeLabel || 'Remove' };
+          }
+        } else if (n.type === 'bulkUpdate' && st.bulk[n.id]) {
+          var bv = Object.assign({}, v, { count: st.bulk[n.id].count });
+          aw = { type: 'confirm', nodeId: n.id, confirmLabel: interpolate(n.confirmLabel || 'Update {{count}}', bv),
+                 cancelLabel: n.cancelLabel || 'Cancel', danger: true };
         }
       }
       return {
@@ -897,21 +1396,31 @@
                    display: displayValue(ctx, s), binding: (ctx.flow.bindings || {})[s] || null };
         }),
         progress: progress(ctx),
-        canGoBack: st.history.length > 0 || !!st.editingField
+        canGoBack: st.history.length > 0 || !!st.editingField || !!(st.current && st.repeat[st.current])
       };
     }
 
-    async function start(flowId, context) {
-      var flow = compile(flowId).flow;
+    // opts.version pins a version registered for this flow (an error when it isn't there).
+    async function start(flowId, context, opts) {
+      opts = opts || {};
+      var key = flowId;
+      if (isFilled(opts.version)) {
+        key = flowId + '@' + Number(opts.version);
+        if (!versions[key]) throw new Error('Version ' + opts.version + ' of flow "' + flowId + '" is not available.');
+      }
+      var flow = compile(key).flow;
       var sid = randomId();
-      var st = { flowId: flowId, version: flow.version || 1, status: 'in_progress', current: null,
+      var st = { flowId: flowId, flowKey: key, version: flow.version || 1, status: 'in_progress', current: null,
                  slots: {}, history: [], editing: false, context: clone(context || {}), records: {}, results: {}, editingField: null,
-                 verify: {}, verified: {}, verifiedLast: null };
+                 verify: {}, verified: {}, verifiedLast: null, repeat: {}, bulk: {} };
       sessions.set(sid, st);
       var ctx = makeCtx(sid, st);
-      seedContext(ctx);
-      await run(ctx, flow.start);
-      await ensureOptions(ctx);
+      dbg(ctx, { event: 'start', context: st.context });
+      try {
+        seedContext(ctx);
+        await run(ctx, flow.start);
+        await ensureOptions(ctx);
+      } catch (e) { dbg(ctx, { event: 'error', message: e.message }); throw e; }
       return clone(buildTurn(ctx));
     }
 
@@ -921,21 +1430,41 @@
       var ctx = makeCtx(sid, st);
       payload = payload || {};
       if (st.status !== 'in_progress') return clone(buildTurn(ctx));
+      dbg(ctx, { event: 'input', node: st.current, input: inputForLog(ctx, payload) });
+      try {
+        await handleInput(ctx, payload);
+      } catch (e) { dbg(ctx, { event: 'error', node: st.current, message: e.message }); throw e; }
+      return clone(buildTurn(ctx));
+    }
+
+    async function handleInput(ctx, payload) {
+      var st = ctx.st;
       var cmd = String(payload.command || '').toLowerCase();
       var node = ctx.nodes[st.current];
       await ensureOptions(ctx);
 
-      if (cmd === 'restart') {
+      if (cmd === 'resume') {
+        reprompt(ctx);
+      } else if (cmd === 'restart') {
         Object.keys(view(ctx)).forEach(function (k) { touch(ctx, k); });
+        await removeSessionFiles(ctx);
         st.slots = {}; st.history = []; st.editing = false; st.records = {}; st.results = {}; st.editingField = null;
-        st.verify = {}; st.verified = {}; st.verifiedLast = null;
+        st.verify = {}; st.verified = {}; st.verifiedLast = null; st.repeat = {}; st.bulk = {};
         seedContext(ctx);
         say(ctx, 'text', "Okay, let's start over.");
         await run(ctx, ctx.flow.start);
       } else if (cmd === 'back' && node && node.type === 'changeFields' && st.editingField) {
         st.editingField = null;
         say(ctx, 'text', 'No problem, I kept it as it was. Anything else to change?');
+      } else if (cmd === 'back' && node && node.type === 'repeat' && st.repeat[node.id]
+                 && (st.repeat[node.id].field > 0 || repeatItems(ctx, node).length > 0)) {
+        // Inside a line item: back to its previous field, or drop the unfinished item.
+        var rs = st.repeat[node.id];
+        if (rs.field > 0) { rs.field--; delete rs.draft[node.fields[rs.field].field]; repeatPromptField(ctx, node); }
+        else { delete st.repeat[node.id]; say(ctx, 'text', 'Okay, I dropped that one.'); repeatShow(ctx, node); }
       } else if (cmd === 'back') {
+        if (node && node.type === 'repeat') delete st.repeat[node.id];
+        if (node && node.type === 'bulkUpdate') delete st.bulk[node.id];
         var prev = st.history.pop();
         // A passed Verify step has nothing to ask again: step back past it.
         while (prev && ctx.nodes[prev] && ctx.nodes[prev].type === 'verify' && st.history.length) prev = st.history.pop();
@@ -951,11 +1480,19 @@
         if (fd && fieldEditable(ctx, cn, fd)) promptField(ctx, cn, fd);
         else if (target) { st.editing = true; ctx.forceAsk = target.id; await run(ctx, target.id); }
         else say(ctx, 'error', 'There is no question for "' + slot + '".');
+      } else if (!node) {
+        say(ctx, 'error', 'There is nothing to answer right now.');
       } else if (node.type === 'ask') {
-        var parsed = parseValue(eff(ctx, node.input), payload.value);
+        var spec = eff(ctx, node.input) || {};
+        var parsed = spec.kind === 'file' ? parseFile(spec, payload.file) : parseValue(spec, payload.value);
         var err = parsed.error || await validate(ctx, node, parsed.value);
         if (err) say(ctx, 'error', err);
         else {
+          if (spec.kind === 'file' && parsed.value) {
+            var old = st.slots[node.slot];
+            parsed.value = Object.assign({ id: await saveFile(ctx, node.slot, parsed.value, parsed.data) }, parsed.value);
+            if (old && old.id) await removeFile(ctx, old.id);
+          }
           st.slots[node.slot] = parsed.value; touch(ctx, node.slot);
           st.history.push(node.id);
           if (st.editing) { st.editing = false; ctx.replay = true; await run(ctx, ctx.flow.start); }
@@ -970,9 +1507,12 @@
         await handlePick(ctx, node, payload);
       } else if (node.type === 'changeFields') {
         await handleChange(ctx, node, payload, cmd);
+      } else if (node.type === 'repeat') {
+        await handleRepeat(ctx, node, payload, cmd);
+      } else if (node.type === 'bulkUpdate' && st.bulk[node.id]) {
+        await handleBulk(ctx, node, payload, cmd);
       }
       await ensureOptions(ctx);
-      return clone(buildTurn(ctx));
     }
 
     async function handlePick(ctx, node, payload) {
@@ -1031,12 +1571,17 @@
       registerConnector: registerConnector,
       registerDataSource: registerDataSource,
       registerLov: registerLov,
-      getState: function (sid) { return clone(sessions.get(sid)); }
+      getState: function (sid) { return clone(sessions.get(sid)); },
+      // A file uploaded in this session (default in-memory store only): {name, size, mimeType, data(base64)}.
+      getFile: function (sid, fileId) {
+        var f = memFiles.get(String(fileId));
+        return f && f.sessionId === sid ? { name: f.name, size: f.size, mimeType: f.mimeType, data: f.data } : null;
+      }
     };
   }
 
   var api = { createEngine: createEngine, createMemorySource: createMemorySource, parseValue: parseValue,
-              evalCond: evalCond, interpolate: interpolate };
+              evalCond: evalCond, interpolate: interpolate, parseFile: parseFile, maskJsonText: maskJsonText };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else global.FlowChatEngine = api;
 })(typeof window !== 'undefined' ? window : globalThis);

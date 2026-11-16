@@ -9,6 +9,9 @@
     "version":  { "type": "integer", "minimum": 1 },
     "name":     { "type": "string" },
     "start":    { "type": "string", "description": "Id of the first node" },
+    "debug":    { "type": "boolean", "default": false, "description": "Log every step, branch, connector call and search (FC_EVENTS rows with direction DBG; onDebug in the JS engine). PII values are masked." },
+    "piiSlots": { "type": "array", "items": { "type": "string" }, "description": "Slots (e.g. set by a lookup or page context) whose values logs must redact. For asked questions use \"pii\" on the question." },
+    "resumeText": { "type": "string", "description": "Shown when a conversation is picked up again after a page reload (input {\"command\": \"resume\"})." },
     "bindings": {
       "type": "object",
       "description": "slot -> where the value is mirrored on the host page, one key per adapter",
@@ -40,8 +43,67 @@
         { "$ref": "#/$defs/lookup" },  { "$ref": "#/$defs/summary" }, { "$ref": "#/$defs/submit" },
         { "$ref": "#/$defs/end" },
         { "$ref": "#/$defs/verify" },
-        { "$ref": "#/$defs/findRecord" }, { "$ref": "#/$defs/changeFields" }, { "$ref": "#/$defs/saveChanges" }
+        { "$ref": "#/$defs/findRecord" }, { "$ref": "#/$defs/changeFields" }, { "$ref": "#/$defs/saveChanges" },
+        { "$ref": "#/$defs/repeat" }, { "$ref": "#/$defs/bulkUpdate" }
       ]
+    },
+
+    "pii": { "description": "Mask this value in FC_EVENTS and debug logs: true = [redacted], \"last4\" = only the last 4 characters", "enum": [true, false, "last4"] },
+
+    "repeat": {
+      "description": "Collect a list of items, each with its own questions. The slot holds [{field: value}, ...]; <slot>.count is the number of items. The widget shows the items with Remove, Add and Done.",
+      "properties": {
+        "type": { "const": "repeat" },
+        "slot": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,99}$" },
+        "label": { "type": "string", "description": "Shown in the summary and list card" },
+        "itemLabel": { "type": "string", "default": "item", "description": "What one item is called; {{item}} in messages" },
+        "prompt": { "type": "string", "description": "Intro said when the step starts" },
+        "itemTitle": { "type": "string", "description": "Template over the item's fields, e.g. \"{{description}} ({{amount}})\"" },
+        "min": { "type": "integer", "minimum": 0, "default": 1 },
+        "max": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+        "skipIfFilled": { "type": "boolean", "default": false },
+        "fields": { "type": "array", "minItems": 1, "items": { "type": "object", "required": ["field"],
+          "properties": { "field": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,49}$" }, "label": { "type": "string" },
+                          "prompt": { "type": "string", "description": "{{n}} = item number; earlier fields of the item are available" },
+                          "input": { "$ref": "#/$defs/input" },
+                          "validators": { "type": "array", "items": { "$ref": "#/$defs/validator" } },
+                          "pii": { "$ref": "#/$defs/pii" } } } },
+        "addLabel": { "type": "string" }, "firstAddLabel": { "type": "string" }, "doneLabel": { "type": "string" },
+        "removeLabel": { "type": "string" }, "listTitle": { "type": "string" },
+        "prompts": { "type": "object", "properties": {
+          "added": { "type": "string" }, "removed": { "type": "string" }, "menu": { "type": "string" },
+          "tooFew": { "type": "string" }, "full": { "type": "string" }, "empty": { "type": "string" } } },
+        "next": { "$ref": "#/$defs/id" }
+      },
+      "required": ["slot", "fields", "next"]
+    },
+
+    "bulkUpdate": {
+      "description": "Search a data source, show how many records match, and after an explicit confirmation apply the same change to each one through the data source (whitelist, row filter and version checks apply per row).",
+      "properties": {
+        "type": { "const": "bulkUpdate" },
+        "source": { "type": "string" },
+        "criteria": { "type": "array", "items": { "type": "object", "required": ["field", "slot"],
+          "properties": { "field": { "type": "string" }, "op": { "enum": ["eq", "starts", "contains", "gte", "lte"] },
+                          "slot": { "type": "string" } } } },
+        "minCriteria": { "type": "integer", "minimum": 1, "default": 1 },
+        "byRowFilter": { "type": "boolean", "default": false },
+        "requireVerified": { "type": "string" },
+        "set": { "type": "object", "description": "field -> {\"value\": ...} or {\"slot\": \"answer\"}, optional \"label\"",
+          "additionalProperties": { "type": "object", "properties": { "value": {}, "slot": { "type": "string" }, "label": { "type": "string" } } } },
+        "maxRows": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 },
+        "card": { "type": "object", "properties": { "title": { "type": "string" }, "subtitle": { "type": "string" } } },
+        "confirmLabel": { "type": "string", "default": "Update {{count}}" }, "cancelLabel": { "type": "string" },
+        "prompts": { "type": "object", "properties": {
+          "confirm": { "type": "string" }, "done": { "type": "string" }, "partial": { "type": "string" },
+          "none": { "type": "string" }, "tooMany": { "type": "string" }, "cancelled": { "type": "string" },
+          "listTitle": { "type": "string" } } },
+        "done": { "$ref": "#/$defs/id" },
+        "none": { "$ref": "#/$defs/id", "description": "No match, or cancelled without a cancelled port" },
+        "tooMany": { "$ref": "#/$defs/id" }, "cancelled": { "$ref": "#/$defs/id" },
+        "partial": { "$ref": "#/$defs/id", "description": "Some records could not be changed. Defaults to done." }
+      },
+      "required": ["source", "set", "done"]
     },
 
     "alias": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,49}$", "description": "Record alias; fields are read as alias.field" },
@@ -106,7 +168,8 @@
             "field": { "type": "string" }, "label": { "type": "string" }, "prompt": { "type": "string" },
             "input": { "$ref": "#/$defs/input" },
             "validators": { "type": "array", "items": { "$ref": "#/$defs/validator" } },
-            "editableWhen": { "$ref": "#/$defs/condExpr" }, "lockedMessage": { "type": "string" } } } },
+            "editableWhen": { "$ref": "#/$defs/condExpr" }, "lockedMessage": { "type": "string" },
+            "pii": { "$ref": "#/$defs/pii" } } } },
         "done": { "$ref": "#/$defs/id" }, "noChanges": { "$ref": "#/$defs/id" }
       },
       "required": ["record", "fields", "done"]
@@ -136,6 +199,7 @@
         "label":  { "type": "string" },
         "prompt": { "type": "string", "description": "Supports {{slot}} placeholders" },
         "skipIfFilled": { "type": "boolean", "default": false },
+        "pii":    { "$ref": "#/$defs/pii" },
         "input":  { "$ref": "#/$defs/input" },
         "validators": { "type": "array", "items": { "$ref": "#/$defs/validator" } },
         "next":   { "$ref": "#/$defs/id" }
@@ -146,7 +210,11 @@
     "input": {
       "type": "object",
       "properties": {
-        "kind": { "enum": ["text", "email", "number", "date", "choice", "yesno"], "default": "text" },
+        "kind": { "enum": ["text", "email", "number", "date", "choice", "yesno", "file"], "default": "text",
+                  "description": "file (Ask only): an upload. The answer is {id, name, size, mimeType}; the content is stored in FC_FILES" },
+        "accept": { "description": "file: accepted extensions / MIME types, e.g. [\".pdf\", \"image/*\"]",
+                    "oneOf": [{ "type": "array", "items": { "type": "string" } }, { "type": "string" }] },
+        "maxSizeKb": { "type": "integer", "minimum": 1, "maximum": 20480, "default": 5120 },
         "required": { "type": "boolean", "default": true },
         "placeholder": { "type": "string" },
         "minLength": { "type": "integer" }, "maxLength": { "type": "integer" },

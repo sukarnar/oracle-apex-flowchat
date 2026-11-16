@@ -9,14 +9,16 @@ answer on the server, branches on the answers, and fills the page's existing for
 flows/      loan_application.json    sample "create" flow (collect answers, submit)
             update_application.json  sample "search and update" flow (find, change, review, save)
             update_application_public.json  same, for public pages: verifies a one-time code first
+            expense_claim.json       Phase E sample: line items (Repeat), a file answer, a PII answer, debug logging
             flow.schema.json         JSON Schema for flow definitions
 designer/   index.html               visual flow designer (no dependencies)
 widget/     flowchat.js              <flow-chat> Web Component + transports + adapters (no dependencies)
             flowchat-engine.js       reference engine in JS (demo, simulator, Node backends)
 db/         install.sql              first-time install: runs 01..07, 09..12 in order (08 ORDS is optional)
             upgrade_phase_d.sql      upgrades an existing install with Phase D: Verify step, lookup lists (keeps your data)
+            upgrade_phase_e.sql      upgrades with Phase E: versions, resume, debug, PII masking, Repeat, Bulk update, files
             reinstall_packages.sql   re-creates FC_DATA, FC_ENGINE, FC_DESIGNER only (upgrades, compile fixes)
-            01_tables.sql            FC_FLOWS, FC_FLOW_VERSIONS, FC_CONNECTORS, FC_SESSIONS, FC_EVENTS
+            01_tables.sql            FC_FLOWS, FC_FLOW_VERSIONS, FC_CONNECTORS, FC_SESSIONS, FC_EVENTS, FC_FILES
             02_data_sources.sql      FC_DATA_SOURCES (+ fields) registry tables
             02c_lovs.sql             FC_LOVS: lookup lists for choice answers (SQL or PL/SQL)
             02b_fc_data.sql          FC_DATA package (search / get / update); re-runnable
@@ -29,10 +31,12 @@ db/         install.sql              first-time install: runs 01..07, 09..12 in 
             10_verify_demo.sql       send_code connector, FC_DEMO_OUTBOX, "loan_apps_public" data source
             11_seed_public_flow.sql  generated: publishes update_application_public
             12_lov_demo.sql          FC_DEMO_BRANCHES and the lookup lists "countries" and "branches"
-            13_seed_loan_flow.sql    generated: publishes loan_application (used by the upgrade only)
+            13_seed_loan_flow.sql    generated: publishes loan_application with the country and branch lists
+            14_seed_expense_flow.sql FC_DEMO_EXPENSES.submit_claim connector + publishes expense_claim
 demo/       index.html               create demo (runs in the browser using the JS engine)
             update.html              search and update demo, with a live table and a conflict button
             verify.html              public-page demo: one-time code first, with an in-page outbox
+            expenses.html            Phase E demo: line items, receipt upload, masked debug log
             demo-lovs.js             in-browser stand-ins for the "countries" and "branches" lookup lists
 tests/      engine.test.js           node tests/engine.test.js
             update.test.js           node tests/update.test.js
@@ -40,6 +44,7 @@ tests/      engine.test.js           node tests/engine.test.js
             lov.test.js              node tests/lov.test.js
             mine.test.js             node tests/mine.test.js (Find record by row filter only)
             appuser.test.js          node tests/appuser.test.js (built-in {{app_user}})
+            phase-e.test.js          node tests/phase-e.test.js (versions, debug, PII, resume, Repeat, Bulk update, files)
             apex-embed-test.html     designer inside a page-wide form, like APEX
             apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
             fake-apex-backend.js     emulates the FC_DESIGNER Ajax protocol in the browser (testing only)
@@ -52,7 +57,8 @@ tools/      build-seed.js            flow JSON -> SQL publish script
 python -m http.server 8765
 ```
 Then open <http://localhost:8765/demo/> (create), <http://localhost:8765/demo/update.html> (search and update)
-or <http://localhost:8765/demo/verify.html> (search and update on a public page, with a one-time code).
+or <http://localhost:8765/demo/verify.html> (search and update on a public page, with a one-time code),
+or <http://localhost:8765/demo/expenses.html> (line items, a file upload and the masked debug log).
 The flows are fetched over HTTP, so opening the files directly won't work.
 
 ## 1b. Design flows visually
@@ -432,6 +438,119 @@ Turn-protocol additions:
   which the widget shows as links. Input `{"command": "resend"}` sends a new code.
 - New message types: `record`, a read-only card, and `changes`, the old → new card.
 
+## 7. Phase E: versions, resume, debugging, PII, line items, bulk updates, files
+
+**Upgrading an existing install:** from the `db` folder run `@upgrade_phase_e.sql`. It lets
+FC_EVENTS hold debug rows, creates `FC_FILES`, re-creates the packages and publishes the
+`expense_claim` sample. Tables and data are kept and it is safe to re-run. Then upload the new
+`flowchat.js`, `flowchat-engine.js` and `designer.js`.
+
+### Pin a flow version
+
+```html
+<flow-chat flow="loan_application" version="3" transport="apex"></flow-chat>
+```
+Without `version` the latest published version is used. A pinned version must be published (not a
+draft or retired), otherwise the start fails with "Version 3 of flow … is not published". The APEX
+transport sends it as `x03`, REST as `"version"` in the body, and `fc_engine.start_session` takes it
+as `p_version`. A conversation always stays on the version it started with.
+
+### Resume after a page reload
+
+```html
+<flow-chat flow="loan_application" transport="apex" resume="session"></flow-chat>
+```
+- `resume="session"` keeps the session id and transcript in `sessionStorage` (cleared when the
+  tab closes); `resume="local"` uses `localStorage` (kept until the conversation ends, at most a day).
+- On load the widget redraws the transcript and sends `{"command": "resume"}`. The engine answers with
+  "Welcome back…" (the flow's `resumeText`), asks the current question again and re-sends every value,
+  so the page's fields are filled in again. Nothing in the conversation changes.
+- If the conversation has expired, finished, or belongs to another APEX session, the widget silently
+  starts a new one. The browser storage holds the transcript as the user saw it, so leave `resume`
+  off on shared computers if answers are sensitive.
+
+### Debug logging
+
+- Tick **Debug logging** in the designer's flow settings (`"debug": true`), or run
+  `fc_engine.set_debug(true)` in a database session (for a test script).
+- Every step, branch, skip, connector call (payload, response, milliseconds), search and bulk update
+  is written to `FC_EVENTS` with `direction = 'DBG'`. A failed turn is rolled back, but its error is still
+  logged as a DBG row. When APEX debug is on, the same events go to the APEX debug log.
+- One-time codes and file contents are never logged; PII values are masked (below).
+```sql
+select event_id, node_id, json_value(payload, '$.event') event, payload
+  from fc_events where session_id = :sid and direction = 'DBG' order by event_id;
+```
+- The JavaScript engine calls `createEngine({ onDebug: (event) => ... })`. The designer's Test tab
+  shows the events under the session state when the flow has debug on.
+
+### PII masking in FC_EVENTS
+
+- Mark a question **In logs: Redact it** (`"pii": true`) or **Show only the last 4 characters**
+  (`"pii": "last4"`). The same setting exists on Change fields fields and Repeat item fields. Values set
+  by a lookup or page context go in the flow's **PII answers** (`"piiSlots": ["ssn"]`).
+- Every FC_EVENTS row (IN, OUT, DBG and the update audit) has those values replaced by `[redacted]`
+  or `••••1234`, wherever they appear: the answer itself, the summary, messages that repeat it, record
+  values. The input that sets a PII answer is logged as `[redacted]`.
+- The chat, the session state (`FC_SESSIONS.STATE`, needed to run the conversation) and connector
+  payloads still hold the real values. Purge sessions with `fc_engine.purge_expired`.
+
+### Repeat: line items and child rows
+
+```json
+{ "id": "lines", "type": "repeat", "slot": "lines", "label": "Expenses", "itemLabel": "expense",
+  "min": 1, "max": 10, "itemTitle": "{{description}} ({{amount}})",
+  "fields": [
+    { "field": "description", "prompt": "What was expense {{n}} for?", "input": { "kind": "text" } },
+    { "field": "amount", "prompt": "How much was {{description}}?", "input": { "kind": "number", "prefix": "$" } }
+  ], "next": "review" }
+```
+- The questions are asked in order for each item, validated like Ask nodes (validators included).
+  Then the widget shows the items with **Remove**, **Add another** and **Done**.
+- The slot holds `[{"description": "Taxi", "amount": 42.5}, …]`, which is what the Submit connector
+  receives. `{{lines}}` shows the number of items and `{{lines.count}}` works in conditions.
+- Back inside an item returns to its previous question, or drops the unfinished item. The summary lists
+  the items with Edit, which reopens the list. `min` items are re-checked before submit.
+
+### Bulk update
+
+```json
+{ "id": "close_old", "type": "bulkUpdate", "source": "loan_apps",
+  "criteria": [{ "field": "status", "op": "eq", "slot": "old_status" }],
+  "set": { "status": { "value": "CLOSED", "label": "Status" } },
+  "maxRows": 50, "card": { "title": "{{reference}}" },
+  "done": "finished", "none": "nothing", "cancelled": "nothing" }
+```
+- Searches like Find record (criteria or `byRowFilter`), then shows "This will set Status = CLOSED on
+  12 records" with the first 10 and a red **Update 12** button. Nothing changes until the user confirms.
+- Each record is then read again and updated with its own version through FC_DATA, so the updatable
+  whitelist, the row filter and conflict detection apply to every row. The keys never reach the browser.
+- More than `maxRows` matches (at most 500) goes to `tooMany`. Rows that fail (changed meanwhile,
+  not allowed) are counted, and `partial` (or `done`) follows. The result goes to FC_EVENTS.
+- New values come from `{"value": …}` or an earlier answer `{"slot": "new_status"}`.
+
+### File answers
+
+```json
+{ "id": "ask_receipt", "type": "ask", "slot": "receipt", "prompt": "Please attach your receipt.",
+  "input": { "kind": "file", "accept": [".pdf", "image/*"], "maxSizeKb": 5120 }, "next": "review" }
+```
+- The widget shows **Choose file** with drag and drop, checks type and size, and sends the file
+  base64-encoded (in `p_clob_01` with the APEX transport). The server checks the decoded size, the
+  extension and the declared type again.
+- The content goes to `FC_FILES`; the answer is `{"id", "name", "size", "mimeType"}`. A Submit connector
+  reads the content with `where file_id = :id and session_id = :sessionId` (see `fc_demo_expenses`).
+  Files are deleted with their session, and a replaced answer deletes the old file.
+- The type check trusts the browser's file name and declared type. Scan files before using them.
+- JavaScript engine: pass `files: { save(file) -> id, remove({sessionId, fileId}) }`, or use the
+  default memory store and `engine.getFile(sessionId, fileId)`.
+
+Turn-protocol additions: `await.type` can be `listMenu` (`items: [{index, title}], canAdd, canDone,
+addLabel, doneLabel`) or `confirm` (`confirmLabel, cancelLabel, danger`); an `ask` inside a Repeat has
+`item: n`; message type `list` is a read-only list card. New inputs: `{"command": "resume"}`,
+`{"command": "add"}`, `{"command": "remove", "index": 0}`, `{"command": "confirm"}`, `{"command": "cancel"}`
+and `{"file": {"name", "mimeType", "data"}}`.
+
 ## Turn protocol
 
 The server and the widget exchange exactly one JSON shape. Any backend that produces it works with the widget.
@@ -448,9 +567,12 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 46 unit tests (`tests/engine.test.js`,
+- The JavaScript engine and widget are tested: 60 unit tests (`tests/engine.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
-  `tests/appuser.test.js`), plus manual end-to-end runs of the demos.
+  `tests/appuser.test.js`, `tests/phase-e.test.js`), plus manual end-to-end runs of the demos.
+- **The Phase E PL/SQL (`FC_ENGINE`, `01_tables.sql`, `upgrade_phase_e.sql`, `14_seed_expense_flow.sql`)
+  has not been compiled yet.** It mirrors the JavaScript engine, which is tested. Expect possible small
+  compile fixes when you run `upgrade_phase_e.sql`.
 - **The Phase D PL/SQL (Verify step and lookup lists in `FC_ENGINE`, `FC_DATA`, `FC_DESIGNER`,
   `02c_lovs.sql`, `10_verify_demo.sql`, `12_lov_demo.sql`) has not been compiled yet.** It mirrors the
   JavaScript engine, which is tested. Expect possible small compile fixes when you run `upgrade_phase_d.sql`.
@@ -463,7 +585,8 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 - **Re-upload changed files:** after updating `designer.js` or `designer.css` in APEX, re-upload
   them. APEX versions static file URLs, so browsers pick up the change. On a plain web server,
   force-reload to avoid a cached copy.
-- Not done yet (rest of Phase D): child rows / line items (repeat), bulk updates, resuming a conversation after a reload, file uploads, LLM extraction from free text, PII masking in `FC_EVENTS`, and a
-  packaged APEX region plugin. The Static Content region approach above is the stand-in for the plugin.
+- Not done yet: LLM extraction from free text, and a packaged APEX region plugin. The Static Content
+  region approach above is the stand-in for the plugin. Repeat items can't contain file answers yet;
+  use a separate Ask step for the file.
 - When an edit replays the flow, lookups are not re-run. For example, if you change the email,
   the customer lookup keeps its earlier result.

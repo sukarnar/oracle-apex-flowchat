@@ -1,0 +1,40 @@
+{
+  "flowId": "expense_claim",
+  "name": "Expense claim",
+  "version": 1,
+  "debug": true,
+  "start": "welcome",
+  "bindings": {
+    "employee": { "dom": "#employee", "apex": "P20_EMPLOYEE" },
+    "bank_account": { "dom": "#bank_account", "apex": "P20_BANK_ACCOUNT" },
+    "lines": { "dom": "#lines", "apex": "P20_LINES" },
+    "receipt": { "dom": "#receipt", "apex": "P20_RECEIPT" },
+    "reference": { "dom": "#reference", "apex": "P20_REFERENCE" }
+  },
+  "nodes": [
+    { "id": "welcome", "type": "message", "text": "Let's put your expense claim together.", "next": "ask_employee" },
+    { "id": "ask_employee", "type": "ask", "slot": "employee", "label": "Your name",
+      "prompt": "What's your name?", "input": { "kind": "text", "minLength": 2 }, "next": "ask_bank" },
+    { "id": "ask_bank", "type": "ask", "slot": "bank_account", "label": "Bank account", "pii": "last4",
+      "prompt": "Which bank account should we pay into? (Logs only ever show its last 4 digits.)",
+      "input": { "kind": "text", "minLength": 6, "maxLength": 34 }, "next": "lines" },
+    { "id": "lines", "type": "repeat", "slot": "lines", "label": "Expenses", "itemLabel": "expense", "min": 1, "max": 10,
+      "prompt": "Now the expenses, one at a time.",
+      "itemTitle": "{{description}} ({{amount}}, {{date}})",
+      "fields": [
+        { "field": "description", "label": "Description", "prompt": "What was expense {{n}} for?", "input": { "kind": "text", "maxLength": 80 } },
+        { "field": "amount", "label": "Amount", "prompt": "How much was {{description}}?", "input": { "kind": "number", "prefix": "$", "min": 0.01, "max": 5000 } },
+        { "field": "date", "label": "Date", "prompt": "When was it?", "input": { "kind": "date", "maxDate": "today" } }
+      ],
+      "next": "check_total" },
+    { "id": "check_total", "type": "condition",
+      "branches": [{ "when": { "slot": "lines.count", "op": ">", "value": 3 }, "next": "many" }], "else": "ask_receipt" },
+    { "id": "many", "type": "message", "text": "That's {{lines}} expenses, so a single combined receipt or statement is fine.", "next": "ask_receipt" },
+    { "id": "ask_receipt", "type": "ask", "slot": "receipt", "label": "Receipts",
+      "prompt": "Please attach your receipts as one PDF or photo.",
+      "input": { "kind": "file", "accept": [".pdf", "image/*"], "maxSizeKb": 5120 }, "next": "review" },
+    { "id": "review", "type": "summary", "text": "Here's your claim. Please check it:", "confirmLabel": "Submit claim", "next": "submit" },
+    { "id": "submit", "type": "submit", "connector": "submit_claim", "onSuccess": "done", "onError": "review" },
+    { "id": "done", "type": "end", "text": "Thanks {{employee}}! Claim {{reference}} with {{lines}} expenses is submitted." }
+  ]
+}

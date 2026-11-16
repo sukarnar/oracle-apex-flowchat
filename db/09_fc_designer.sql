@@ -119,8 +119,8 @@ create or replace package body fc_designer as
     l_br     json_array_t;
     l_ports  constant sys.odcivarchar2list := sys.odcivarchar2list(
                'next', 'else', 'onNotFound', 'onSuccess', 'onError', 'found', 'notFound', 'tooMany', 'cancelled',
-               'done', 'noChanges', 'saved', 'conflict', 'forbidden', 'error', 'verified', 'failed');
-    l_types  constant varchar2(200) := ',message,ask,condition,lookup,summary,submit,end,verify,findRecord,changeFields,saveChanges,';
+               'done', 'noChanges', 'saved', 'conflict', 'forbidden', 'error', 'verified', 'failed', 'none', 'partial');
+    l_types  constant varchar2(200) := ',message,ask,condition,lookup,summary,submit,end,verify,findRecord,changeFields,saveChanges,repeat,bulkUpdate,';
     procedure err (p in varchar2) is
     begin
       if length(l_errs) > 3500 then return; end if;

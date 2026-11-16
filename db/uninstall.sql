@@ -4,6 +4,7 @@ begin ords.delete_module(p_module_name => 'flowchat'); exception when others the
 drop package fc_designer;
 drop package fc_demo_connectors;
 drop package fc_demo_verify;
+drop package fc_demo_expenses;
 drop package fc_engine;
 drop package fc_data;
 drop table fc_demo_loan_apps purge;
@@ -13,6 +14,7 @@ drop table fc_lovs purge;
 drop table fc_demo_customers purge;
 drop table fc_data_source_fields purge;
 drop table fc_data_sources purge;
+drop table fc_files purge;
 drop table fc_events purge;
 drop table fc_sessions purge;
 drop table fc_connectors purge;

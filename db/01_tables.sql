@@ -67,7 +67,23 @@ create table fc_events (
   created_at   timestamp with time zone default systimestamp not null,
   constraint fc_events_pk primary key (event_id),
   constraint fc_events_sess_fk foreign key (session_id) references fc_sessions on delete cascade,
-  constraint fc_events_dir_ck check (direction in ('IN', 'OUT')),
+  constraint fc_events_dir_ck check (direction in ('IN', 'OUT', 'DBG')),
   constraint fc_events_payload_ck check (payload is json)
 );
+
+-- Files uploaded as answers (input kind "file"). The slot keeps {id, name, size, mimeType};
+-- a submit connector reads the content here:  where file_id = :id and session_id = :sessionId
+create table fc_files (
+  file_id      varchar2(32)   not null,
+  session_id   varchar2(32)   not null,
+  slot         varchar2(200)  not null,
+  filename     varchar2(400)  not null,
+  mime_type    varchar2(100),
+  file_size    number,
+  content      blob,
+  created_at   timestamp with time zone default systimestamp not null,
+  constraint fc_files_pk primary key (file_id),
+  constraint fc_files_sess_fk foreign key (session_id) references fc_sessions on delete cascade
+);
+create index fc_files_sess_ix on fc_files (session_id);
 create index fc_events_sess_ix on fc_events (session_id, event_id);

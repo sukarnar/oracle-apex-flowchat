@@ -19,6 +19,12 @@
  *   submit-request APEX request value used by on-complete="submit-page" (default FC_COMPLETE)
  *   manual-start  don't start automatically; call el.start()
  *   theme         light | dark | auto            (default auto)
+ *   version       pin a published version of the flow (default: the latest published version)
+ *   resume        session | local   keep the conversation across page reloads (sessionStorage is
+ *                 cleared when the tab closes; local keeps it until the conversation ends or expires)
+ *
+ * File answers (input kind "file") are read in the browser and sent base64-encoded; the APEX
+ * transport sends large inputs in p_clob_01, so they aren't limited by the 32K item size.
  *
  * Events (bubble, composed): fc-turn, fc-field, fc-complete, fc-error
  */
@@ -51,29 +57,45 @@
       });
     });
   };
-  RestTransport.prototype.start = function (flowId, context) { return this._post('/sessions', { flowId: flowId, context: context }); };
+  RestTransport.prototype.start = function (flowId, context, version) {
+    var body = { flowId: flowId, context: context };
+    if (version) body.version = Number(version);
+    return this._post('/sessions', body);
+  };
   RestTransport.prototype.input = function (sid, payload) { return this._post('/sessions/' + encodeURIComponent(sid) + '/input', payload); };
 
   function ApexTransport(startProcess, inputProcess) {
     this.startProcess = startProcess || 'FC_START';
     this.inputProcess = inputProcess || 'FC_INPUT';
   }
-  ApexTransport.prototype._call = function (proc, x01, x02) {
+  // x02 is limited to 32K, so a large JSON (a file answer) goes in p_clob_01 instead.
+  ApexTransport.prototype._call = function (proc, x01, json, x03) {
     if (!window.apex || !apex.server) return Promise.reject(new Error('APEX JavaScript API not found on this page'));
+    var data = { x01: x01 };
+    if (json.length > 8000) data.p_clob_01 = json; else data.x02 = json;
+    if (x03) data.x03 = String(x03);
     return new Promise(function (resolve, reject) {
-      apex.server.process(proc, { x01: x01, x02: x02 }, { dataType: 'text' })
+      apex.server.process(proc, data, { dataType: 'text' })
         .done(function (d) { try { resolve(checkTurn(d)); } catch (e) { reject(e); } })
         .fail(function (xhr, status, err) { reject(new Error(err || status || 'AJAX error')); });
     });
   };
-  ApexTransport.prototype.start = function (flowId, context) { return this._call(this.startProcess, flowId, JSON.stringify(context || {})); };
+  ApexTransport.prototype.start = function (flowId, context, version) { return this._call(this.startProcess, flowId, JSON.stringify(context || {}), version); };
   ApexTransport.prototype.input = function (sid, payload) { return this._call(this.inputProcess, sid, JSON.stringify(payload || {})); };
 
   function LocalTransport(engine) { this.engine = engine; }
-  LocalTransport.prototype.start = function (flowId, context) { return this.engine.start(flowId, context).then(checkTurn); };
+  LocalTransport.prototype.start = function (flowId, context, version) {
+    return this.engine.start(flowId, context, version ? { version: Number(version) } : undefined).then(checkTurn);
+  };
   LocalTransport.prototype.input = function (sid, payload) { return this.engine.input(sid, payload).then(checkTurn); };
 
   // ------------------------------------------------------------------ adapters
+  // The text a page field gets: plain values as they are; lists and files show their display text.
+  function fieldText(u) {
+    if (u.value === null || u.value === undefined) return '';
+    if (typeof u.value === 'object') return u.display || '';
+    return String(u.value);
+  }
   var hostCssInjected = false;
   function injectHostCss() {
     if (hostCssInjected) return; hostCssInjected = true;
@@ -109,8 +131,9 @@
   DomAdapter.prototype.apply = function (u) {
     var sel = u.binding && u.binding.dom;
     if (!sel) return;
-    var v = u.value === null || u.value === undefined ? '' : String(u.value);
+    var v = fieldText(u);
     this.root.querySelectorAll(sel).forEach(function (el) {
+      if (el.type === 'file') return;   // a file input can't be set from script
       if (el.type === 'checkbox') el.checked = v === 'Y' || v === 'true';
       else if (el.type === 'radio') el.checked = el.value === v;
       else el.value = v;
@@ -134,7 +157,7 @@
     if (!name || !window.apex) return;
     var item = apex.item(name);
     if (!item || !item.node) return;
-    var v = u.value === null || u.value === undefined ? '' : String(u.value);
+    var v = fieldText(u);
     // Display value is passed for popup LOVs; date items should use format mask YYYY-MM-DD.
     item.setValue(v, u.display || v);
     if (v !== '') flash(document.getElementById(name + '_CONTAINER') || item.node);
@@ -217,6 +240,16 @@
     '.opt{font:inherit;font-size:14px;text-align:left;padding:8px 12px;border:0;border-bottom:1px solid var(--fc-border);background:var(--fc-bg);color:var(--fc-text);cursor:pointer}',
     '.opt:last-child{border-bottom:0}.opt:hover,.opt:focus-visible,.opt.cur{background:color-mix(in srgb,var(--fc-accent) 12%,var(--fc-bg));outline:none}',
     '.opt.cur{font-weight:600}.optnone{padding:8px 12px;font-size:13px;color:var(--fc-muted)}',
+    '.items{display:flex;flex-direction:column;gap:4px;max-height:180px;overflow-y:auto}',
+    '.item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;border:1px solid var(--fc-border);border-radius:10px;font-size:13.5px}',
+    '.item span{overflow-wrap:anywhere}.li{padding:5px 0;border-top:1px dashed var(--fc-border)}.li:first-of-type{border-top:0}',
+    '.li small{display:block;color:var(--fc-muted);font-size:12px}',
+    '.btns{display:flex;gap:8px;flex-wrap:wrap}',
+    '.btn.danger{background:var(--fc-error);border-color:var(--fc-error);color:#fff;font-weight:500}',
+    '.drop{display:flex;align-items:center;gap:10px;border:1.5px dashed var(--fc-border);border-radius:10px;padding:10px 12px;font-size:13.5px}',
+    '.drop.over{border-color:var(--fc-accent);background:color-mix(in srgb,var(--fc-accent) 8%,transparent)}',
+    '.drop .name{flex:1;min-width:0;color:var(--fc-muted);overflow-wrap:anywhere}',
+    '.restored{opacity:.75}',
     '@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}'
   ].join('');
 
@@ -230,6 +263,24 @@
     return e;
   }
   function delay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function kb(n) { return n < 1048576 ? Math.max(1, Math.round(n / 1024)) + ' KB' : (Math.round(n / 104857.6) / 10) + ' MB'; }
+  function acceptOk(accept, file) {
+    var list = (Array.isArray(accept) ? accept : String(accept || '').split(',')).map(function (x) { return String(x).trim().toLowerCase(); }).filter(Boolean);
+    if (!list.length) return true;
+    var ext = (file.name.toLowerCase().match(/\.[^.]+$/) || [''])[0], type = String(file.type || '').toLowerCase();
+    return list.some(function (a) { return a[0] === '.' ? a === ext : /\/\*$/.test(a) ? type.indexOf(a.slice(0, -1)) === 0 : a === type; });
+  }
+  function readBase64(file) {
+    return new Promise(function (resolve, reject) {
+      var r = new FileReader();
+      r.onload = function () { resolve(String(r.result).replace(/^data:[^,]*,/, '')); };
+      r.onerror = function () { reject(new Error('The file could not be read.')); };
+      r.readAsDataURL(file);
+    });
+  }
+  function storageOf(mode) {
+    try { return mode === 'local' ? window.localStorage : mode === 'session' ? window.sessionStorage : null; } catch (e) { return null; }
+  }
   function isoLocal(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
   function resolveDate(s) {
     var d = new Date();
@@ -295,7 +346,7 @@
       var restart = h('button', 'restart', 'Start over');
       restart.type = 'button';
       restart.addEventListener('click', () => (this._sid && this._turn && this._turn.status === 'in_progress')
-        ? this.send({ command: 'restart' }, 'Start over') : this.start());
+        ? this.send({ command: 'restart' }, 'Start over') : this.start(true));
       var prog = h('div', 'progress'); this._bar = h('span'); prog.append(this._bar);
       header.append(avatar, titles, restart, prog);
       this._log = h('div', 'log'); this._log.setAttribute('role', 'log'); this._log.setAttribute('aria-live', 'polite');
@@ -305,13 +356,52 @@
       this._shadow.append(style, wrap);
     }
 
-    async start() {
+    /** Starts the conversation. With resume on, picks up a saved one first unless fresh is true. */
+    async start(fresh) {
       this._log.textContent = '';
       this._composer.textContent = '';
-      this._sid = null; this._turn = null;
+      this._sid = null; this._turn = null; this._transcript = [];
       var flow = this.getAttribute('flow');
+      if (fresh) this._forget();
+      else if (await this._resume()) return;
       var ctx = Object.assign({}, this._adapter().readContext(parseContextAttr(this.getAttribute('context'))), this._opts.context);
-      await this._exchange(() => this._transport().start(flow, ctx));
+      await this._exchange(() => this._transport().start(flow, ctx, this.getAttribute('version')));
+    }
+
+    // ---- resume after a reload: the transcript is kept in the browser, the state on the server
+    _store() { return storageOf((this.getAttribute('resume') || '').toLowerCase()); }
+    _storeKey() {
+      return 'flowchat:' + (this.id || '') + ':' + this.getAttribute('flow') + ':' + (this.getAttribute('version') || '') + ':' + location.pathname;
+    }
+    _forget() { var s = this._store(); if (s) try { s.removeItem(this._storeKey()); } catch (e) { /* storage blocked */ } }
+    _remember() {
+      var s = this._store();
+      if (!s || !this._sid) return;
+      try { s.setItem(this._storeKey(), JSON.stringify({ sid: this._sid, at: Date.now(), transcript: this._transcript.slice(-120) })); }
+      catch (e) { /* full or blocked: resume just won't happen */ }
+    }
+    async _resume() {
+      var s = this._store(), saved = null;
+      if (!s) return false;
+      try { saved = JSON.parse(s.getItem(this._storeKey()) || 'null'); } catch (e) { saved = null; }
+      if (!saved || !saved.sid || Date.now() - (saved.at || 0) > 864e5) { this._forget(); return false; }
+      this._setBusy(true);
+      var turn;
+      try {
+        turn = await this._transport().input(saved.sid, { command: 'resume' });
+      } catch (e) {
+        this._setBusy(false); this._forget(); return false;   // expired or another session: start fresh
+      }
+      this._setBusy(false);
+      if (!turn || turn.status !== 'in_progress') { this._forget(); return false; }
+      this._restoring = true;
+      (saved.transcript || []).forEach((x) => { if (x.u !== undefined) this._addUser(x.u); else this._addBot(x.b); });
+      this._restoring = false;
+      this._log.querySelectorAll('.msg').forEach(function (m) { m.classList.add('restored'); });
+      this._disableOldCards();
+      this._transcript = (saved.transcript || []).slice();
+      await this._applyTurn(turn);
+      return true;
     }
 
     /** Send raw protocol input, e.g. {value:'x'} or {command:'back'}. echo = text shown as the user's bubble. */
@@ -354,6 +444,7 @@
       }
       this._setProgress(turn);
       this._renderComposer(turn);
+      if (turn.status === 'in_progress') this._remember(); else this._forget();
       this._emit('fc-turn', turn);
       if (turn.status === 'completed') {
         this._emit('fc-complete', turn);
@@ -398,13 +489,26 @@
     _scroll() { var l = this._log; requestAnimationFrame(function () { l.scrollTop = l.scrollHeight; }); }
 
     _addUser(text) {
+      if (!this._restoring && this._transcript) this._transcript.push({ u: text });
       var m = h('div', 'msg user'); m.append(h('div', 'bubble', text));
       this._log.append(m); this._scroll();
     }
 
     _addBot(msg) {
+      if (!this._restoring && this._transcript && !/^Something went wrong/.test(msg.text || '')) this._transcript.push({ b: msg });
       var m = h('div', 'msg bot' + (msg.type === 'error' ? ' error' : msg.type === 'success' ? ' success' : ''));
-      if (msg.type === 'summary' || msg.type === 'record' || msg.type === 'changes') {
+      if (msg.type === 'list') {
+        // Line items so far, or the records a bulk update will change (read-only).
+        var lc = h('div', 'card');
+        lc.append(h('div', 'card-title', msg.text));
+        (msg.items || []).forEach(function (it) {
+          var li = h('div', 'li', it.title);
+          if (it.subtitle) li.append(h('small', null, it.subtitle));
+          lc.append(li);
+        });
+        m.classList.add('has-card');
+        m.append(lc);
+      } else if (msg.type === 'summary' || msg.type === 'record' || msg.type === 'changes') {
         // summary: answers with Edit · record: read-only current values · changes: old → new with Edit
         var card = h('div', 'card ' + (msg.type === 'record' ? 'record' : 'summary'));
         card.append(h('div', 'card-title', msg.text));
@@ -494,11 +598,43 @@
       return inp;
     }
 
+    // File answer: pick or drop one file; type and size are checked here and again on the server.
+    _renderFile(c, a, spec) {
+      var maxKb = Math.min(Number(spec.maxSizeKb) || 5120, 20480);
+      var drop = h('label', 'drop');
+      var inp = h('input'); inp.type = 'file'; inp.hidden = true;
+      if (spec.accept) inp.accept = Array.isArray(spec.accept) ? spec.accept.join(',') : String(spec.accept);
+      var pick = h('span', 'btn', spec.buttonLabel || 'Choose file');
+      var name = h('span', 'name', spec.placeholder || 'or drop it here (up to ' + kb(maxKb * 1024) + ')');
+      drop.append(inp, pick, name);
+      drop.tabIndex = 0;
+      drop.setAttribute('aria-label', (a.label || 'File') + ': choose a file');
+      drop.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); inp.click(); } });
+      var take = async (file) => {
+        if (!file) return;
+        if (!acceptOk(spec.accept, file)) { name.textContent = 'That type of file is not accepted here.'; return; }
+        if (file.size > maxKb * 1024) { name.textContent = 'That file is too big (limit ' + kb(maxKb * 1024) + ').'; return; }
+        if (!file.size) { name.textContent = 'That file is empty.'; return; }
+        name.textContent = 'Reading ' + file.name + '…';
+        try {
+          var data = await readBase64(file);
+          this.send({ file: { name: file.name, mimeType: file.type || 'application/octet-stream', size: file.size, data: data } },
+                    '📎 ' + file.name + ' (' + kb(file.size) + ')');
+        } catch (e) { name.textContent = e.message; }
+      };
+      inp.addEventListener('change', () => take(inp.files && inp.files[0]));
+      drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
+      drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+      drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); take(e.dataTransfer && e.dataTransfer.files[0]); });
+      c.append(drop);
+      return drop;
+    }
+
     _renderComposer(turn) {
       var c = this._composer; c.textContent = '';
       if (turn.status !== 'in_progress' || !turn['await']) {
         var again = h('button', 'btn', this.getAttribute('restart-label') || 'Start again'); again.type = 'button';
-        again.addEventListener('click', () => this.start());
+        again.addEventListener('click', () => this.start(true));
         c.append(again);
         return;
       }
@@ -532,6 +668,42 @@
         var done = h('button', 'btn primary', a.doneLabel || 'Done'); done.type = 'button';
         done.addEventListener('click', () => this.send({ command: 'done' }, a.doneLabel || 'Done'));
         c.append(fchips, done);
+      } else if (a.type === 'listMenu') {
+        // Repeat step: the items so far (each removable), Add and Done.
+        if ((a.items || []).length) {
+          var items = h('div', 'items');
+          a.items.forEach((it) => {
+            var row = h('div', 'item'); row.append(h('span', null, it.title));
+            var rm = h('button', 'edit', a.removeLabel || 'Remove'); rm.type = 'button';
+            rm.setAttribute('aria-label', (a.removeLabel || 'Remove') + ' ' + it.title);
+            rm.addEventListener('click', () => this.send({ command: 'remove', index: it.index }, (a.removeLabel || 'Remove') + ' ' + it.title));
+            row.append(rm);
+            items.append(row);
+          });
+          c.append(items);
+        }
+        var btns = h('div', 'btns');
+        var add = h('button', 'btn' + (a.canDone ? '' : ' primary'), a.addLabel || 'Add'); add.type = 'button';
+        add.disabled = !a.canAdd;
+        add.addEventListener('click', () => this.send({ command: 'add' }, a.addLabel || 'Add'));
+        var fin = h('button', 'btn' + (a.canDone ? ' primary' : ''), a.doneLabel || 'Done'); fin.type = 'button';
+        fin.disabled = !a.canDone;
+        fin.addEventListener('click', () => this.send({ command: 'done' }, a.doneLabel || 'Done'));
+        btns.append(add, fin);
+        c.append(btns);
+        focusEl = a.canDone ? fin : add;
+      } else if (a.type === 'confirm') {
+        // Bulk update: an explicit go-ahead, or cancel.
+        var cb = h('div', 'btns');
+        var yes = h('button', 'btn ' + (a.danger ? 'danger' : 'primary'), a.confirmLabel || 'Confirm'); yes.type = 'button';
+        yes.addEventListener('click', () => this.send({ command: 'confirm' }, a.confirmLabel || 'Confirm'));
+        var no = h('button', 'btn', a.cancelLabel || 'Cancel'); no.type = 'button';
+        no.addEventListener('click', () => this.send({ command: 'cancel' }, a.cancelLabel || 'Cancel'));
+        cb.append(yes, no);
+        c.append(cb);
+        focusEl = no;
+      } else if (spec.kind === 'file') {
+        focusEl = this._renderFile(c, a, spec);
       } else if (spec.kind === 'choice' && (spec.display === 'list' || (spec.display !== 'buttons' && (spec.options || []).length > 8))) {
         // Long lists (usually lookup lists from the server): type to filter, then pick.
         focusEl = this._renderOptionList(c, a, spec);

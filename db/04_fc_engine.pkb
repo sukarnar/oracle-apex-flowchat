@@ -20,12 +20,20 @@ create or replace package body fc_engine as
     out_msgs      json_array_t,
     updates       json_array_t,    -- slots / alias.field changed during this turn
     replay        boolean,
-    force_ask     varchar2(200)
+    force_ask     varchar2(200),
+    repeat_slots  json_object_t    -- slot -> id of the Repeat node that collects it
   );
 
   -- Lookup list options fetched during this request: "<list>|<params json>" -> [{value, label}].
   -- Reset on every request, so lists are always current.
   g_lov_cache json_object_t;
+
+  -- Debug logging: set_debug(true) logs every conversation of this database session;
+  -- a flow with "debug": true logs its own. g_dbg_sid = the conversation being logged in this request.
+  g_debug   boolean := false;
+  g_dbg_sid varchar2(32);
+
+  function field_def (p_change_node in json_object_t, p_field in varchar2) return json_object_t;   -- forward
 
   ------------------------------------------------------------------------------
   -- scalar helpers
@@ -129,6 +137,25 @@ create or replace package body fc_engine as
     end case;
   end resolve_date;
 
+  -- A value as placeholder text: a list (Repeat) shows its count, a file its name.
+  function text_of (p_obj in json_object_t, p_key in varchar2) return varchar2 is
+    l_el json_element_t;
+  begin
+    if p_obj is null or p_key is null or not p_obj.has(p_key) then return null; end if;
+    l_el := p_obj.get(p_key);
+    if l_el is null or l_el.is_null then return null; end if;
+    if l_el.is_array then return to_char(treat(l_el as json_array_t).get_size); end if;
+    if l_el.is_object then return nvl(str(treat(l_el as json_object_t), 'name'), l_el.to_string); end if;
+    return str(p_obj, p_key);
+  end text_of;
+
+  function size_text (p in number) return varchar2 is
+  begin
+    if p is null then return null; end if;
+    if p < 1048576 then return greatest(1, round(p / 1024)) || ' KB'; end if;
+    return num_str(round(p / 1048576, 1)) || ' MB';
+  end size_text;
+
   -- {{slot}} and {{record.field}} placeholders.
   function interpolate (p_text in varchar2, p_values in json_object_t) return varchar2 is
     l_res varchar2(32767) := p_text;
@@ -138,7 +165,7 @@ create or replace package body fc_engine as
       l_key := regexp_substr(l_res, '\{\{\s*([A-Za-z0-9_.]+)\s*\}\}', 1, 1, null, 1);
       exit when l_key is null;
       l_res := regexp_replace(l_res, '\{\{\s*' || replace(l_key, '.', '\.') || '\s*\}\}',
-                              replace(str(p_values, l_key), '\', '\\'));
+                              replace(text_of(p_values, l_key), '\', '\\'));
     end loop;
     return l_res;
   end interpolate;
@@ -170,6 +197,7 @@ create or replace package body fc_engine as
     l_alias json_key_list := c.records.get_keys;
     l_cur   json_object_t;
     l_flds  json_key_list;
+    l_rep   json_key_list;
   begin
     if l_alias is not null then
       for i in 1 .. l_alias.count loop
@@ -183,6 +211,15 @@ create or replace package body fc_engine as
           end if;
         end if;
       end loop;
+    end if;
+    -- A Repeat slot also exposes its number of items as "<slot>.count" (0 when none).
+    if c.repeat_slots is not null then
+      l_rep := c.repeat_slots.get_keys;
+      if l_rep is not null then
+        for i in 1 .. l_rep.count loop
+          l_v.put(l_rep(i) || '.count', arr(c.slots, l_rep(i)).get_size);
+        end loop;
+      end if;
     end if;
     l_v.put('app_user', coalesce(sys_context('APEX$SESSION', 'APP_USER'), user));
     return l_v;
@@ -339,6 +376,199 @@ create or replace package body fc_engine as
   end call_connector;
 
   ------------------------------------------------------------------------------
+  -- logging: PII masking and debug events (FC_EVENTS)
+  ------------------------------------------------------------------------------
+  -- "pii": true | "last4" on a node or field -> 'full' | 'last4' (null = not PII)
+  function pii_mode (p in json_object_t) return varchar2 is
+    l varchar2(30) := str(p, 'pii');
+  begin
+    return case when l is null or l = 'false' then null when l = 'last4' then 'last4' else 'full' end;
+  end pii_mode;
+
+  procedure add_pii (p_arr in out nocopy json_array_t, p_el in json_element_t, p_mode in varchar2) is
+    l   json_object_t := json_object_t();
+    l_v varchar2(4000);
+  begin
+    if p_el is null or p_el.is_null or p_el.is_array then return; end if;
+    if p_el.is_object then l_v := str(treat(p_el as json_object_t), 'name'); else l_v := el_str(p_el); end if;
+    if l_v is null or length(l_v) < 3 then return; end if;
+    l.put('v', l_v);
+    l.put('m', case when p_mode = 'last4' then 'last4' else 'full' end);
+    p_arr.append(l);
+  end add_pii;
+
+  -- Every value that logs must never show in clear: PII answers, PII record fields and PII
+  -- line-item fields, plus the flow's "piiSlots".
+  function pii_pairs (c in out nocopy t_ctx) return json_array_t is
+    l_out   json_array_t := json_array_t();
+    l_list  json_array_t := arr(c.flow, 'piiSlots');
+    l_nodes json_array_t := c.flow.get_array('nodes');
+    l_n     json_object_t;
+    l_type  varchar2(30);
+    l_flds  json_array_t;
+    l_f     json_object_t;
+    l_fld   varchar2(200);
+    l_mode  varchar2(10);
+    l_rec   json_object_t;
+    l_items json_array_t;
+    l_it    json_object_t;
+    l_draft json_object_t;
+  begin
+    for i in 0 .. l_list.get_size - 1 loop
+      if c.slots.has(el_str(l_list.get(i))) then add_pii(l_out, c.slots.get(el_str(l_list.get(i))), 'full'); end if;
+    end loop;
+    for i in 0 .. l_nodes.get_size - 1 loop
+      l_n    := treat(l_nodes.get(i) as json_object_t);
+      l_type := str(l_n, 'type');
+      if l_type = 'ask' then
+        if pii_mode(l_n) is not null and c.slots.has(str(l_n, 'slot')) then
+          add_pii(l_out, c.slots.get(str(l_n, 'slot')), pii_mode(l_n));
+        end if;
+      elsif l_type = 'changeFields' then
+        l_rec := obj(c.records, str(l_n, 'record'));
+        if l_rec is not null then
+          l_flds := arr(l_n, 'fields');
+          for j in 0 .. l_flds.get_size - 1 loop
+            l_f    := treat(l_flds.get(j) as json_object_t);
+            l_fld  := str(l_f, 'field');
+            l_mode := pii_mode(l_f);
+            if l_mode is not null then
+              if obj(l_rec, 'current') is not null and obj(l_rec, 'current').has(l_fld) then
+                add_pii(l_out, obj(l_rec, 'current').get(l_fld), l_mode);
+              end if;
+              if obj(l_rec, 'original') is not null and obj(l_rec, 'original').has(l_fld) then
+                add_pii(l_out, obj(l_rec, 'original').get(l_fld), l_mode);
+              end if;
+            end if;
+          end loop;
+        end if;
+      elsif l_type = 'repeat' then
+        l_flds  := arr(l_n, 'fields');
+        l_items := arr(c.slots, str(l_n, 'slot'));
+        l_draft := obj(obj(obj(c.state, 'repeat'), str(l_n, 'id')), 'draft');
+        for j in 0 .. l_flds.get_size - 1 loop
+          l_f    := treat(l_flds.get(j) as json_object_t);
+          l_fld  := str(l_f, 'field');
+          l_mode := pii_mode(l_f);
+          if l_mode is not null then
+            for k in 0 .. l_items.get_size - 1 loop
+              if l_items.get(k).is_object then
+                l_it := treat(l_items.get(k) as json_object_t);
+                if l_it.has(l_fld) then add_pii(l_out, l_it.get(l_fld), l_mode); end if;
+              end if;
+            end loop;
+            if l_draft is not null and l_draft.has(l_fld) then add_pii(l_out, l_draft.get(l_fld), l_mode); end if;
+          end if;
+        end loop;
+      end if;
+    end loop;
+    return l_out;
+  end pii_pairs;
+
+  -- Replaces every PII value (as it appears inside JSON text) with a mask, longest values first.
+  function mask_clob (c in out nocopy t_ctx, p_text in clob) return clob is
+    l_pairs json_array_t;
+    l_out   clob := p_text;
+    l_p     json_object_t;
+    l_v     varchar2(4000);
+    l_tmp   json_object_t;
+    l_txt   varchar2(32767);
+    l_esc   varchar2(32767);
+  begin
+    if p_text is null then return p_text; end if;
+    l_pairs := pii_pairs(c);
+    if l_pairs.get_size = 0 then return p_text; end if;
+    for pass in 1 .. 3 loop
+      for i in 0 .. l_pairs.get_size - 1 loop
+        l_p := treat(l_pairs.get(i) as json_object_t);
+        l_v := str(l_p, 'v');
+        if (pass = 1 and length(l_v) >= 20) or (pass = 2 and length(l_v) between 8 and 19) or (pass = 3 and length(l_v) < 8) then
+          l_tmp := json_object_t();
+          l_tmp.put('v', l_v);
+          l_txt := l_tmp.to_string;                      -- {"v":"<escaped>"}
+          l_esc := substr(l_txt, 7, length(l_txt) - 8);
+          if length(l_esc) >= 3 then
+            l_out := replace(l_out, l_esc,
+                       case when str(l_p, 'm') = 'last4' then to_char(unistr('\2022\2022\2022\2022')) || substr(l_v, -4) else '[redacted]' end);
+          end if;
+        end if;
+      end loop;
+    end loop;
+    return l_out;
+  end mask_clob;
+
+  -- One FC_EVENTS row, PII values masked.
+  procedure log_ev (c in out nocopy t_ctx, p_dir in varchar2, p_node in varchar2, p_payload in clob) is
+    l_sid varchar2(32) := c.session_id;
+    l_pay clob := mask_clob(c, p_payload);
+  begin
+    insert into fc_events (session_id, direction, node_id, payload)
+    values (l_sid, p_dir, p_node, l_pay);
+  end log_ev;
+
+  function dbg_rows (c in out nocopy t_ctx) return boolean is
+  begin
+    return g_debug or get_bool(c.flow, 'debug');
+  end dbg_rows;
+
+  function dbg_enabled (c in out nocopy t_ctx) return boolean is
+  begin
+    return dbg_rows(c) or nvl(apex_application.g_debug, false);
+  end dbg_enabled;
+
+  -- A debug event: an FC_EVENTS row (direction DBG) when the flow or set_debug asks for it,
+  -- and an APEX debug message whenever APEX debug is on. Masked like every other row.
+  procedure dbg (c in out nocopy t_ctx, p_node in varchar2, p_ev in json_object_t) is
+    l_e json_object_t := p_ev;
+    l   clob;
+  begin
+    if not dbg_enabled(c) then return; end if;
+    l_e.put('at', to_char(sys_extract_utc(systimestamp), 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"'));
+    l := mask_clob(c, l_e.to_clob);
+    apex_debug.info('FlowChat %s: %s', c.session_id, dbms_lob.substr(l, 3800, 1));
+    if dbg_rows(c) then log_ev(c, 'DBG', p_node, l); end if;
+  end dbg;
+
+  procedure dbg_kv (c in out nocopy t_ctx, p_event in varchar2, p_node in varchar2,
+                    p_k1 in varchar2 default null, p_v1 in varchar2 default null,
+                    p_k2 in varchar2 default null, p_v2 in varchar2 default null) is
+    l json_object_t;
+  begin
+    if not dbg_enabled(c) then return; end if;
+    l := json_object_t();
+    l.put('event', p_event);
+    if p_node is not null then l.put('node', p_node); end if;
+    if p_k1 is not null then l.put(p_k1, p_v1); end if;
+    if p_k2 is not null then l.put(p_k2, p_v2); end if;
+    dbg(c, p_node, l);
+  end dbg_kv;
+
+  -- Calls a connector and, when debugging, logs the payload (no one-time code), response and time.
+  function conn (c in out nocopy t_ctx, p_node in varchar2, p_connector in varchar2, p_payload in clob) return json_object_t is
+    l_t0  timestamp := systimestamp;
+    l_d   interval day to second;
+    l_res json_object_t;
+    l_e   json_object_t;
+    l_pay json_object_t;
+  begin
+    l_res := call_connector(p_connector, p_payload);
+    if dbg_enabled(c) then
+      l_d   := systimestamp - l_t0;
+      l_pay := json_object_t.parse(p_payload);
+      if l_pay.has('code') then l_pay.put('code', '(one-time code, not logged)'); end if;
+      l_e := json_object_t();
+      l_e.put('event', 'connector');
+      l_e.put('node', p_node);
+      l_e.put('connector', p_connector);
+      l_e.put('ms', round((extract(minute from l_d) * 60 + extract(second from l_d)) * 1000));
+      l_e.put('payload', l_pay);
+      l_e.put('response', l_res);
+      dbg(c, p_node, l_e);
+    end if;
+    return l_res;
+  end conn;
+
+  ------------------------------------------------------------------------------
   -- parsing, display & validation
   ------------------------------------------------------------------------------
   function parse_value (p_spec in json_object_t, p_raw in varchar2) return json_object_t is
@@ -420,6 +650,9 @@ create or replace package body fc_engine as
         else return err('Please answer yes or no.');
         end if;
 
+      when 'file' then
+        return err('Please attach a file.');
+
       else
         l_res.put('value', l_s);
     end case;
@@ -429,8 +662,17 @@ create or replace package body fc_engine as
   function display_for (p_spec in json_object_t, p_val in varchar2) return varchar2 is
     l_opts json_array_t;
     l_opt  json_object_t;
+    l_file json_object_t;
   begin
     if p_val is null then return null; end if;
+    if str(p_spec, 'kind') = 'file' then
+      begin
+        l_file := json_object_t.parse(p_val);
+        return nvl(str(l_file, 'name'), 'file') || ' (' || size_text(to_num(str(l_file, 'size'))) || ')';
+      exception when others then
+        return p_val;
+      end;
+    end if;
     case str(p_spec, 'kind')
       when 'number' then return str(p_spec, 'prefix') || nvl(fmt_num(to_num(p_val)), p_val);
       when 'yesno'  then return case p_val when 'Y' then 'Yes' when 'N' then 'No' else p_val end;
@@ -468,6 +710,174 @@ create or replace package body fc_engine as
     return get_node(c, l_id);
   end change_node;
 
+  ------------------------------------------------------------------------------
+  -- repeat (line items / child rows): the slot holds an array of {field: value} objects;
+  -- state.repeat[nodeId] = {draft: {...}, field: n} while an item is being answered.
+  ------------------------------------------------------------------------------
+  function rp_items (c in out nocopy t_ctx, p_node in json_object_t) return json_array_t is
+  begin
+    return arr(c.slots, str(p_node, 'slot'));
+  end rp_items;
+
+  function rp_min (p_node in json_object_t) return pls_integer is
+  begin
+    if str(p_node, 'min') is null then return 1; end if;
+    return greatest(nvl(trunc(to_num(str(p_node, 'min'))), 0), 0);
+  end rp_min;
+
+  function rp_max (p_node in json_object_t) return pls_integer is
+  begin
+    return least(greatest(nvl(trunc(to_num(str(p_node, 'max'))), 20), 1), 100);
+  end rp_max;
+
+  function rp_state (c in out nocopy t_ctx, p_id in varchar2) return json_object_t is
+  begin
+    return obj(obj(c.state, 'repeat'), p_id);
+  end rp_state;
+
+  procedure rp_put (c in out nocopy t_ctx, p_id in varchar2, p_st in json_object_t) is
+    l_all json_object_t := obj(c.state, 'repeat');
+  begin
+    if l_all is null then l_all := json_object_t(); end if;
+    if p_st is null then
+      if l_all.has(p_id) then l_all.remove(p_id); end if;
+    else
+      l_all.put(p_id, p_st);
+    end if;
+    c.state.put('repeat', l_all);
+  end rp_put;
+
+  function in_history (c in out nocopy t_ctx, p_id in varchar2) return boolean is
+  begin
+    for i in 0 .. c.history.get_size - 1 loop
+      if c.history.get_string(i) = p_id then return true; end if;
+    end loop;
+    return false;
+  end in_history;
+
+  -- Finished: enough items, and Done was tapped (or items exist), with no item half-answered.
+  function rp_complete (c in out nocopy t_ctx, p_node in json_object_t) return boolean is
+    l_n pls_integer := rp_items(c, p_node).get_size;
+  begin
+    return l_n >= rp_min(p_node)
+       and (l_n > 0 or in_history(c, str(p_node, 'id')))
+       and rp_state(c, str(p_node, 'id')) is null;
+  end rp_complete;
+
+  -- A line-item field validated like an Ask node.
+  function rp_field_node (p_node in json_object_t, p_fd in json_object_t) return json_object_t is
+    l json_object_t := json_object_t();
+  begin
+    l.put('id', str(p_node, 'id'));
+    l.put('slot', str(p_node, 'slot') || '.' || str(p_fd, 'field'));
+    l.put('input', input_spec(p_fd));
+    if p_fd.has('validators') then l.put('validators', p_fd.get_array('validators')); end if;
+    return l;
+  end rp_field_node;
+
+  function item_title (c in out nocopy t_ctx, p_node in json_object_t, p_item in json_object_t, p_i in pls_integer) return varchar2 is
+    l_v    json_object_t := json_object_t();
+    l_flds json_array_t  := arr(p_node, 'fields');
+    l_f    json_object_t;
+    l_d    varchar2(4000);
+    l_t    varchar2(32767);
+  begin
+    l_v.put('n', p_i + 1);
+    for i in 0 .. l_flds.get_size - 1 loop
+      l_f := treat(l_flds.get(i) as json_object_t);
+      l_d := display_for(eff_spec(c, input_spec(l_f)), str(p_item, str(l_f, 'field')));
+      l_v.put(str(l_f, 'field'), l_d);
+      if l_d is not null then
+        l_t := l_t || case when l_t is not null then ' ' || to_char(unistr('\00B7')) || ' ' end || l_d;
+      end if;
+    end loop;
+    if str(p_node, 'itemTitle') is not null then return interpolate(str(p_node, 'itemTitle'), l_v); end if;
+    return nvl(l_t, 'Item ' || (p_i + 1));
+  end item_title;
+
+  function repeat_titles (c in out nocopy t_ctx, p_node in json_object_t) return varchar2 is
+    l_items json_array_t := rp_items(c, p_node);
+    l_t     varchar2(32767);
+  begin
+    for i in 0 .. l_items.get_size - 1 loop
+      l_t := l_t || case when i > 0 then '; ' end || item_title(c, p_node, treat(l_items.get(i) as json_object_t), i);
+    end loop;
+    return l_t;
+  end repeat_titles;
+
+  function rp_vals (c in out nocopy t_ctx, p_node in json_object_t, p_extra in json_object_t default null) return json_object_t is
+    l      json_object_t := vals(c);
+    l_n    pls_integer   := rp_items(c, p_node).get_size;
+    l_keys json_key_list;
+  begin
+    l.put('count', l_n);
+    l.put('min', rp_min(p_node));
+    l.put('max', rp_max(p_node));
+    l.put('n', l_n + 1);
+    l.put('item', nvl(str(p_node, 'itemLabel'), 'item'));
+    if p_extra is not null then
+      l_keys := p_extra.get_keys;
+      if l_keys is not null then
+        for i in 1 .. l_keys.count loop l.put(l_keys(i), p_extra.get(l_keys(i))); end loop;
+      end if;
+    end if;
+    return l;
+  end rp_vals;
+
+  procedure rp_card (c in out nocopy t_ctx, p_node in json_object_t) is
+    l_items json_array_t := rp_items(c, p_node);
+    l_list  json_array_t := json_array_t();
+    l_it    json_object_t;
+    l_msg   json_object_t := json_object_t();
+  begin
+    for i in 0 .. l_items.get_size - 1 loop
+      l_it := json_object_t();
+      l_it.put('index', i);
+      l_it.put('title', item_title(c, p_node, treat(l_items.get(i) as json_object_t), i));
+      l_list.append(l_it);
+    end loop;
+    l_msg.put('type', 'list');
+    l_msg.put('text', interpolate(nvl(str(p_node, 'listTitle'), nvl(str(p_node, 'label'), 'Items') || ' ({{count}})'), rp_vals(c, p_node)));
+    l_msg.put('items', l_list);
+    c.out_msgs.append(l_msg);
+  end rp_card;
+
+  procedure rp_prompt_field (c in out nocopy t_ctx, p_node in json_object_t) is
+    l_rs json_object_t := rp_state(c, str(p_node, 'id'));
+    l_f  json_object_t := treat(arr(p_node, 'fields').get(nvl(to_num(str(l_rs, 'field')), 0)) as json_object_t);
+  begin
+    add_msg(c, 'text', interpolate(nvl(str(l_f, 'prompt'), nvl(str(l_f, 'label'), str(l_f, 'field')) || ' for {{item}} {{n}}?'),
+                                   rp_vals(c, p_node, obj(l_rs, 'draft'))));
+  end rp_prompt_field;
+
+  -- Shows the step as it stands: the question being answered, or the list with Add / Done.
+  procedure rp_show (c in out nocopy t_ctx, p_node in json_object_t) is
+    l_pr json_object_t := obj(p_node, 'prompts');
+    l_n  pls_integer   := rp_items(c, p_node).get_size;
+  begin
+    c.state.put('current', str(p_node, 'id'));
+    if rp_state(c, str(p_node, 'id')) is not null then
+      rp_prompt_field(c, p_node);
+      return;
+    end if;
+    if l_n > 0 then rp_card(c, p_node); end if;
+    add_msg(c, 'text', interpolate(
+      case when l_n >= rp_max(p_node) then nvl(str(l_pr, 'full'), 'That''s the most I can take ({{max}}). Tap Done to continue.')
+           when l_n >= rp_min(p_node) then nvl(str(l_pr, 'menu'), 'Add another {{item}}, or tap Done.')
+           when l_n > 0 then nvl(str(l_pr, 'tooFew'), 'Please add at least {{min}}.')
+           else nvl(str(l_pr, 'empty'), 'Tap Add to add a {{item}}.') end,
+      rp_vals(c, p_node)));
+  end rp_show;
+
+  procedure rp_start (c in out nocopy t_ctx, p_node in json_object_t) is
+    l_rs json_object_t := json_object_t();
+  begin
+    l_rs.put('draft', json_object_t());
+    l_rs.put('field', 0);
+    rp_put(c, str(p_node, 'id'), l_rs);
+    rp_prompt_field(c, p_node);
+  end rp_start;
+
   -- Input spec for a slot or "alias.field" (used for display formatting).
   function spec_for (c in out nocopy t_ctx, p_name in varchar2) return json_object_t is
     l_dot pls_integer := instr(p_name, '.');
@@ -489,6 +899,9 @@ create or replace package body fc_engine as
 
   function display_value (c in out nocopy t_ctx, p_name in varchar2) return varchar2 is
   begin
+    if c.repeat_slots is not null and c.repeat_slots.has(p_name) then
+      return repeat_titles(c, get_node(c, str(c.repeat_slots, p_name)));
+    end if;
     return display_for(spec_for(c, p_name), str(vals(c), p_name));
   end display_value;
 
@@ -512,10 +925,12 @@ create or replace package body fc_engine as
     l_prefix := str(l_spec, 'prefix');
     if l_val is null then
       if str(l_spec, 'required') = 'false' then return null; end if;
-      return nvl(str(l_spec, 'requiredMessage'), c_required);
+      return nvl(str(l_spec, 'requiredMessage'), case when l_kind = 'file' then 'Please attach a file.' else c_required end);
     end if;
 
-    if l_kind = 'choice' then
+    if l_kind = 'file' then
+      if not p_parsed.get('value').is_object then return 'Please attach a file.'; end if;
+    elsif l_kind = 'choice' then
       -- Also catches an answer a lookup list no longer offers (an answer it depends on changed).
       l_opts := arr(l_spec, 'options');
       for i in 0 .. l_opts.get_size - 1 loop
@@ -558,8 +973,8 @@ create or replace package body fc_engine as
           return nvl(str(l_v, 'message'), 'That value isn''t in the expected format.');
         end if;
       elsif str(l_v, 'type') = 'server' then
-        l_res := call_connector(str(l_v, 'connector'),
-                                payload(c, str(p_node, 'id'), str(p_node, 'slot'), p_parsed.get('value')));
+        l_res := conn(c, str(p_node, 'id'), str(l_v, 'connector'),
+                      payload(c, str(p_node, 'id'), str(p_node, 'slot'), p_parsed.get('value')));
         if str(l_res, 'valid') = 'false' then
           return coalesce(str(l_res, 'message'), str(l_v, 'message'), 'That value wasn''t accepted.');
         end if;
@@ -815,7 +1230,7 @@ create or replace package body fc_engine as
     l_pay.put('to', l_target);
     l_pay.put('code', l_code);
     l_pay.put('ttlMinutes', l_ttl);
-    l_res := call_connector(str(p_node, 'connector'), l_pay.to_clob);
+    l_res := conn(c, l_id, str(p_node, 'connector'), l_pay.to_clob);
     if str(l_res, 'ok') = 'false' then
       l_all.remove(l_id);
       c.state.put('verify', l_all);
@@ -849,32 +1264,18 @@ create or replace package body fc_engine as
     return null;
   end run_verify;
 
-  function run_find (c in out nocopy t_ctx, p_node in json_object_t, p_await out boolean) return varchar2 is
-    l_v       json_object_t := vals(c);
-    l_prompts json_object_t := obj(p_node, 'prompts');
-    l_card    json_object_t := obj(p_node, 'card');
-    l_crit    json_array_t  := json_array_t();
-    l_cdef    json_array_t  := arr(p_node, 'criteria');
-    l_cd      json_object_t;
-    l_c       json_object_t;
-    l_val     varchar2(4000);
-    l_max     pls_integer   := nvl(to_num(str(p_node, 'maxResults')), 10);
-    l_rows    json_array_t;
-    l_row     json_object_t;
-    l_vals    json_object_t;
-    l_res     json_array_t  := json_array_t();
-    l_r       json_object_t;
+  -- Search criteria from answered slots; p_ok = false when fewer than minCriteria are answered.
+  -- byRowFilter: no criteria; the data source's row filter (e.g. owner = :APP_USER) picks the rows.
+  function crit_for (c in out nocopy t_ctx, p_node in json_object_t, p_ok out boolean) return json_array_t is
+    l_v    json_object_t := vals(c);
+    l_crit json_array_t  := json_array_t();
+    l_cdef json_array_t  := arr(p_node, 'criteria');
+    l_cd   json_object_t;
+    l_c    json_object_t;
+    l_val  varchar2(4000);
   begin
-    p_await := false;
-    if str(p_node, 'requireVerified') is not null and not is_verified(c, str(p_node, 'requireVerified')) then
-      -- never search for an identity that hasn't passed a Verify step (a flow design error)
-      add_msg(c, 'error', 'I can''t look that up until it has been verified.');
-      return failed(c);
-    end if;
-    -- byRowFilter: no criteria; the data source's row filter (e.g. owner = :APP_USER) picks the rows.
-    if nvl(str(p_node, 'byRowFilter'), 'false') = 'true' then
-      l_cdef := json_array_t();
-    end if;
+    p_ok := true;
+    if nvl(str(p_node, 'byRowFilter'), 'false') = 'true' then return l_crit; end if;
     for i in 0 .. l_cdef.get_size - 1 loop
       l_cd  := treat(l_cdef.get(i) as json_object_t);
       l_val := str(l_v, str(l_cd, 'slot'));
@@ -886,12 +1287,61 @@ create or replace package body fc_engine as
         l_crit.append(l_c);
       end if;
     end loop;
-    if nvl(str(p_node, 'byRowFilter'), 'false') <> 'true' and l_crit.get_size < nvl(to_num(str(p_node, 'minCriteria')), 1) then
+    p_ok := l_crit.get_size >= nvl(to_num(str(p_node, 'minCriteria')), 1);
+    return l_crit;
+  end crit_for;
+
+  function search_src (c in out nocopy t_ctx, p_node in json_object_t, p_crit in json_array_t, p_limit in pls_integer) return json_array_t is
+    l_rows json_array_t;
+    l_e    json_object_t;
+  begin
+    l_rows := fc_data.search_rows(str(p_node, 'source'), p_crit, p_limit, obj(c.state, 'context'));
+    if dbg_enabled(c) then
+      l_e := json_object_t();
+      l_e.put('event', 'search');
+      l_e.put('node', str(p_node, 'id'));
+      l_e.put('source', str(p_node, 'source'));
+      l_e.put('criteria', p_crit);
+      l_e.put('rows', l_rows.get_size);
+      dbg(c, str(p_node, 'id'), l_e);
+    end if;
+    return l_rows;
+  end search_src;
+
+  -- Never search for an identity that hasn't passed a Verify step (a flow design error).
+  function verified_gate (c in out nocopy t_ctx, p_node in json_object_t) return boolean is
+  begin
+    if str(p_node, 'requireVerified') is not null and not is_verified(c, str(p_node, 'requireVerified')) then
+      add_msg(c, 'error', 'I can''t look that up until it has been verified.');
+      return false;
+    end if;
+    return true;
+  end verified_gate;
+
+  function run_find (c in out nocopy t_ctx, p_node in json_object_t, p_await out boolean) return varchar2 is
+    l_v       json_object_t := vals(c);
+    l_prompts json_object_t := obj(p_node, 'prompts');
+    l_card    json_object_t := obj(p_node, 'card');
+    l_crit    json_array_t;
+    l_ok      boolean;
+    l_max     pls_integer   := nvl(to_num(str(p_node, 'maxResults')), 10);
+    l_rows    json_array_t;
+    l_row     json_object_t;
+    l_vals    json_object_t;
+    l_res     json_array_t  := json_array_t();
+    l_r       json_object_t;
+  begin
+    p_await := false;
+    if not verified_gate(c, p_node) then
+      return failed(c);
+    end if;
+    l_crit := crit_for(c, p_node, l_ok);
+    if not l_ok then
       add_msg(c, 'text', interpolate(nvl(str(l_prompts, 'none'), c_not_found), l_v));
       return str(p_node, 'notFound');
     end if;
 
-    l_rows := fc_data.search_rows(str(p_node, 'source'), l_crit, l_max + 1, obj(c.state, 'context'));
+    l_rows := search_src(c, p_node, l_crit, l_max + 1);
     if l_rows.get_size = 0 then
       add_msg(c, 'text', interpolate(nvl(str(l_prompts, 'none'), c_not_found), l_v));
       return str(p_node, 'notFound');
@@ -984,8 +1434,7 @@ create or replace package body fc_engine as
     l_audit.put('after', l_changes);
     l_audit.put('result', nvl(str(l_r, 'status'), 'error'));
     l_audit_c := l_audit.to_clob;   -- package-private functions and object methods can't appear inside SQL
-    insert into fc_events (session_id, direction, node_id, payload)
-    values (l_sid, 'OUT', l_nid, l_audit_c);
+    log_ev(c, 'OUT', l_nid, l_audit_c);
 
     case nvl(str(l_r, 'status'), 'error')
       when 'ok' then
@@ -1024,6 +1473,155 @@ create or replace package body fc_engine as
         return route(c, str(p_node, 'error'));
     end case;
   end run_save;
+
+  ------------------------------------------------------------------------------
+  -- bulk update: the same change applied to every record a search finds, after a confirmation.
+  -- state.bulk[nodeId] = {keys, count, changes, changeText, preview} (keys never leave the server)
+  ------------------------------------------------------------------------------
+  function bulk_state (c in out nocopy t_ctx, p_id in varchar2) return json_object_t is
+  begin
+    return obj(obj(c.state, 'bulk'), p_id);
+  end bulk_state;
+
+  procedure bulk_put (c in out nocopy t_ctx, p_id in varchar2, p_b in json_object_t) is
+    l_all json_object_t := obj(c.state, 'bulk');
+  begin
+    if l_all is null then l_all := json_object_t(); end if;
+    if p_b is null then
+      if l_all.has(p_id) then l_all.remove(p_id); end if;
+    else
+      l_all.put(p_id, p_b);
+    end if;
+    c.state.put('bulk', l_all);
+  end bulk_put;
+
+  procedure bulk_confirm (c in out nocopy t_ctx, p_node in json_object_t) is
+    l_b     json_object_t := bulk_state(c, str(p_node, 'id'));
+    l_pr    json_object_t := obj(p_node, 'prompts');
+    l_v     json_object_t := vals(c);
+    l_cnt   pls_integer   := nvl(to_num(str(l_b, 'count')), 0);
+    l_prev  json_array_t  := arr(l_b, 'preview');
+    l_items json_array_t  := json_array_t();
+    l_it    json_object_t;
+    l_p     json_object_t;
+    l_msg   json_object_t := json_object_t();
+  begin
+    l_v.put('count', l_cnt);
+    l_v.put('records', case when l_cnt = 1 then 'record' else 'records' end);
+    l_v.put('changes', str(l_b, 'changeText'));
+    add_msg(c, 'text', interpolate(nvl(str(l_pr, 'confirm'),
+      'This will set {{changes}} on {{count}} {{records}}. Do you want to go ahead?'), l_v));
+    for i in 0 .. l_prev.get_size - 1 loop
+      l_p  := treat(l_prev.get(i) as json_object_t);
+      l_it := json_object_t();
+      l_it.put('index', i);
+      l_it.put('title', str(l_p, 'title'));
+      l_it.put('subtitle', str(l_p, 'subtitle'));
+      l_items.append(l_it);
+    end loop;
+    if l_cnt > l_prev.get_size then
+      l_it := json_object_t();
+      l_it.put('index', -1);
+      l_it.put('title', to_char(unistr('\2026')) || 'and ' || (l_cnt - l_prev.get_size) || ' more');
+      l_items.append(l_it);
+    end if;
+    l_msg.put('type', 'list');
+    l_msg.put('text', interpolate(nvl(str(l_pr, 'listTitle'), 'Records to change'), l_v));
+    l_msg.put('items', l_items);
+    c.out_msgs.append(l_msg);
+  end bulk_confirm;
+
+  function run_bulk (c in out nocopy t_ctx, p_node in json_object_t, p_await out boolean) return varchar2 is
+    l_id      varchar2(200) := str(p_node, 'id');
+    l_v       json_object_t := vals(c);
+    l_pr      json_object_t := obj(p_node, 'prompts');
+    l_card    json_object_t := obj(p_node, 'card');
+    l_crit    json_array_t;
+    l_ok      boolean;
+    l_max     pls_integer   := least(greatest(nvl(trunc(to_num(str(p_node, 'maxRows'))), 50), 1), 500);
+    l_rows    json_array_t;
+    l_row     json_object_t;
+    l_set     json_object_t := obj(p_node, 'set');
+    l_skeys   json_key_list;
+    l_el      json_element_t;
+    l_so      json_object_t;
+    l_label   varchar2(200);
+    l_changes json_object_t := json_object_t();
+    l_text    varchar2(4000);
+    l_keys    json_array_t  := json_array_t();
+    l_prev    json_array_t  := json_array_t();
+    l_p       json_object_t;
+    l_b       json_object_t := json_object_t();
+  begin
+    p_await := false;
+    if not verified_gate(c, p_node) then
+      return failed(c);
+    end if;
+    l_crit := crit_for(c, p_node, l_ok);
+    if not l_ok then
+      add_msg(c, 'text', interpolate(nvl(str(l_pr, 'none'), 'I couldn''t find any matching records.'), l_v));
+      return route(c, str(p_node, 'none'));
+    end if;
+    l_rows := search_src(c, p_node, l_crit, l_max + 1);
+    if l_rows.get_size = 0 then
+      add_msg(c, 'text', interpolate(nvl(str(l_pr, 'none'), 'I couldn''t find any matching records.'), l_v));
+      return route(c, str(p_node, 'none'));
+    end if;
+    if l_rows.get_size > l_max then
+      l_v.put('max', l_max);
+      add_msg(c, 'text', interpolate(nvl(str(l_pr, 'tooMany'),
+        'That matches more than {{max}} records, which is too many to change at once.'), l_v));
+      return route(c, coalesce(str(p_node, 'tooMany'), str(p_node, 'none')));
+    end if;
+
+    -- the new values: {"value": ...} literal or {"slot": "..."} from an answer
+    if l_set is not null then
+      l_skeys := l_set.get_keys;
+      if l_skeys is not null then
+        for i in 1 .. l_skeys.count loop
+          l_el    := l_set.get(l_skeys(i));
+          l_label := l_skeys(i);
+          if l_el.is_object then
+            l_so := treat(l_el as json_object_t);
+            l_label := nvl(str(l_so, 'label'), l_skeys(i));
+            if str(l_so, 'slot') is not null then
+              if str(l_v, str(l_so, 'slot')) is not null then l_changes.put(l_skeys(i), l_v.get(str(l_so, 'slot')));
+              else l_changes.put_null(l_skeys(i));
+              end if;
+            elsif l_so.has('value') then
+              l_changes.put(l_skeys(i), l_so.get('value'));
+            else
+              l_changes.put_null(l_skeys(i));
+            end if;
+          else
+            l_changes.put(l_skeys(i), l_el);
+          end if;
+          l_text := l_text || case when i > 1 then ', ' end || l_label || ' = ' || nvl(text_of(l_changes, l_skeys(i)), '(empty)');
+        end loop;
+      end if;
+    end if;
+
+    for i in 0 .. l_rows.get_size - 1 loop
+      l_row := treat(l_rows.get(i) as json_object_t);
+      l_keys.append(str(l_row, 'key'));
+      if i < 10 then
+        l_p := json_object_t();
+        l_p.put('title', interpolate(nvl(str(l_card, 'title'), str(l_row, 'key')), obj(l_row, 'values')));
+        l_p.put('subtitle', case when str(l_card, 'subtitle') is not null then interpolate(str(l_card, 'subtitle'), obj(l_row, 'values')) end);
+        l_prev.append(l_p);
+      end if;
+    end loop;
+    l_b.put('keys', l_keys);
+    l_b.put('count', l_rows.get_size);
+    l_b.put('changes', l_changes);
+    l_b.put('changeText', l_text);
+    l_b.put('preview', l_prev);
+    bulk_put(c, l_id, l_b);
+    c.state.put('current', l_id);
+    bulk_confirm(c, p_node);
+    p_await := true;
+    return null;
+  end run_bulk;
 
   ------------------------------------------------------------------------------
   -- runtime
@@ -1100,7 +1698,7 @@ create or replace package body fc_engine as
       l_nodes := c.flow.get_array('nodes');
       for i in 0 .. l_nodes.get_size - 1 loop
         l_n := treat(l_nodes.get(i) as json_object_t);
-        if str(l_n, 'type') = 'ask' and str(c.slots, str(l_n, 'slot')) is not null then
+        if str(l_n, 'type') in ('ask', 'repeat') and str(c.slots, str(l_n, 'slot')) is not null then
           add_item(str(l_n, 'slot'));
         end if;
       end loop;
@@ -1139,10 +1737,38 @@ create or replace package body fc_engine as
     l_n      json_object_t;
     l_slot   varchar2(200);
     l_parsed json_object_t;
+    l_items  json_array_t;
+    l_it     json_object_t;
+    l_flds   json_array_t;
+    l_f      json_object_t;
+    l_v      json_object_t;
   begin
     for i in 0 .. l_nodes.get_size - 1 loop
       l_n := treat(l_nodes.get(i) as json_object_t);
       l_slot := str(l_n, 'slot');
+      if str(l_n, 'type') = 'repeat' and in_history(c, str(l_n, 'id')) then
+        l_items := rp_items(c, l_n);
+        if l_items.get_size < rp_min(l_n) then
+          l_v := json_object_t();
+          l_v.put('min', rp_min(l_n));
+          p_err := interpolate(nvl(str(obj(l_n, 'prompts'), 'tooFew'), 'Please add at least {{min}}.'), l_v);
+          return str(l_n, 'id');
+        end if;
+        l_flds := arr(l_n, 'fields');
+        for j in 0 .. l_items.get_size - 1 loop
+          l_it := treat(l_items.get(j) as json_object_t);
+          for k in 0 .. l_flds.get_size - 1 loop
+            l_f := treat(l_flds.get(k) as json_object_t);
+            l_parsed := json_object_t();
+            if l_it.has(str(l_f, 'field')) then l_parsed.put('value', l_it.get(str(l_f, 'field'))); else l_parsed.put_null('value'); end if;
+            p_err := validate(c, rp_field_node(l_n, l_f), l_parsed);
+            if p_err is not null then
+              p_err := item_title(c, l_n, l_it, j) || ': ' || p_err;
+              return str(l_n, 'id');
+            end if;
+          end loop;
+        end loop;
+      end if;
       if str(l_n, 'type') = 'ask' and str(c.slots, l_slot) is not null then
         l_parsed := json_object_t();
         l_parsed.put('value', c.slots.get(l_slot));
@@ -1178,10 +1804,16 @@ create or replace package body fc_engine as
         p_total := p_total + 1;
         if key_count(record_changes(obj(c.records, str(l_n, 'record')))) > 0 then p_done := p_done + 1; end if;
         l_id := str(l_n, 'done');
+      elsif l_type = 'repeat' then
+        p_total := p_total + 1;
+        if rp_complete(c, l_n) then p_done := p_done + 1; end if;
+        l_id := str(l_n, 'next');
       elsif l_type = 'condition' then
         l_id := pick_branch(l_v, l_n);
       elsif l_type = 'verify' then
         l_id := str(l_n, 'verified');
+      elsif l_type = 'bulkUpdate' then
+        l_id := str(l_n, 'done');
       elsif l_type in ('message', 'lookup') then
         l_id := str(l_n, 'next');
       else
@@ -1204,6 +1836,7 @@ create or replace package body fc_engine as
     l_skip    boolean;
     l_stale   boolean;
     l_spec    json_object_t;
+    l_prev    varchar2(200);
   begin
     while l_id is not null loop
       l_steps := l_steps + 1;
@@ -1212,6 +1845,7 @@ create or replace package body fc_engine as
       end if;
       l_node := get_node(c, l_id);
       l_type := str(l_node, 'type');
+      dbg_kv(c, 'node', l_id, 'type', l_type, 'replay', case when c.replay then 'true' end);
 
       case l_type
         when 'message' then
@@ -1219,13 +1853,40 @@ create or replace package body fc_engine as
           l_id := str(l_node, 'next');
 
         when 'condition' then
+          l_prev := l_id;
           l_id := pick_branch(vals(c), l_node);
+          dbg_kv(c, 'branch', l_prev, 'next', l_id);
+
+        when 'repeat' then
+          if (c.replay or get_bool(l_node, 'skipIfFilled')) and nvl(c.force_ask, '~') <> l_id and rp_complete(c, l_node) then
+            l_id := str(l_node, 'next');
+          else
+            if c.replay then c.state.put('editing', true); end if;
+            c.replay := false;
+            c.force_ask := null;
+            c.state.put('current', l_id);
+            if str(l_node, 'prompt') is not null then
+              add_msg(c, 'text', interpolate(str(l_node, 'prompt'), rp_vals(c, l_node)));
+            end if;
+            if rp_items(c, l_node).get_size = 0 and rp_state(c, l_id) is null and rp_min(l_node) > 0 then
+              rp_start(c, l_node);
+            else
+              rp_show(c, l_node);
+            end if;
+            return;
+          end if;
+
+        when 'bulkUpdate' then
+          c.replay := false;
+          l_id := run_bulk(c, l_node, l_await);
+          if l_await then return; end if;
+          if l_id is null and str(c.state, 'status') = 'failed' then return; end if;
 
         when 'lookup' then
           if c.replay then
             l_id := str(l_node, 'next');
           else
-            l_res := call_connector(str(l_node, 'connector'), payload(c, l_id));
+            l_res := conn(c, l_id, str(l_node, 'connector'), payload(c, l_id));
             merge_slots(c, l_res);
             add_msg(c, 'text', str(l_res, 'message'));
             if str(l_res, 'found') = 'false' and l_node.has('onNotFound') then
@@ -1249,6 +1910,7 @@ create or replace package body fc_engine as
             end if;
           end if;
           if l_skip then
+            dbg_kv(c, 'skip', l_id, 'reason', 'answered');
             l_id := str(l_node, 'next');
           else
             -- a question reached while replaying an edit keeps the replay going after it's answered
@@ -1283,7 +1945,7 @@ create or replace package body fc_engine as
             c.force_ask := l_bad;
             l_id := l_bad;
           else
-            l_res := call_connector(str(l_node, 'connector'), payload(c, l_id));
+            l_res := conn(c, l_id, str(l_node, 'connector'), payload(c, l_id));
             merge_slots(c, l_res);
             if str(l_res, 'ok') = 'true' then
               add_msg(c, 'text', str(l_res, 'message'));
@@ -1367,6 +2029,9 @@ create or replace package body fc_engine as
     l_spec    json_object_t;
     l_acts    json_array_t;
     l_act     json_object_t;
+    l_rs      json_object_t;
+    l_ritems  json_array_t;
+    l_bv      json_object_t;
   begin
     if str(c.state, 'status') = 'in_progress' and l_cur is not null then
       l_node := get_node(c, l_cur);
@@ -1460,6 +2125,44 @@ create or replace package body fc_engine as
           end loop;
           l_aw.put('fields', l_items);
         end if;
+
+      elsif l_type = 'repeat' then
+        l_rs     := rp_state(c, l_cur);
+        l_ritems := rp_items(c, l_node);
+        if l_rs is not null then
+          l_fd := treat(arr(l_node, 'fields').get(nvl(to_num(str(l_rs, 'field')), 0)) as json_object_t);
+          l_aw.put('type', 'ask');
+          l_aw.put('slot', str(l_node, 'slot') || '.' || str(l_fd, 'field'));
+          l_aw.put('label', field_label(l_fd));
+          l_aw.put('input', turn_input(c, input_spec(l_fd)));
+          l_aw.put_null('value');
+          l_aw.put('item', l_ritems.get_size + 1);
+        else
+          l_aw.put('type', 'listMenu');
+          l_aw.put('itemLabel', nvl(str(l_node, 'itemLabel'), 'item'));
+          l_items := json_array_t();
+          for i in 0 .. l_ritems.get_size - 1 loop
+            l_item := json_object_t();
+            l_item.put('index', i);
+            l_item.put('title', item_title(c, l_node, treat(l_ritems.get(i) as json_object_t), i));
+            l_items.append(l_item);
+          end loop;
+          l_aw.put('items', l_items);
+          l_aw.put('canAdd', l_ritems.get_size < rp_max(l_node));
+          l_aw.put('canDone', l_ritems.get_size >= rp_min(l_node));
+          l_aw.put('addLabel', case when l_ritems.get_size > 0 then nvl(str(l_node, 'addLabel'), 'Add another')
+                                    else nvl(str(l_node, 'firstAddLabel'), 'Add') end);
+          l_aw.put('doneLabel', nvl(str(l_node, 'doneLabel'), 'Done'));
+          l_aw.put('removeLabel', nvl(str(l_node, 'removeLabel'), 'Remove'));
+        end if;
+
+      elsif l_type = 'bulkUpdate' and bulk_state(c, l_cur) is not null then
+        l_bv := vals(c);
+        l_bv.put('count', to_num(str(bulk_state(c, l_cur), 'count')));
+        l_aw.put('type', 'confirm');
+        l_aw.put('confirmLabel', interpolate(nvl(str(l_node, 'confirmLabel'), 'Update {{count}}'), l_bv));
+        l_aw.put('cancelLabel', nvl(str(l_node, 'cancelLabel'), 'Cancel'));
+        l_aw.put('danger', true);
       end if;
     end if;
 
@@ -1486,7 +2189,8 @@ create or replace package body fc_engine as
     if l_aw is not null then l_turn.put('await', l_aw); else l_turn.put_null('await'); end if;
     l_turn.put('fieldUpdates', l_updates);
     l_turn.put('progress', l_prog);
-    l_turn.put('canGoBack', c.history.get_size > 0 or str(c.state, 'editingField') is not null);
+    l_turn.put('canGoBack', c.history.get_size > 0 or str(c.state, 'editingField') is not null
+                            or (l_cur is not null and rp_state(c, l_cur) is not null));
     return l_turn.to_clob;
   end build_turn;
 
@@ -1507,6 +2211,7 @@ create or replace package body fc_engine as
     c.results   := json_object_t();
     c.replay    := false;
     c.force_ask := null;
+    c.repeat_slots := json_object_t();
     g_lov_cache := json_object_t();
   end init_ctx;
 
@@ -1523,12 +2228,16 @@ create or replace package body fc_engine as
     c.nodes := json_object_t();
     c.slot_nodes := json_object_t();
     c.change_nodes := json_object_t();
+    c.repeat_slots := json_object_t();
     l_nodes := c.flow.get_array('nodes');
     for i in 0 .. l_nodes.get_size - 1 loop
       l_node := treat(l_nodes.get(i) as json_object_t);
       l_type := str(l_node, 'type');
       c.nodes.put(str(l_node, 'id'), l_node);
-      if l_type = 'ask' and not c.slot_nodes.has(str(l_node, 'slot')) then
+      if l_type = 'repeat' and not c.repeat_slots.has(str(l_node, 'slot')) then
+        c.repeat_slots.put(str(l_node, 'slot'), str(l_node, 'id'));
+      end if;
+      if l_type in ('ask', 'repeat') and not c.slot_nodes.has(str(l_node, 'slot')) then
         c.slot_nodes.put(str(l_node, 'slot'), str(l_node, 'id'));
       elsif l_type = 'changeFields' and not c.change_nodes.has(str(l_node, 'record')) then
         c.change_nodes.put(str(l_node, 'record'), str(l_node, 'id'));
@@ -1604,6 +2313,7 @@ create or replace package body fc_engine as
     if c.results is null then c.results := json_object_t(); end if;
     if c.state.has('history') then c.history := c.state.get_array('history'); else c.history := json_array_t(); end if;
     fc_data.set_verified(str(c.state, 'verifiedLast'));   -- package state may be left over from another request
+    if dbg_rows(c) then g_dbg_sid := p_session_id; else g_dbg_sid := null; end if;
   end load_session;
 
   ------------------------------------------------------------------------------
@@ -1799,21 +2509,451 @@ create or replace package body fc_engine as
     end if;
   end handle_change;
 
+  procedure handle_repeat (c in out nocopy t_ctx, p_node in json_object_t, p_in in json_object_t, p_cmd in varchar2) is
+    l_id     varchar2(200) := str(p_node, 'id');
+    l_slot   varchar2(200) := str(p_node, 'slot');
+    l_pr     json_object_t := obj(p_node, 'prompts');
+    l_rs     json_object_t := rp_state(c, str(p_node, 'id'));
+    l_items  json_array_t  := rp_items(c, p_node);
+    l_new    json_array_t;
+    l_flds   json_array_t  := arr(p_node, 'fields');
+    l_f      json_object_t;
+    l_fi     pls_integer;
+    l_draft  json_object_t;
+    l_parsed json_object_t;
+    l_err    varchar2(4000);
+    l_val    varchar2(4000) := lower(trim(str(p_in, 'value')));
+    l_idx    pls_integer;
+    l_x      json_object_t := json_object_t();
+  begin
+    if l_rs is not null then
+      -- answering a field of the item being added
+      l_fi := nvl(to_num(str(l_rs, 'field')), 0);
+      l_f  := treat(l_flds.get(l_fi) as json_object_t);
+      l_parsed := parse_value(eff_spec(c, input_spec(l_f)), str(p_in, 'value'));
+      l_err := str(l_parsed, 'error');
+      if l_err is null then l_err := validate(c, rp_field_node(p_node, l_f), l_parsed); end if;
+      if l_err is not null then
+        add_msg(c, 'error', l_err);
+        return;
+      end if;
+      l_draft := obj(l_rs, 'draft');
+      if l_draft is null then l_draft := json_object_t(); end if;
+      l_draft.put(str(l_f, 'field'), l_parsed.get('value'));
+      l_rs.put('draft', l_draft);
+      if l_fi + 1 < l_flds.get_size then
+        l_rs.put('field', l_fi + 1);
+        rp_put(c, l_id, l_rs);
+        rp_prompt_field(c, p_node);
+        return;
+      end if;
+      l_items.append(l_draft);
+      c.slots.put(l_slot, l_items);
+      touch(c, l_slot);
+      rp_put(c, l_id, null);
+      l_x.put('title', item_title(c, p_node, l_draft, l_items.get_size - 1));
+      add_msg(c, 'text', interpolate(nvl(str(l_pr, 'added'), 'Added {{title}}.'), rp_vals(c, p_node, l_x)));
+      rp_show(c, p_node);
+      return;
+    end if;
+
+    if p_cmd = 'add' or l_val = 'add' or l_val = lower(nvl(str(p_node, 'addLabel'), 'add another')) then
+      if l_items.get_size >= rp_max(p_node) then
+        add_msg(c, 'error', interpolate(nvl(str(l_pr, 'full'), 'That''s the most I can take ({{max}}). Tap Done to continue.'), rp_vals(c, p_node)));
+      else
+        rp_start(c, p_node);
+      end if;
+      return;
+    end if;
+
+    if p_cmd = 'remove' then
+      l_idx := trunc(to_num(str(p_in, 'index')));
+      if l_idx is null or l_idx < 0 or l_idx >= l_items.get_size then
+        add_msg(c, 'error', 'There is no such item.');
+        return;
+      end if;
+      l_x.put('title', item_title(c, p_node, treat(l_items.get(l_idx) as json_object_t), l_idx));
+      l_new := json_array_t();
+      for i in 0 .. l_items.get_size - 1 loop
+        if i <> l_idx then l_new.append(l_items.get(i)); end if;
+      end loop;
+      if l_new.get_size > 0 then c.slots.put(l_slot, l_new); else c.slots.remove(l_slot); end if;
+      touch(c, l_slot);
+      add_msg(c, 'text', interpolate(nvl(str(l_pr, 'removed'), 'Removed {{title}}.'), l_x));
+      rp_show(c, p_node);
+      return;
+    end if;
+
+    if p_cmd = 'done' or l_val = 'done' or l_val = lower(nvl(str(p_node, 'doneLabel'), 'done')) then
+      if l_items.get_size < rp_min(p_node) then
+        add_msg(c, 'error', interpolate(nvl(str(l_pr, 'tooFew'), 'Please add at least {{min}}.'), rp_vals(c, p_node)));
+        return;
+      end if;
+      c.history.append(l_id);
+      if get_bool(c.state, 'editing') then
+        c.state.put('editing', false);
+        c.replay := true;
+        run(c, str(c.flow, 'start'));
+      else
+        run(c, str(p_node, 'next'));
+      end if;
+      return;
+    end if;
+
+    add_msg(c, 'error', 'Tap ' || nvl(str(p_node, 'addLabel'), 'Add another') || ' or ' || nvl(str(p_node, 'doneLabel'), 'Done') || '.');
+  end handle_repeat;
+
+  -- Each record is read again and updated with its own version through FC_DATA, so the
+  -- data source's updatable whitelist and row filter apply to every row.
+  procedure handle_bulk (c in out nocopy t_ctx, p_node in json_object_t, p_in in json_object_t, p_cmd in varchar2) is
+    l_id      varchar2(200) := str(p_node, 'id');
+    l_src     varchar2(100) := str(p_node, 'source');
+    l_b       json_object_t := bulk_state(c, str(p_node, 'id'));
+    l_pr      json_object_t := obj(p_node, 'prompts');
+    l_val     varchar2(4000) := lower(trim(str(p_in, 'value')));
+    l_v       json_object_t := vals(c);
+    l_keys    json_array_t;
+    l_changes json_object_t;
+    l_ck      json_key_list;
+    l_key     varchar2(4000);
+    l_row     json_object_t;
+    l_cur     json_object_t;
+    l_orig    json_object_t;
+    l_ch      json_object_t;
+    l_r       json_object_t;
+    l_ok      pls_integer := 0;
+    l_failed  pls_integer := 0;
+    l_audit   json_object_t := json_object_t();
+    l_next    varchar2(200);
+    l_dummy   varchar2(1);
+  begin
+    if l_b is null then return; end if;
+    l_v.put('count', to_num(str(l_b, 'count')));
+
+    if p_cmd = 'cancel' or l_val in ('cancel', 'no') or l_val = lower(nvl(str(p_node, 'cancelLabel'), 'cancel')) then
+      bulk_put(c, l_id, null);
+      add_msg(c, 'text', nvl(str(l_pr, 'cancelled'), 'Okay, I didn''t change anything.'));
+      l_next := coalesce(str(p_node, 'cancelled'), str(p_node, 'none'));
+      if l_next is not null then run(c, l_next); else l_dummy := failed(c); end if;
+      return;
+    end if;
+
+    if p_cmd = 'confirm' or l_val in ('confirm', 'yes', 'y', 'ok', 'go', 'update')
+       or l_val = lower(interpolate(nvl(str(p_node, 'confirmLabel'), 'Update {{count}}'), l_v)) then
+      c.history.append(l_id);
+      l_keys    := arr(l_b, 'keys');
+      l_changes := obj(l_b, 'changes');
+      if l_changes is null then l_changes := json_object_t(); end if;
+      l_ck := l_changes.get_keys;
+      for i in 0 .. l_keys.get_size - 1 loop
+        l_key := el_str(l_keys.get(i));
+        l_row := fc_data.get_row(l_src, l_key, obj(c.state, 'context'));
+        l_cur := obj(l_row, 'values');
+        if l_cur is null then
+          l_failed := l_failed + 1;
+          continue;
+        end if;
+        l_orig := json_object_t();
+        l_ch   := json_object_t();
+        if l_ck is not null then
+          for j in 1 .. l_ck.count loop
+            if not same(str(l_cur, l_ck(j)), str(l_changes, l_ck(j))) then
+              l_ch.put(l_ck(j), l_changes.get(l_ck(j)));
+              if l_cur.has(l_ck(j)) then l_orig.put(l_ck(j), l_cur.get(l_ck(j))); else l_orig.put_null(l_ck(j)); end if;
+            end if;
+          end loop;
+        end if;
+        if key_count(l_ch) = 0 then
+          l_ok := l_ok + 1;          -- already has the new values
+          continue;
+        end if;
+        l_r := fc_data.update_row(l_src, l_key, str(l_row, 'version'), l_orig, l_ch, obj(c.state, 'context'));
+        if str(l_r, 'status') = 'ok' then l_ok := l_ok + 1; else l_failed := l_failed + 1; end if;
+      end loop;
+
+      -- audit trail in the session transcript
+      l_audit.put('action', 'bulkUpdate');
+      l_audit.put('source', l_src);
+      l_audit.put('changes', l_changes);
+      l_audit.put('count', l_keys.get_size);
+      l_audit.put('updated', l_ok);
+      l_audit.put('failed', l_failed);
+      log_ev(c, 'OUT', l_id, l_audit.to_clob);
+      dbg_kv(c, 'bulkUpdate', l_id, 'updated', to_char(l_ok), 'failed', to_char(l_failed));
+
+      bulk_put(c, l_id, null);
+      l_v.put('updated', l_ok);
+      l_v.put('failed', l_failed);
+      if l_failed > 0 then
+        add_msg(c, 'error', interpolate(nvl(str(l_pr, 'partial'),
+          'I updated {{updated}} of {{count}} records. {{failed}} could not be changed (changed by someone else, or not allowed).'), l_v));
+      else
+        add_msg(c, 'text', interpolate(nvl(str(l_pr, 'done'), 'Done. I updated {{updated}} of {{count}} records.'), l_v));
+      end if;
+      run(c, case when l_failed > 0 and str(p_node, 'partial') is not null then str(p_node, 'partial') else str(p_node, 'done') end);
+      return;
+    end if;
+
+    add_msg(c, 'error', 'Tap "' || interpolate(nvl(str(p_node, 'confirmLabel'), 'Update {{count}}'), l_v)
+                        || '" to go ahead, or ' || nvl(str(p_node, 'cancelLabel'), 'Cancel') || '.');
+  end handle_bulk;
+
+  ------------------------------------------------------------------------------
+  -- files: {"file": {name, mimeType, data(base64)}} -> FC_FILES; the slot keeps {id, name, size, mimeType}
+  ------------------------------------------------------------------------------
+  function parse_file (p_spec in json_object_t, p_file in json_object_t, p_blob out blob) return json_object_t is
+    l_res  json_object_t := json_object_t();
+    l_val  json_object_t := json_object_t();
+    l_data clob;
+    l_max  number := least(nvl(to_num(str(p_spec, 'maxSizeKb')), 5120), 20480) * 1024;
+    l_size number;
+    l_name varchar2(4000);
+    l_type varchar2(100);
+    l_ext  varchar2(100);
+    l_acc  apex_t_varchar2 := apex_t_varchar2();
+    l_arr  json_array_t;
+    l_a    varchar2(200);
+    l_list varchar2(4000);
+    l_ok   boolean := true;
+
+    function err (p in varchar2) return json_object_t is
+      l json_object_t := json_object_t();
+    begin
+      p_blob := null;
+      l.put('error', p);
+      return l;
+    end err;
+  begin
+    p_blob := null;
+    if p_file is null or not p_file.has('data') then
+      l_res.put_null('value');
+      return l_res;
+    end if;
+    l_data := p_file.get_clob('data');
+    if l_data is null or dbms_lob.getlength(l_data) = 0 then
+      l_res.put_null('value');
+      return l_res;
+    end if;
+    -- cheap check before decoding: base64 is 4/3 of the content
+    if dbms_lob.getlength(l_data) * 3 / 4 > l_max + 3 then
+      return err(nvl(str(p_spec, 'sizeMessage'), 'That file is too big. The limit is ' || size_text(l_max) || '.'));
+    end if;
+    begin
+      p_blob := apex_web_service.clobbase642blob(l_data);
+    exception when others then
+      return err('That file could not be read. Please try again.');
+    end;
+    l_size := nvl(dbms_lob.getlength(p_blob), 0);
+    if l_size = 0 then return err('That file is empty.'); end if;
+    if l_size > l_max then
+      return err(nvl(str(p_spec, 'sizeMessage'), 'That file is too big. The limit is ' || size_text(l_max) || '.'));
+    end if;
+
+    l_name := regexp_replace(nvl(str(p_file, 'name'), 'file'), '[\/:*?"<>|[:cntrl:]]', '_');
+    if length(l_name) > 200 then l_name := substr(l_name, -200); end if;
+    l_type := lower(substr(nvl(str(p_file, 'mimeType'), 'application/octet-stream'), 1, 100));
+    l_ext  := lower(regexp_substr(l_name, '\.[^.]+$'));
+
+    -- "accept": [".pdf", "image/*"] or ".pdf,image/*"
+    if p_spec.has('accept') then
+      if p_spec.get('accept').is_array then
+        l_arr := p_spec.get_array('accept');
+        for i in 0 .. l_arr.get_size - 1 loop
+          l_acc.extend;
+          l_acc(l_acc.count) := el_str(l_arr.get(i));
+        end loop;
+      else
+        l_acc := apex_string.split(str(p_spec, 'accept'), ',');
+      end if;
+    end if;
+    for i in 1 .. l_acc.count loop
+      l_a := lower(trim(l_acc(i)));
+      if l_a is not null then
+        if l_list is null then l_ok := false; end if;     -- there is a list: the file must match it
+        l_list := l_list || case when l_list is not null then ', ' end || l_a;
+        if (substr(l_a, 1, 1) = '.' and l_a = l_ext)
+           or (l_a like '%/*' and l_type like substr(l_a, 1, length(l_a) - 1) || '%')
+           or l_a = l_type then
+          l_ok := true;
+        end if;
+      end if;
+    end loop;
+    if not l_ok then
+      return err(nvl(str(p_spec, 'typeMessage'), 'Please attach one of these file types: ' || l_list || '.'));
+    end if;
+
+    l_val.put('name', l_name);
+    l_val.put('size', l_size);
+    l_val.put('mimeType', l_type);
+    l_res.put('value', l_val);
+    return l_res;
+  end parse_file;
+
+  -- Stores the content in FC_FILES (removing the file this slot held before) and returns
+  -- {"value": {id, name, size, mimeType}}.
+  function save_file (c in out nocopy t_ctx, p_slot in varchar2, p_parsed in json_object_t, p_blob in blob) return json_object_t is
+    l_val  json_object_t := obj(p_parsed, 'value');
+    l_out  json_object_t := json_object_t();
+    l_res  json_object_t := json_object_t();
+    l_fid  varchar2(32)  := rawtohex(dbms_crypto.randombytes(16));
+    l_sid  varchar2(32)  := c.session_id;
+    l_old  varchar2(32)  := str(obj(c.slots, p_slot), 'id');
+    l_name varchar2(400) := str(l_val, 'name');
+    l_type varchar2(100) := str(l_val, 'mimeType');
+    l_size number        := to_num(str(l_val, 'size'));
+  begin
+    insert into fc_files (file_id, session_id, slot, filename, mime_type, file_size, content)
+    values (l_fid, l_sid, p_slot, l_name, l_type, l_size, p_blob);
+    if l_old is not null then
+      delete from fc_files where file_id = l_old and session_id = l_sid;
+    end if;
+    l_out.put('id', l_fid);
+    l_out.put('name', l_name);
+    l_out.put('size', l_size);
+    l_out.put('mimeType', l_type);
+    l_res.put('value', l_out);
+    return l_res;
+  end save_file;
+
+  -- Is the value the user is answering right now a PII value?
+  function current_is_pii (c in out nocopy t_ctx) return boolean is
+    l_cur  varchar2(200) := str(c.state, 'current');
+    l_node json_object_t;
+    l_list json_array_t  := arr(c.flow, 'piiSlots');
+    l_fd   json_object_t;
+    l_rs   json_object_t;
+  begin
+    if l_cur is null or not c.nodes.has(l_cur) then return false; end if;
+    l_node := get_node(c, l_cur);
+    case str(l_node, 'type')
+      when 'ask' then
+        if pii_mode(l_node) is not null then return true; end if;
+        for i in 0 .. l_list.get_size - 1 loop
+          if el_str(l_list.get(i)) = str(l_node, 'slot') then return true; end if;
+        end loop;
+      when 'changeFields' then
+        if str(c.state, 'editingField') is not null then
+          l_fd := field_def(l_node, str(c.state, 'editingField'));
+          return l_fd is not null and pii_mode(l_fd) is not null;
+        end if;
+      when 'repeat' then
+        l_rs := rp_state(c, l_cur);
+        if l_rs is not null then
+          l_fd := treat(arr(l_node, 'fields').get(nvl(to_num(str(l_rs, 'field')), 0)) as json_object_t);
+          return pii_mode(l_fd) is not null;
+        end if;
+      else null;
+    end case;
+    return false;
+  end current_is_pii;
+
+  -- The input as FC_EVENTS may show it: no one-time codes, no file contents, PII answers redacted.
+  function input_for_log (c in out nocopy t_ctx, p_in in json_object_t) return clob is
+    l_cur  varchar2(200) := str(c.state, 'current');
+    l_out  json_object_t := json_object_t();
+    l_keys json_key_list := p_in.get_keys;
+    l_file json_object_t;
+    l_lf   json_object_t;
+    l_pii  boolean := current_is_pii(c);
+  begin
+    if l_keys is not null then
+      for i in 1 .. l_keys.count loop
+        if l_keys(i) = 'file' then
+          l_file := obj(p_in, 'file');
+          l_lf := json_object_t();
+          l_lf.put('name', case when l_pii then '[redacted]' else str(l_file, 'name') end);
+          l_lf.put('mimeType', str(l_file, 'mimeType'));
+          l_lf.put('data', '(file content, not logged)');
+          l_out.put('file', l_lf);
+        elsif l_keys(i) = 'value' and l_cur is not null and c.nodes.has(l_cur)
+              and str(get_node(c, l_cur), 'type') = 'verify' then
+          l_out.put('value', '(one-time code, not logged)');
+        elsif l_keys(i) = 'value' and l_pii then
+          l_out.put('value', '[redacted]');
+        else
+          l_out.put(l_keys(i), p_in.get(l_keys(i)));
+        end if;
+      end loop;
+    end if;
+    return l_out.to_clob;
+  end input_for_log;
+
+  ------------------------------------------------------------------------------
+  -- resume: the current question again, unchanged (after a page reload)
+  ------------------------------------------------------------------------------
+  procedure reprompt (c in out nocopy t_ctx) is
+    l_cur  varchar2(200) := str(c.state, 'current');
+    l_node json_object_t;
+    l_v    json_object_t := vals(c);
+    l_keys json_key_list := l_v.get_keys;
+    l_fd   json_object_t;
+    l_n    json_object_t;
+    l_res  json_array_t;
+  begin
+    -- the page's fields were reset by the reload: send every value again
+    if l_keys is not null then
+      for i in 1 .. l_keys.count loop touch(c, l_keys(i)); end loop;
+    end if;
+    add_msg(c, 'text', interpolate(nvl(str(c.flow, 'resumeText'), 'Welcome back. Let''s carry on where we left off.'), l_v));
+    if l_cur is null or not c.nodes.has(l_cur) then return; end if;
+    l_node := get_node(c, l_cur);
+    case str(l_node, 'type')
+      when 'ask' then
+        add_msg(c, 'text', interpolate(str(l_node, 'prompt'), l_v));
+      when 'summary' then
+        add_summary(c, l_node);
+      when 'verify' then
+        add_msg(c, 'text', interpolate(nvl(str(obj(l_node, 'prompts'), 'resume'),
+          'Please enter the code I sent to {{' || str(l_node, 'slot') || '}}.'), verify_vals(c, l_node)));
+      when 'findRecord' then
+        if c.results.has(l_cur) then l_res := c.results.get_array(l_cur); else l_res := json_array_t(); end if;
+        l_n := copy(l_v);
+        l_n.put('count', l_res.get_size);
+        add_msg(c, 'text', interpolate(nvl(str(obj(l_node, 'prompts'), 'many'), 'I found {{count}} matching records. Which one?'), l_n));
+      when 'changeFields' then
+        if str(c.state, 'editingField') is not null then l_fd := field_def(l_node, str(c.state, 'editingField')); end if;
+        if l_fd is not null then
+          prompt_field(c, l_node, l_fd);
+        else
+          add_record_card(c, l_node);
+          add_msg(c, 'text', interpolate(nvl(str(l_node, 'prompt'), 'What would you like to change?'), l_v));
+        end if;
+      when 'repeat' then
+        rp_show(c, l_node);
+      when 'bulkUpdate' then
+        if bulk_state(c, l_cur) is not null then bulk_confirm(c, l_node); end if;
+      else
+        null;
+    end case;
+  end reprompt;
+
   ------------------------------------------------------------------------------
   -- public API
   ------------------------------------------------------------------------------
-  function start_session (p_flow_id in varchar2, p_context in clob default null) return clob is
+  function start_session (p_flow_id in varchar2, p_context in clob default null,
+                          p_version in number default null) return clob is
     c         t_ctx;
     l_version number;
     l_ctx     json_object_t;
     l_turn    clob;
     l_sid     varchar2(32);
   begin
-    select max(version) into l_version
-      from fc_flow_versions
-     where flow_id = p_flow_id and status = 'PUBLISHED';
-    if l_version is null then
-      raise_application_error(-20001, 'No published version of flow "' || p_flow_id || '".');
+    g_dbg_sid := null;
+    if p_version is not null then
+      -- a pinned version: it must be published (not a draft, not retired)
+      select max(version) into l_version
+        from fc_flow_versions
+       where flow_id = p_flow_id and version = p_version and status = 'PUBLISHED';
+      if l_version is null then
+        raise_application_error(-20001, 'Version ' || p_version || ' of flow "' || p_flow_id || '" is not published.');
+      end if;
+    else
+      select max(version) into l_version
+        from fc_flow_versions
+       where flow_id = p_flow_id and status = 'PUBLISHED';
+      if l_version is null then
+        raise_application_error(-20001, 'No published version of flow "' || p_flow_id || '".');
+      end if;
     end if;
 
     init_ctx(c);
@@ -1836,6 +2976,8 @@ create or replace package body fc_engine as
     c.state.put('editing', false);
     c.state.put_null('editingField');
     c.state.put('context', l_ctx);
+    c.state.put('repeat', json_object_t());
+    c.state.put('bulk', json_object_t());
     c.slots   := json_object_t();
     c.history := json_array_t();
     seed_context(c);
@@ -1845,12 +2987,13 @@ create or replace package body fc_engine as
             coalesce(sys_context('APEX$SESSION', 'APP_USER'), user),
             sys_context('APEX$SESSION', 'APP_SESSION'),
             systimestamp + c_ttl);
-    log_event(l_sid, 'IN', null, nvl(p_context, '{}'));
+    log_ev(c, 'IN', null, nvl(p_context, '{}'));
+    dbg_kv(c, 'start', null, 'version', to_char(l_version));
 
     run(c, str(c.flow, 'start'));
     save_session(c);
     l_turn := build_turn(c);
-    log_event(l_sid, 'OUT', str(c.state, 'current'), l_turn);
+    log_ev(c, 'OUT', str(c.state, 'current'), l_turn);
     return l_turn;
   end start_session;
 
@@ -1871,18 +3014,17 @@ create or replace package body fc_engine as
     l_target varchar2(200);
     l_keys   json_key_list;
     l_turn   clob;
-    l_log    clob;
+    l_spec   json_object_t;
+    l_blob   blob;
+    l_rs     json_object_t;
+    l_draft  json_object_t;
+    l_fi     pls_integer;
+    l_sid    varchar2(32) := p_session_id;
   begin
     load_session(c, p_session_id);
     if p_input is null or dbms_lob.getlength(p_input) = 0 then l_in := json_object_t(); else l_in := json_object_t.parse(p_input); end if;
     l_cur := str(c.state, 'current');
-    l_log := l_in.to_clob;
-    if l_cur is not null and c.nodes.has(l_cur) and l_in.has('value') then
-      if str(c.nodes.get_object(l_cur), 'type') = 'verify' then
-        l_log := '{"value":"(one-time code, not logged)"}';
-      end if;
-    end if;
-    log_event(p_session_id, 'IN', l_cur, l_log);
+    log_ev(c, 'IN', l_cur, input_for_log(c, l_in));
 
     if str(c.state, 'status') <> 'in_progress' then
       return build_turn(c);
@@ -1894,11 +3036,15 @@ create or replace package body fc_engine as
       l_type := str(l_node, 'type');
     end if;
 
-    if l_cmd = 'restart' then
+    if l_cmd = 'resume' then
+      reprompt(c);
+
+    elsif l_cmd = 'restart' then
       l_keys := vals(c).get_keys;
       if l_keys is not null then
         for i in 1 .. l_keys.count loop touch(c, l_keys(i)); end loop;
       end if;
+      delete from fc_files where session_id = l_sid;
       c.slots   := json_object_t();
       c.records := json_object_t();
       c.results := json_object_t();
@@ -1908,6 +3054,8 @@ create or replace package body fc_engine as
       c.state.put('verify', json_object_t());
       c.state.put('verified', json_object_t());
       c.state.put_null('verifiedLast');
+      c.state.put('repeat', json_object_t());
+      c.state.put('bulk', json_object_t());
       fc_data.set_verified(null);
       seed_context(c);
       add_msg(c, 'text', 'Okay, let''s start over.');
@@ -1917,7 +3065,29 @@ create or replace package body fc_engine as
       c.state.put_null('editingField');
       add_msg(c, 'text', 'No problem, I kept it as it was. Anything else to change?');
 
+    elsif l_cmd = 'back' and l_type = 'repeat' and rp_state(c, l_cur) is not null
+          and (nvl(to_num(str(rp_state(c, l_cur), 'field')), 0) > 0 or rp_items(c, l_node).get_size > 0) then
+      -- inside a line item: back to its previous field, or drop the unfinished item
+      l_rs := rp_state(c, l_cur);
+      l_fi := nvl(to_num(str(l_rs, 'field')), 0);
+      if l_fi > 0 then
+        l_draft := obj(l_rs, 'draft');
+        if l_draft is null then l_draft := json_object_t(); end if;
+        l_fd := treat(arr(l_node, 'fields').get(l_fi - 1) as json_object_t);
+        if l_draft.has(str(l_fd, 'field')) then l_draft.remove(str(l_fd, 'field')); end if;
+        l_rs.put('draft', l_draft);
+        l_rs.put('field', l_fi - 1);
+        rp_put(c, l_cur, l_rs);
+        rp_prompt_field(c, l_node);
+      else
+        rp_put(c, l_cur, null);
+        add_msg(c, 'text', 'Okay, I dropped that one.');
+        rp_show(c, l_node);
+      end if;
+
     elsif l_cmd = 'back' then
+      if l_type = 'repeat' then rp_put(c, l_cur, null); end if;
+      if l_type = 'bulkUpdate' then bulk_put(c, l_cur, null); end if;
       c.state.put('editing', false);
       if c.history.get_size > 0 then
         l_prev := c.history.get_string(c.history.get_size - 1);
@@ -1949,14 +3119,25 @@ create or replace package body fc_engine as
         add_msg(c, 'error', 'There is no question for "' || l_slot || '".');
       end if;
 
+    elsif l_type is null then
+      add_msg(c, 'error', 'There is nothing to answer right now.');
+
     elsif l_type = 'ask' then
-      l_parsed := parse_value(eff_spec(c, input_spec(l_node)), str(l_in, 'value'));
+      l_spec := eff_spec(c, input_spec(l_node));
+      if str(l_spec, 'kind') = 'file' then
+        l_parsed := parse_file(l_spec, obj(l_in, 'file'), l_blob);
+      else
+        l_parsed := parse_value(l_spec, str(l_in, 'value'));
+      end if;
       l_err := str(l_parsed, 'error');
       if l_err is null then l_err := validate(c, l_node, l_parsed); end if;
 
       if l_err is not null then
         add_msg(c, 'error', l_err);
       else
+        if str(l_spec, 'kind') = 'file' and l_blob is not null then
+          l_parsed := save_file(c, str(l_node, 'slot'), l_parsed, l_blob);
+        end if;
         c.slots.put(str(l_node, 'slot'), l_parsed.get('value'));
         touch(c, str(l_node, 'slot'));
         c.history.append(l_cur);
@@ -1985,11 +3166,17 @@ create or replace package body fc_engine as
 
     elsif l_type = 'changeFields' then
       handle_change(c, l_node, l_in, l_cmd);
+
+    elsif l_type = 'repeat' then
+      handle_repeat(c, l_node, l_in, l_cmd);
+
+    elsif l_type = 'bulkUpdate' then
+      handle_bulk(c, l_node, l_in, l_cmd);
     end if;
 
     save_session(c);
     l_turn := build_turn(c);
-    log_event(p_session_id, 'OUT', str(c.state, 'current'), l_turn);
+    log_ev(c, 'OUT', str(c.state, 'current'), l_turn);
     return l_turn;
   end handle_input;
 
@@ -2055,22 +3242,54 @@ create or replace package body fc_engine as
     return l.to_clob;
   end error_json;
 
+  -- After a failed turn (rolled back): a DBG row with the error, when the conversation is being debugged.
+  procedure log_error (p_session_id in varchar2, p_msg in varchar2) is
+    l   json_object_t := json_object_t();
+    l_c clob;
+  begin
+    if g_dbg_sid is null or p_session_id is null or g_dbg_sid <> p_session_id then return; end if;
+    l.put('event', 'error');
+    l.put('message', substr(p_msg, 1, 2000));
+    l.put('at', to_char(sys_extract_utc(systimestamp), 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"'));
+    l_c := l.to_clob;
+    insert into fc_events (session_id, direction, node_id, payload) values (p_session_id, 'DBG', null, l_c);
+  exception when others then
+    null;   -- logging must never hide the original error
+  end log_error;
+
+  procedure set_debug (p_on in boolean default true) is
+  begin
+    g_debug := nvl(p_on, false);
+  end set_debug;
+
   procedure apex_start is
   begin
     savepoint fc_turn;
-    http_out(start_session(apex_application.g_x01, apex_application.g_x02));
+    http_out(start_session(apex_application.g_x01, apex_application.g_x02, to_num(apex_application.g_x03)));
   exception when others then
     rollback to fc_turn;
     http_out(error_json);
   end apex_start;
 
   procedure apex_input is
+    l_in   clob;
+    l_json clob;
+    l_msg  varchar2(4000);
   begin
     savepoint fc_turn;
-    http_out(handle_input(apex_application.g_x01, apex_application.g_x02));
+    -- the widget sends inputs over 8K (file answers) in p_clob_01 instead of x02
+    if apex_application.g_clob_01 is not null and dbms_lob.getlength(apex_application.g_clob_01) > 0 then
+      l_in := apex_application.g_clob_01;
+    else
+      l_in := apex_application.g_x02;
+    end if;
+    http_out(handle_input(apex_application.g_x01, l_in));
   exception when others then
+    l_msg  := sqlerrm;
+    l_json := error_json;
     rollback to fc_turn;
-    http_out(error_json);
+    log_error(apex_application.g_x01, l_msg);
+    http_out(l_json);
   end apex_input;
 
   procedure ords_start (p_body in clob) is
@@ -2081,7 +3300,7 @@ create or replace package body fc_engine as
     savepoint fc_turn;
     l_body := json_object_t.parse(nvl(p_body, '{}'));
     if l_body.has('context') then l_ctx := l_body.get_object('context').to_clob; end if;
-    l_res := start_session(str(l_body, 'flowId'), l_ctx);
+    l_res := start_session(str(l_body, 'flowId'), l_ctx, to_num(str(l_body, 'version')));
     http_out(l_res, 201);
   exception when others then
     rollback to fc_turn;
@@ -2089,16 +3308,23 @@ create or replace package body fc_engine as
   end ords_start;
 
   procedure ords_input (p_session_id in varchar2, p_body in clob) is
-    l_res clob;
+    l_res    clob;
+    l_json   clob;
+    l_msg    varchar2(4000);
+    l_status number;
   begin
     savepoint fc_turn;
     l_res := handle_input(p_session_id, p_body);
     http_out(l_res, 200);
   exception when others then
+    l_msg    := sqlerrm;
+    l_json   := error_json;
+    l_status := case when sqlcode = -20002 then 404
+                     when sqlcode between -20999 and -20000 then 400
+                     else 500 end;
     rollback to fc_turn;
-    http_out(error_json, case when sqlcode = -20002 then 404
-                              when sqlcode between -20999 and -20000 then 400
-                              else 500 end);
+    log_error(p_session_id, l_msg);
+    http_out(l_json, l_status);
   end ords_input;
 
 end fc_engine;

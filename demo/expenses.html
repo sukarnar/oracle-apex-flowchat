@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlowChat Expenses Demo</title>
+<style>
+  :root { --bg: #eef1f6; --panel: #fff; --text: #18202c; --muted: #64708a; --border: #dde2ea; --code-bg: #0f172a; --code-text: #cbd5e1; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #0d1117; --panel: #161b24; --text: #e8ecf3; --muted: #97a1b6; --border: #2e3747; }
+  }
+  :root[data-theme="dark"] { --bg: #0d1117; --panel: #161b24; --text: #e8ecf3; --muted: #97a1b6; --border: #2e3747; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .top { padding: 20px 24px 8px; max-width: 1240px; margin: 0 auto; }
+  .top h1 { font-size: 20px; margin: 0 0 4px; }
+  .top p { margin: 0; color: var(--muted); font-size: 14px; }
+  main { max-width: 1240px; margin: 0 auto; padding: 16px 24px 32px; display: grid; grid-template-columns: 1fr 420px; gap: 20px; align-items: start; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px; min-width: 0; }
+  .panel h2 { font-size: 15px; margin: 0 0 2px; }
+  .panel .hint { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  form.classic { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+  form.classic label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); }
+  form.classic label.full { grid-column: 1 / -1; }
+  form.classic input, form.classic textarea { font: inherit; font-size: 14px; color: var(--text); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+  form.classic input[readonly], form.classic textarea[readonly] { background: color-mix(in srgb, var(--border) 35%, var(--panel)); }
+  details { margin-top: 16px; }
+  summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+  pre { background: var(--code-bg); color: var(--code-text); border-radius: 10px; padding: 12px; font-size: 12px; max-height: 320px; overflow: auto; margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .tips { font-size: 13px; color: var(--muted); margin: 12px 0 0; padding-left: 18px; }
+  flow-chat { position: sticky; top: 16px; --fc-height: min(640px, calc(100vh - 40px)); }
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; padding: 12px 16px 24px; }
+    .top { padding: 16px 16px 4px; }
+    flow-chat { position: static; order: -1; --fc-height: 540px; }
+    form.classic { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+  <div class="top">
+    <h1>FlowChat: expense claim demo</h1>
+    <p>Line items (Repeat), a file upload, a PII-masked answer and the debug log, all running in the browser.</p>
+  </div>
+
+  <main>
+    <section class="panel">
+      <h2>Expense claim (existing form)</h2>
+      <p class="hint">Bound fields fill in as you answer. The expense list shows its summary text.</p>
+      <form class="classic" id="claimForm" onsubmit="return false">
+        <label>Employee <input id="employee"></label>
+        <label>Bank account <input id="bank_account"></label>
+        <label class="full">Expenses <textarea id="lines" rows="3" readonly></textarea></label>
+        <label class="full">Receipt <input id="receipt" readonly></label>
+        <label class="full">Reference <input id="reference" readonly placeholder="(set on submit)"></label>
+      </form>
+      <ul class="tips">
+        <li>Add two or three expenses, remove one, then tap <b>Done</b>.</li>
+        <li>At the summary, use <b>Edit</b> on Expenses to reopen the list.</li>
+        <li>The debug log below never shows the bank account in full, or the file's content.</li>
+      </ul>
+      <details open>
+        <summary>Debug log (flow has "debug": true)</summary>
+        <pre id="debugLog">-</pre>
+      </details>
+      <details>
+        <summary>Last turn (wire protocol)</summary>
+        <pre id="turnJson">-</pre>
+      </details>
+    </section>
+
+    <flow-chat id="chat" flow="expense_claim" transport="local" adapter="dom" form="#claimForm"
+               heading="Expenses assistant" subheading="I'll build the claim with you" manual-start></flow-chat>
+  </main>
+
+  <script src="../widget/flowchat-engine.js"></script>
+  <script src="../widget/flowchat.js"></script>
+  <script>
+    (async function () {
+      const chat = document.getElementById('chat');
+      const log = document.getElementById('debugLog');
+      const lines = [];
+      try {
+        const flow = await fetch('../flows/expense_claim.json').then((r) => r.json());
+        let ref = 5001;
+        const engine = FlowChatEngine.createEngine({
+          flows: [flow],
+          onDebug: (e) => {
+            const { sessionId, flowId, version, at, ...rest } = e;
+            lines.push(at.slice(11, 19) + '  ' + JSON.stringify(rest));
+            log.textContent = lines.slice(-60).join('\n');
+            log.scrollTop = log.scrollHeight;
+          },
+          connectors: {
+            submit_claim: async (p) => {
+              const total = p.slots.lines.reduce((s, l) => s + Number(l.amount), 0);
+              return { ok: true, slots: { reference: 'EXP-' + (ref++) }, message: 'Total claimed: $' + total.toFixed(2) + '.' };
+            }
+          }
+        });
+        chat.configure({ transport: new FlowChat.LocalTransport(engine) });
+        chat.addEventListener('fc-turn', (e) => { document.getElementById('turnJson').textContent = JSON.stringify(e.detail, null, 2); });
+        chat.start();
+      } catch (e) {
+        document.getElementById('turnJson').textContent = 'Could not load the flow: ' + e.message + '\nServe this folder over HTTP (see README).';
+      }
+    })();
+  </script>
+</body>
+</html>

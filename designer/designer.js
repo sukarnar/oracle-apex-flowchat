@@ -127,6 +127,9 @@
                  make: (id) => ({ id, type: 'submit', connector: '' }) },
     end:       { label: 'End',       color: '#475569', desc: 'Finish the conversation.',
                  make: (id) => ({ id, type: 'end', text: 'All done!' }) },
+    repeat:    { label: 'Repeat',    color: '#0284c7', desc: 'Collect a list of items (line items, children, expenses), each with its own questions.',
+                 make: (id) => ({ id, type: 'repeat', slot: uniqueSlot('items'), label: 'Items', itemLabel: 'item', min: 1, max: 20,
+                                  fields: [{ field: 'description', label: 'Description', prompt: 'Description of {{item}} {{n}}?', input: { kind: 'text' } }] }) },
     verify:    { label: 'Verify', color: '#9333ea', group: 'data', desc: 'Send a one-time code to an answer (email or phone) and check it before searching.',
                  make: (id) => ({ id, type: 'verify', slot: '', channel: 'email', connector: '', codeLength: 6, ttlMinutes: 10,
                                   maxAttempts: 3, maxResends: 2 }) },
@@ -136,7 +139,9 @@
     changeFields: { label: 'Change fields', color: '#db2777', group: 'data', desc: 'Let the user change fields of the loaded record.',
                  make: (id) => ({ id, type: 'changeFields', record: '', prompt: 'What would you like to change?', fields: [] }) },
     saveChanges: { label: 'Save changes', color: '#059669', group: 'data', desc: 'Save only changed fields, with conflict detection.',
-                 make: (id) => ({ id, type: 'saveChanges', record: '' }) }
+                 make: (id) => ({ id, type: 'saveChanges', record: '' }) },
+    bulkUpdate: { label: 'Bulk update', color: '#b45309', group: 'data', desc: 'Apply the same change to every record a search finds, after the user confirms.',
+                 make: (id) => ({ id, type: 'bulkUpdate', source: '', criteria: [], set: {}, maxRows: 50, card: { title: '' } }) }
   };
 
   const PORT_TITLES = {
@@ -147,14 +152,16 @@
     done: 'When the user clicks Done, go to', noChanges: 'If nothing was changed, go to',
     saved: 'After saving, go to', conflict: 'On a conflict (record changed meanwhile), go to',
     forbidden: 'If not allowed, go to', error: 'On any other error, go to',
-    verified: 'Once the code is correct, go to', failed: 'After too many wrong codes, or if sending fails, go to'
+    verified: 'Once the code is correct, go to', failed: 'After too many wrong codes, or if sending fails, go to',
+    none: 'If no record matches (or the user cancels), go to', partial: 'If some records could not be changed, go to'
   };
   const PORT_HINTS = {
     tooMany: 'Optional. Defaults to the not-found path.', cancelled: 'Optional. Defaults to the not-found path.',
     noChanges: 'Optional. Defaults to the Done path.',
     conflict: 'Usually back to the review summary: the latest values are reloaded with the user\'s edits on top.',
     forbidden: 'Optional. Without it the conversation ends as failed.', error: 'Optional. Without it the conversation ends as failed.',
-    failed: 'Optional. Without it the conversation ends as failed.'
+    failed: 'Optional. Without it the conversation ends as failed.',
+    partial: 'Optional. Defaults to the Done path (the message says how many failed).'
   };
 
   // Default data source catalog: mirrors db/06_demo_data_source.sql so the update sample works in Test.
@@ -315,6 +322,10 @@
       case 'changeFields': return [{ key: 'done', label: 'done' }, { key: 'noChanges', label: 'no changes', optional: true }];
       case 'saveChanges': return [{ key: 'saved', label: 'saved' }, { key: 'conflict', label: 'conflict', optional: true },
         { key: 'forbidden', label: 'forbidden', optional: true }, { key: 'error', label: 'error', optional: true }];
+      case 'repeat': return [{ key: 'next', label: 'done' }];
+      case 'bulkUpdate': return [{ key: 'done', label: 'done' }, { key: 'none', label: 'none' },
+        { key: 'tooMany', label: 'too many', optional: true }, { key: 'cancelled', label: 'cancelled', optional: true },
+        { key: 'partial', label: 'partly failed', optional: true }];
       case 'condition':
         return (n.branches || []).map((b, i) => ({ key: 'branch:' + i, label: condText(b.when) || 'branch ' + (i + 1) }))
           .concat([{ key: 'else', label: 'else' }]);
@@ -355,8 +366,10 @@
     S.flow.nodes.forEach((n) => { if (n.type === 'ask' && n.slot && out.indexOf(n.slot) < 0) out.push(n.slot); });
     return out;
   }
+  function repeatNodes() { return S.flow.nodes.filter((n) => n.type === 'repeat' && n.slot); }
   function knownSlots() {
     const s = askSlots();
+    repeatNodes().forEach((n) => { [n.slot, n.slot + '.count'].forEach((k) => { if (s.indexOf(k) < 0) s.push(k); }); });
     Object.keys(S.flow.bindings || {}).forEach((k) => { if (s.indexOf(k) < 0) s.push(k); });
     recordFields().forEach((k) => { if (s.indexOf(k) < 0) s.push(k); });
     return s;
@@ -402,7 +415,7 @@
   }
   function sourceUses() {
     const out = {};
-    findNodes().forEach((n) => { if (n.source) out[n.source] = true; });
+    S.flow.nodes.forEach((n) => { if ((n.type === 'findRecord' || n.type === 'bulkUpdate') && n.source) out[n.source] = true; });
     return Object.keys(out);
   }
   function inputKindFor(type) { return type === 'NUMBER' ? 'number' : type === 'DATE' ? 'date' : 'text'; }
@@ -420,7 +433,7 @@
     };
     S.flow.nodes.forEach((n) => {
       if (n.type === 'ask') add(n.input, n.id);
-      if (n.type === 'changeFields') (n.fields || []).forEach((f) => add(f.input, n.id));
+      if (n.type === 'changeFields' || n.type === 'repeat') (n.fields || []).forEach((f) => add(f.input, n.id));
     });
     return out;
   }
@@ -608,7 +621,7 @@
       if (budget-- <= 0 || paths.length >= 1000) return;
       const n = byId(id);
       if (!n || seen.has(id)) return;
-      const s2 = n.type === 'ask' && n.slot ? slots.concat(n.slot) : slots;
+      const s2 = (n.type === 'ask' || n.type === 'repeat') && n.slot ? slots.concat(n.slot) : slots;
       if (isGoal(n)) { paths.push(new Set(s2)); return; }
       seen.add(id);
       ports(n).forEach((p) => { const t = getPort(n, p.key); if (t) dfs(t, seen, s2); });
@@ -703,7 +716,67 @@
           placeholders(n.prompt, n.id);
           checkChoice(spec, n.id, 'Choice question');
           if (spec.kind === 'number' && isFilled(spec.min) && isFilled(spec.max) && spec.min > spec.max) add('error', 'Minimum is greater than maximum.', n.id);
+          if (spec.kind === 'file') {
+            if (isFilled(spec.maxSizeKb) && (spec.maxSizeKb < 1 || spec.maxSizeKb > 20480)) add('error', 'File size limit must be 1 to 20480 KB.', n.id);
+            if (!spec.accept || !String(spec.accept).trim()) add('warning', 'Any type of file is accepted. Set the accepted types (e.g. .pdf, image/*).', n.id);
+            if (!f.nodes.some((x) => x.type === 'submit')) add('warning', 'Files are kept in FC_FILES; without a Submit step nothing ever reads them.', n.id);
+          }
           checkValidators(n.validators, n.id);
+          break;
+        }
+        case 'repeat': {
+          const seen = {};
+          if (!n.slot) add('error', 'Repeat has no list name (slot).', n.id);
+          else if (!/^[a-z][a-z0-9_]{0,99}$/.test(n.slot)) add('error', 'List name "' + n.slot + '" must be lowercase letters, digits and _.', n.id);
+          else if (askSlots().indexOf(n.slot) >= 0) add('error', 'An Ask step also uses "' + n.slot + '".', n.id);
+          if (!(n.fields || []).length) add('error', 'Repeat has no questions for each item.', n.id);
+          if (isFilled(n.min) && isFilled(n.max) && Number(n.min) > Number(n.max)) add('error', 'Minimum items is greater than maximum.', n.id);
+          if (isFilled(n.max) && (n.max < 1 || n.max > 100)) add('error', 'Maximum items must be 1 to 100.', n.id);
+          (n.fields || []).forEach((fd) => {
+            if (!/^[a-z][a-z0-9_]{0,49}$/.test(fd.field || '')) { add('error', 'Item field "' + (fd.field || '') + '" must be lowercase letters, digits and _.', n.id); return; }
+            if (seen[fd.field]) add('error', 'Item field "' + fd.field + '" is listed twice.', n.id);
+            seen[fd.field] = true;
+            const spec = fd.input || {};
+            if (spec.kind === 'file') add('error', 'Item fields can\'t be file answers. Use a separate Ask step for the file.', n.id);
+            checkChoice(spec, n.id, 'Choice field "' + fd.field + '"');
+            checkValidators(fd.validators, n.id);
+          });
+          const itemNames = (n.fields || []).map((fd) => fd.field).concat(['n', 'item', 'count', 'min', 'max', 'title']);
+          [n.prompt].concat((n.fields || []).map((fd) => fd.prompt)).forEach((t) => placeholders(String(t || '')
+            .replace(/\{\{\s*([\w.]+)\s*\}\}/g, (m, k) => (itemNames.indexOf(k) >= 0 ? '' : m)), n.id));
+          String(n.itemTitle || '').replace(/\{\{\s*([\w.]+)\s*\}\}/g, (m, k) => {
+            if (itemNames.indexOf(k) < 0) add('warning', 'Item title uses {{' + k + '}}, which is not an item field.', n.id);
+            return m;
+          });
+          break;
+        }
+        case 'bulkUpdate': {
+          const src = sourceDef(n.source);
+          const crit = n.byRowFilter ? [] : (n.criteria || []);
+          if (!n.source) add('error', 'Bulk update has no data source.', n.id);
+          else if (!src) add('warning', 'Data source "' + n.source + '" is not in the designer catalog, so its fields can\'t be checked. Add it in the Data tab.', n.id);
+          if (!crit.length && !n.byRowFilter) add('error', 'Bulk update has no search criteria. Add one, or choose "The signed-in user\'s records".', n.id);
+          if (n.byRowFilter && src && src.sourceType !== 'PLSQL' && !String(src.rowFilter || '').trim()) {
+            add('error', 'Data source "' + n.source + '" has no row filter, so "the signed-in user\'s records" would be every record.', n.id);
+          }
+          crit.forEach((c) => {
+            if (!c.field || !c.slot) { add('error', 'A search criterion is incomplete.', n.id); return; }
+            const sf = sourceField(n.source, c.field);
+            if (src && (!sf || !sf.searchable)) add('error', 'Field "' + c.field + '" is not searchable in ' + n.source + '.', n.id);
+          });
+          const setKeys = Object.keys(n.set || {});
+          if (!setKeys.length) add('error', 'Bulk update doesn\'t change any field. Add one under "Set".', n.id);
+          setKeys.forEach((k) => {
+            const sf = sourceField(n.source, k);
+            if (src && !sf) add('error', '"' + k + '" is not a field of ' + n.source + '.', n.id);
+            else if (sf && !sf.updatable) add('error', '"' + k + '" is not updatable in ' + n.source + '; every row would be refused.', n.id);
+            const v = n.set[k];
+            if (v && v.slot && slots.indexOf(v.slot) < 0) add('warning', 'The new value of "' + k + '" comes from "' + v.slot + '", which is never captured.', n.id);
+          });
+          if (isFilled(n.maxRows) && (n.maxRows < 1 || n.maxRows > 500)) add('error', 'Maximum records must be 1 to 500.', n.id);
+          if (n.requireVerified && verifiedSlots().indexOf(n.requireVerified) < 0) add('error', 'No Verify step checks "' + n.requireVerified + '".', n.id);
+          Object.keys(n.prompts || {}).forEach((k) => placeholders(String(n.prompts[k])
+            .replace(/\{\{\s*(count|records|changes|updated|failed|max)\s*\}\}/g, ''), n.id));
           break;
         }
         case 'lookup': case 'submit':
@@ -908,6 +981,8 @@
       case 'findRecord': return n.source ? (n.requireVerified ? '\uD83D\uDD12 ' : '') + 'Search ' + n.source + (n.as ? ' → ' + n.as : '') : '';
       case 'changeFields': return n.record ? 'Edit ' + (n.fields || []).length + ' field(s) of ' + n.record : '';
       case 'saveChanges': return n.record ? 'Save changes to ' + n.record : '';
+      case 'repeat': return n.slot ? 'List of ' + (n.itemLabel || 'item') + 's → ' + n.slot + ' (' + (isFilled(n.min) ? n.min : 1) + '–' + (n.max || 20) + ')' : '';
+      case 'bulkUpdate': return n.source ? 'Update ' + Object.keys(n.set || {}).join(', ') + ' in ' + n.source + ' (max ' + (n.maxRows || 50) + ')' : '';
       case 'summary': return n.mode === 'changes' ? 'Review changes to ' + (n.record || '?') : n.text;
       default: return n.text;
     }
@@ -937,6 +1012,9 @@
       if (n.type === 'condition') (n.branches || []).forEach((b, i) => chips.push(h('span', { class: 'chip', text: (i + 1) + ': ' + (condText(b.when) || '?') })));
       if (n.type === 'findRecord') (n.criteria || []).forEach((c) => chips.push(h('span', { class: 'chip', text: c.field + ' ' + (c.op || 'eq') + ' ' + c.slot + (c.optional ? '?' : '') })));
       if (n.type === 'changeFields') (n.fields || []).forEach((f) => chips.push(h('span', { class: 'chip slot', text: f.field || '?' })));
+      if (n.type === 'repeat') (n.fields || []).forEach((f) => chips.push(h('span', { class: 'chip slot', text: f.field || '?' })));
+      if (n.type === 'bulkUpdate') (n.criteria || []).forEach((c) => chips.push(h('span', { class: 'chip', text: c.field + ' ' + (c.op || 'eq') + ' ' + c.slot })));
+      if (n.pii || (n.type === 'ask' && (S.flow.piiSlots || []).indexOf(n.slot) >= 0)) chips.push(h('span', { class: 'chip', text: 'PII', title: 'Masked in logs' }));
       if (chips.length) el.append(h('div', { class: 'nchips' }, chips));
       const ps = ports(n);
       ps.forEach((p, i) => {
@@ -1266,11 +1344,15 @@
       idField(n)
     );
     const editors = { message: textEditor, end: textEditor, ask: askEditor, condition: condEditor, lookup: connEditor, submit: connEditor,
-                      summary: summaryEditor, verify: verifyEditor, findRecord: findEditor, changeFields: changeEditor, saveChanges: saveEditor };
+                      summary: summaryEditor, verify: verifyEditor, findRecord: findEditor, changeFields: changeEditor, saveChanges: saveEditor,
+                      repeat: repeatEditor, bulkUpdate: bulkEditor };
     body.append(editors[n.type](n));
     if (n.type !== 'condition' && n.type !== 'end') {
       body.append(h('h4', { class: 'sub', text: 'Connections' }));
-      ports(n).forEach((p) => body.append(F(n.type === 'summary' ? 'After confirm, go to' : PORT_TITLES[p.key], targetSelect(n, p.key),
+      const bulkTitles = { done: 'After updating, go to', cancelled: 'If the user cancels, go to' };
+      ports(n).forEach((p) => body.append(F(n.type === 'summary' ? 'After confirm, go to'
+        : n.type === 'repeat' ? 'When the list is done, go to'
+        : n.type === 'bulkUpdate' && bulkTitles[p.key] ? bulkTitles[p.key] : PORT_TITLES[p.key], targetSelect(n, p.key),
         p.key === 'onNotFound' ? 'Optional. Used when the connector returns found: false.' :
         p.key === 'onError' ? 'Optional. Without it a failed submit ends the conversation.' : PORT_HINTS[p.key] || null)));
     }
@@ -1335,7 +1417,7 @@
     const prompt = bound(() => n.prompt, (v) => setOrDelete(n, 'prompt', v), { multiline: true, key: n.id + '.prompt' });
     wrap.append(F('Question', prompt), slotChips(prompt));
 
-    wrap.append(answerEditor(n, n.id));
+    wrap.append(answerEditor(n, n.id, { file: true }));
 
     wrap.append(validatorsEditor(n));
     wrap.append(bindingEditor(n.slot));
@@ -1352,14 +1434,16 @@
   }
 
   // Answer type + constraints for anything with an .input spec (Ask nodes, Change-fields fields).
-  function answerEditor(o, kp) {
+  function answerEditor(o, kp, opts) {
+    opts = opts || {};
     const spec = o.input || { kind: 'text' };
     const kind = spec.kind || 'text';
     const setIn = (k, v) => { o.input = o.input || { kind: 'text' }; setOrDelete(o.input, k, v); };
     const box = h('div');
+    const kinds = opts.file ? KINDS.concat([['file', 'File upload']]) : KINDS;
     box.append(h('h4', { class: 'sub', text: 'Answer' }));
     box.append(h('div', { class: 'grid2' },
-      F('Type', sel(KINDS, kind, (v) => mutate(() => {
+      F('Type', sel(kinds, kind, (v) => mutate(() => {
         o.input = { kind: v, required: spec.required, placeholder: spec.placeholder };
         Object.keys(o.input).forEach((k) => o.input[k] === undefined && delete o.input[k]);
         if (v === 'choice') o.input.options = spec.options || [{ value: 'A', label: 'Option A' }, { value: 'B', label: 'Option B' }];
@@ -1384,7 +1468,19 @@
         F('Max length', bound(() => spec.maxLength, (v) => setIn('maxLength', numOrNull(v)), { type: 'number', key: kp + '.maxl' }))));
     } else if (kind === 'choice') {
       box.append(choiceEditor(o, kp));
+    } else if (kind === 'file') {
+      const acc = Array.isArray(spec.accept) ? spec.accept.join(', ') : spec.accept;
+      box.append(h('div', { class: 'grid2' },
+        F('Accepted types', bound(() => acc, (v) => setIn('accept', v.split(',').map((x) => x.trim()).filter(Boolean).length
+          ? v.split(',').map((x) => x.trim()).filter(Boolean) : ''), { key: kp + '.acc', placeholder: '.pdf, image/*' }),
+          'Extensions or MIME types, checked in the browser and again on the server.'),
+        F('Max size (KB)', bound(() => spec.maxSizeKb, (v) => setIn('maxSizeKb', numOrNull(v)), { type: 'number', key: kp + '.msz', placeholder: '5120' }),
+          'Up to 20480 KB.')),
+        h('p', { class: 'hint', text: 'The file goes to FC_FILES (in the Test tab: memory). The answer holds {id, name, size, mimeType}; your Submit connector reads the content by id.' }));
     }
+    box.append(F('In logs', sel([['', 'Show the value'], ['true', 'Redact it (PII)'], ['last4', 'Show only the last 4 characters']],
+      o.pii === true ? 'true' : (o.pii || ''), (v) => mutate(() => setOrDelete(o, 'pii', v === 'true' ? true : v), { panel: true })),
+      'PII values are masked in FC_EVENTS and debug logs. The chat itself still shows them to the user.'));
     return box;
   }
 
@@ -1918,6 +2014,147 @@
     return wrap;
   }
 
+  function repeatEditor(n) {
+    const wrap = h('div');
+    const slotIn = h('input', { class: 'in mono', value: n.slot || '' });
+    slotIn.addEventListener('change', () => {
+      const v = slotIn.value.trim();
+      if (v === n.slot) return;
+      if (!/^[a-z][a-z0-9_]{0,99}$/.test(v)) { toast('List names: lowercase letters, digits and _, starting with a letter.'); slotIn.value = n.slot || ''; return; }
+      const old = n.slot;
+      mutate(() => { if (old) renameSlot(old, v); n.slot = v; }, { panel: true });
+    });
+    wrap.append(h('div', { class: 'grid2' },
+      F('List (slot)', slotIn, 'Holds an array of items: [{field: value}, …]. {{' + (n.slot || 'list') + '.count}} is the number of items.'),
+      F('Label', bound(() => n.label, (v) => setOrDelete(n, 'label', v), { key: n.id + '.label', placeholder: 'Items' }))));
+    const pr = bound(() => n.prompt, (v) => setOrDelete(n, 'prompt', v), { multiline: true, rows: 2, key: n.id + '.prompt', placeholder: '(optional) e.g. Now the expenses, one at a time.' });
+    wrap.append(F('Intro', pr), slotChips(pr));
+    wrap.append(h('div', { class: 'grid2' },
+      F('One item is called', bound(() => n.itemLabel, (v) => setOrDelete(n, 'itemLabel', v), { key: n.id + '.il', placeholder: 'item' })),
+      F('Item title', bound(() => n.itemTitle, (v) => setOrDelete(n, 'itemTitle', v), { key: n.id + '.it', placeholder: '{{description}} ({{amount}})' }),
+        'Shown in the list and the summary. Uses the item\'s fields.'),
+      F('Minimum items', bound(() => n.min, (v) => setOrDelete(n, 'min', numOrNull(v)), { type: 'number', key: n.id + '.min', placeholder: '1' })),
+      F('Maximum items', bound(() => n.max, (v) => setOrDelete(n, 'max', numOrNull(v)), { type: 'number', key: n.id + '.max', placeholder: '20' }))));
+
+    wrap.append(h('h4', { class: 'sub', text: 'Questions for each item' }),
+      h('p', { class: 'hint', text: 'Asked in order for every item. In a question, {{n}} is the item number and earlier fields of the same item can be used, e.g. {{description}}.' }));
+    const flds = n.fields || [];
+    flds.forEach((fd, i) => {
+      const kp = n.id + '.rf' + i;
+      const det = h('details', { class: 'card' });
+      det.open = openFieldCards.has(kp);
+      det.addEventListener('toggle', () => { if (det.open) openFieldCards.add(kp); else openFieldCards.delete(kp); });
+      det.append(h('summary', { class: 'card-h', style: 'cursor:pointer' },
+        h('span', { class: 'grow mono', text: fd.field || '(no field)' }),
+        h('span', { class: 'chip', text: (fd.input && fd.input.kind) || 'text' }),
+        h('button', { class: 'x', text: '↑', title: 'Move up', disabled: i === 0, onclick: (e) => { e.preventDefault(); mutate(() => { flds.splice(i - 1, 0, flds.splice(i, 1)[0]); }, { panel: true }); } }),
+        h('button', { class: 'x', text: '×', title: 'Remove', onclick: (e) => { e.preventDefault(); mutate(() => flds.splice(i, 1), { panel: true }); } })));
+      det.append(h('div', { class: 'grid2' },
+        F('Field', bound(() => fd.field, (v) => { fd.field = v.trim(); }, { mono: true, key: kp + '.fn', onChange: true, panel: true })),
+        F('Label', bound(() => fd.label, (v) => setOrDelete(fd, 'label', v), { key: kp + '.lb' }))));
+      det.append(F('Question', bound(() => fd.prompt, (v) => setOrDelete(fd, 'prompt', v), { key: kp + '.pq', placeholder: (fd.label || 'Field') + ' for {{item}} {{n}}?' })));
+      det.append(answerEditor(fd, kp), validatorsEditor(fd, kp));
+      wrap.append(det);
+    });
+    wrap.append(h('button', { class: 'lnk', text: '+ Add question', onclick: () => mutate(() => {
+      n.fields = flds;
+      let k = 1; while (flds.some((x) => x.field === 'field_' + k)) k++;
+      flds.push({ field: 'field_' + k, label: 'Field ' + k, input: { kind: 'text' } });
+      openFieldCards.add(n.id + '.rf' + (flds.length - 1));
+    }, { panel: true }) }));
+
+    const pp = () => (n.prompts = n.prompts || {});
+    const msg = (key, label, ph) => F(label, bound(() => (n.prompts || {})[key], (v) => { setOrDelete(pp(), key, v); if (!Object.keys(n.prompts).length) delete n.prompts; },
+      { key: n.id + '.p.' + key, placeholder: ph }));
+    wrap.append(h('details', { class: 'adv' }, h('summary', { text: 'Advanced: buttons & messages' }),
+      h('div', { class: 'grid2' },
+        F('Add button', bound(() => n.addLabel, (v) => setOrDelete(n, 'addLabel', v), { key: n.id + '.al', placeholder: 'Add another' })),
+        F('Done button', bound(() => n.doneLabel, (v) => setOrDelete(n, 'doneLabel', v), { key: n.id + '.dl', placeholder: 'Done' }))),
+      msg('added', 'After adding an item', 'Added {{title}}.'),
+      msg('menu', 'Between items', 'Add another {{item}}, or tap Done.'),
+      msg('tooFew', 'Too few items', 'Please add at least {{min}}.'),
+      msg('full', 'Maximum reached', "That's the most I can take ({{max}}). Tap Done to continue."),
+      checkbox('Skip if the list already has items (e.g. from a lookup)', n.skipIfFilled, (c) => mutate(() => setOrDelete(n, 'skipIfFilled', c || null)))));
+    wrap.append(bindingEditor(n.slot));
+    return wrap;
+  }
+
+  function bulkEditor(n) {
+    const wrap = h('div');
+    const ids = Object.keys(catalog());
+    const srcOpts = [['', '— choose a data source —']].concat(ids.map((s) => [s, s]));
+    if (n.source && ids.indexOf(n.source) < 0) srcOpts.push([n.source, n.source + ' (not in catalog)']);
+    const src = sourceDef(n.source);
+    wrap.append(h('div', { class: 'grid2' },
+      F('Data source', sel(srcOpts, n.source || '', (v) => mutate(() => setOrDelete(n, 'source', v), { panel: true }), { mono: true })),
+      F('Maximum records', bound(() => n.maxRows, (v) => setOrDelete(n, 'maxRows', numOrNull(v)), { type: 'number', key: n.id + '.mr', placeholder: '50' }),
+        'More matches than this go to "too many". Up to 500.')));
+
+    wrap.append(h('h4', { class: 'sub', text: 'Which records' }));
+    wrap.append(F(null, sel([['criteria', 'Records matching search criteria'], ['mine', "The signed-in user's records (row filter)"]],
+      n.byRowFilter ? 'mine' : 'criteria', (v) => mutate(() => {
+        if (v === 'mine') { n.byRowFilter = true; delete n.criteria; } else { delete n.byRowFilter; n.criteria = n.criteria || []; }
+      }, { panel: true }))));
+    if (!n.byRowFilter) {
+      const crit = n.criteria || [];
+      const fOpts = [['', 'field…']].concat((src ? src.fields.filter((x) => x.searchable) : []).map((x) => [x.field, x.field]));
+      const sOpts = [['', 'answer…']].concat(knownSlots().map((x) => [x, x]));
+      crit.forEach((c, i) => {
+        wrap.append(h('div', { class: 'rowx' },
+          sel(fOpts.concat(c.field && !fOpts.some((o) => o[0] === c.field) ? [[c.field, c.field]] : []), c.field || '', (v) => mutate(() => { c.field = v; }), { mono: true }),
+          sel([['eq', '='], ['starts', 'starts'], ['contains', 'contains'], ['gte', '≥'], ['lte', '≤']], c.op || 'eq', (v) => mutate(() => { c.op = v; })),
+          sel(sOpts.concat(c.slot && !sOpts.some((o) => o[0] === c.slot) ? [[c.slot, c.slot]] : []), c.slot || '', (v) => mutate(() => { c.slot = v; }), { mono: true }),
+          h('button', { class: 'x', text: '×', title: 'Remove', onclick: () => mutate(() => crit.splice(i, 1), { panel: true }) })));
+      });
+      wrap.append(h('button', { class: 'lnk', text: '+ Add criterion', onclick: () => mutate(() => { n.criteria = crit; crit.push({ field: '', op: 'eq', slot: '' }); }, { panel: true }) }));
+    }
+
+    wrap.append(h('h4', { class: 'sub', text: 'Set' }),
+      h('p', { class: 'hint', text: 'The new value of each field, the same for every record: a fixed value, or an earlier answer.' }));
+    n.set = n.set || {};
+    const upd = (src ? src.fields.filter((x) => x.updatable) : []).map((x) => x.field);
+    Object.keys(n.set).forEach((k) => {
+      const v = n.set[k] && typeof n.set[k] === 'object' ? n.set[k] : { value: n.set[k] };
+      const fromSlot = 'slot' in v;
+      wrap.append(h('div', { class: 'rowx' },
+        h('span', { class: 'mono grow', text: k }),
+        sel([['value', 'fixed value'], ['slot', 'from answer']], fromSlot ? 'slot' : 'value', (m) => mutate(() => {
+          n.set[k] = m === 'slot' ? { slot: '', label: v.label } : { value: '', label: v.label };
+          if (!n.set[k].label) delete n.set[k].label;
+        }, { panel: true })),
+        fromSlot
+          ? sel([['', 'answer…']].concat(knownSlots().map((x) => [x, x])), v.slot || '', (s) => mutate(() => { v.slot = s; n.set[k] = v; }), { mono: true })
+          : bound(() => v.value, (s) => { v.value = s; n.set[k] = v; }, { key: n.id + '.sv.' + k, placeholder: 'new value' }),
+        h('button', { class: 'x', text: '×', title: 'Remove', onclick: () => mutate(() => { delete n.set[k]; }, { panel: true }) })));
+    });
+    const left = upd.filter((x) => !(x in n.set));
+    if (left.length) {
+      wrap.append(F('Add a field to set', sel([['', '+ field…']].concat(left.map((x) => [x, x])), '', (v) => {
+        if (v) mutate(() => { n.set[v] = { value: '', label: humanize(v) }; }, { panel: true });
+      }, { mono: true })));
+    } else if (!src) {
+      wrap.append(h('p', { class: 'hint', text: 'Choose a data source to pick its updatable fields.' }));
+    }
+
+    const card = n.card = n.card || {};
+    wrap.append(h('h4', { class: 'sub', text: 'Confirmation' }),
+      h('div', { class: 'grid2' },
+        F('Record title', bound(() => card.title, (v) => setOrDelete(card, 'title', v), { key: n.id + '.ct', placeholder: '{{reference}}' }), 'Shown for the first 10 records.'),
+        F('Record subtitle', bound(() => card.subtitle, (v) => setOrDelete(card, 'subtitle', v), { key: n.id + '.cs', placeholder: '{{status}}' })),
+        F('Confirm button', bound(() => n.confirmLabel, (v) => setOrDelete(n, 'confirmLabel', v), { key: n.id + '.cl', placeholder: 'Update {{count}}' })),
+        F('Cancel button', bound(() => n.cancelLabel, (v) => setOrDelete(n, 'cancelLabel', v), { key: n.id + '.xl', placeholder: 'Cancel' }))));
+    const pp = () => (n.prompts = n.prompts || {});
+    const msg = (key, label, ph) => F(label, bound(() => (n.prompts || {})[key], (v) => { setOrDelete(pp(), key, v); if (!Object.keys(n.prompts).length) delete n.prompts; },
+      { multiline: true, rows: 2, key: n.id + '.p.' + key, placeholder: ph }));
+    wrap.append(msg('confirm', 'Question', 'This will set {{changes}} on {{count}} {{records}}. Do you want to go ahead?'),
+      msg('done', 'After updating', 'Done. I updated {{updated}} of {{count}} records.'),
+      msg('none', 'Nothing matches', "I couldn't find any matching records."),
+      h('div', { class: 'card' }, h('div', { class: 'hint', style: 'margin:0' },
+        'Nothing changes until the user confirms. Each record is then read again and updated with its own version through the data source, ',
+        'so the updatable fields and the row filter apply to every row. The record keys never reach the browser, and the result is written to FC_EVENTS.')));
+    return wrap;
+  }
+
   function verifyEditor(n) {
     const asks = askSlots();
     const slotOpts = [['', '— choose an answer —']].concat(asks.map((s) => [s, s]));
@@ -1990,6 +2227,18 @@
       F('Name', bound(() => f.name, (v) => setOrDelete(f, 'name', v), { key: 'flow.name' })),
       F('Start node', sel([['', '—']].concat(f.nodes.map((n) => [n.id, n.id + '  (' + TYPES[n.type].label + ')'])), f.start, (v) => mutate(() => { f.start = v; }), { mono: true })));
 
+    wrap.append(h('h4', { class: 'sub', text: 'Logging' }),
+      checkbox('Debug logging: write every step, branch, connector call and search to FC_EVENTS (direction DBG)', f.debug,
+        (c) => mutate(() => setOrDelete(f, 'debug', c || null))),
+      F('PII answers', bound(() => (f.piiSlots || []).join(', '), (v) => {
+        const list = v.split(',').map((x) => x.trim()).filter(Boolean);
+        if (list.length) f.piiSlots = list; else delete f.piiSlots;
+      }, { mono: true, key: 'flow.pii', placeholder: 'e.g. ssn, salary', onChange: true }),
+        'Answers set by lookups or page context that logs must redact. For asked questions, use "In logs" on the question instead.'),
+      F('Resume message', bound(() => f.resumeText, (v) => setOrDelete(f, 'resumeText', v), { key: 'flow.resume',
+        placeholder: "Welcome back. Let's carry on where we left off." }),
+        'Shown when <flow-chat resume> picks the conversation up again after a page reload.'));
+
     wrap.append(h('h4', { class: 'sub', text: 'Form bindings' }),
       h('p', { class: 'hint', text: 'Where each captured value is mirrored on the host page. Asked fields can also be bound from their Ask node.' }));
     const tbl = h('table', { class: 'cov' }, h('tr', null, h('th', { text: 'Field' }), h('th', { text: 'APEX item' }), h('th', { text: 'DOM selector' }), h('th')));
@@ -2034,8 +2283,9 @@
     body.append(h('h4', { class: 'sub', text: 'Field checklist' }),
       h('p', { class: 'hint', text: 'Is each field asked on every path to ' + cv.goal + '? (' + cv.paths + ' path' + (cv.paths === 1 ? '' : 's') + ' analysed)' }));
     const tbl = h('table', { class: 'cov' }, h('tr', null, h('th', { text: 'Field' }), h('th', { text: 'Asked in' }), h('th', { text: 'Coverage' }), h('th', { text: 'Bound to' })));
-    knownSlots().forEach((s) => {
-      const askers = S.flow.nodes.filter((n) => n.type === 'ask' && n.slot === s).map((n) => n.id);
+    const counts = repeatNodes().map((n) => n.slot + '.count');
+    knownSlots().filter((s) => counts.indexOf(s) < 0).forEach((s) => {
+      const askers = S.flow.nodes.filter((n) => (n.type === 'ask' || n.type === 'repeat') && n.slot === s).map((n) => n.id);
       const b = S.flow.bindings[s] || {};
       const c = cv.cov[s];
       const label = askers.length ? (c === 'always' ? 'every path' : c === 'sometimes' ? 'some paths' : 'unreachable')
@@ -2067,6 +2317,7 @@
   const mockFor = (id, role) => (S.mocks[id] !== undefined ? S.mocks[id] : JSON.stringify(ROLE_PRESETS[role][0][1], null, 2));
 
   let testSources = {};
+  let testDebug = [];
   function renderMocks() {
     const box = $('mocks');
     box.textContent = '';
@@ -2174,6 +2425,12 @@
         view.records[a] = { key: r.key, version: r.version, changed: recordChanges(r), current: r.current };
       });
     }
+    if (testDebug.length) {
+      view.debug = testDebug.slice(-40).map((e) => {
+        const { sessionId, flowId, version, at, ...rest } = e;
+        return at.slice(11, 19) + ' ' + JSON.stringify(rest);
+      });
+    }
     $('simState').textContent = JSON.stringify(view, null, 2);
     ROOT.querySelectorAll('pre[data-src]').forEach((pre) => { pre.textContent = rowsText(pre.dataset.src); });
   }
@@ -2245,7 +2502,9 @@
     });
     // {{app_user}}: the designer's own APEX user when it runs inside APEX, else a stand-in.
     const appUser = (window.apex && apex.env && apex.env.APP_USER) || 'TEST_USER';
-    testEngine = FlowChatEngine.createEngine({ flows: [flow], connectors, dataSources: buildTestSources(), lovs: buildTestLovs(), appUser });
+    testDebug = [];
+    testEngine = FlowChatEngine.createEngine({ flows: [flow], connectors, dataSources: buildTestSources(), lovs: buildTestLovs(), appUser,
+      onDebug: flow.debug ? (e) => { testDebug.push(e); } : null });
     const chat = $('simChat');
     chat.setAttribute('flow', flow.flowId || 'draft');
     chat.configure({ transport: new FlowChat.LocalTransport(testEngine), adapter: new FlowChat.NoneAdapter() });
