@@ -47,7 +47,8 @@
         { "$ref": "#/$defs/end" },
         { "$ref": "#/$defs/verify" },
         { "$ref": "#/$defs/findRecord" }, { "$ref": "#/$defs/changeFields" }, { "$ref": "#/$defs/saveChanges" },
-        { "$ref": "#/$defs/repeat" }, { "$ref": "#/$defs/bulkUpdate" }, { "$ref": "#/$defs/set" }, { "$ref": "#/$defs/menu" }
+        { "$ref": "#/$defs/repeat" }, { "$ref": "#/$defs/bulkUpdate" }, { "$ref": "#/$defs/set" }, { "$ref": "#/$defs/menu" },
+        { "$ref": "#/$defs/email" }
       ]
     },
 
@@ -68,6 +69,27 @@
             "next": { "$ref": "#/$defs/id" } } } }
       },
       "required": ["options"]
+    },
+
+    "email": {
+      "description": "Send an email built from templates over the answers. Without a connector the PL/SQL engine queues it with APEX_MAIL (the JS engine calls options.sendEmail). Not sent again when an Edit replays the flow.",
+      "properties": {
+        "type": { "const": "email" },
+        "to": { "type": "string", "description": "Recipients, comma or semicolon separated; may use {{placeholders}}" },
+        "cc": { "type": "string" },
+        "bcc": { "type": "string" },
+        "replyTo": { "type": "string" },
+        "from": { "type": "string", "description": "Sender address. Required for APEX_MAIL (no connector)" },
+        "subject": { "type": "string", "description": "One line; may use {{placeholders}}" },
+        "body": { "type": "string", "description": "Plain text with {{placeholders}}; also sent as escaped HTML" },
+        "attachments": { "type": "array", "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,99}$" }, "description": "File-answer slots to attach" },
+        "connector": { "type": "string", "description": "Optional. Receives the payload plus {to, cc, bcc, replyTo, from, subject, body, attachments}; returns {ok, message?}" },
+        "message": { "type": "string", "description": "Shown in the chat after sending" },
+        "errorMessage": { "type": "string", "description": "Shown when sending fails" },
+        "next": { "$ref": "#/$defs/id" },
+        "onError": { "$ref": "#/$defs/id", "description": "Where to go when sending fails (default: next)" }
+      },
+      "required": ["to", "subject"]
     },
 
     "set": {

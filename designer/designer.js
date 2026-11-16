@@ -130,6 +130,8 @@
                  make: (id) => ({ id, type: 'summary', text: "Here's what I have. Please check:", confirmLabel: 'Confirm & submit' }) },
     submit:    { label: 'Submit',    color: '#16a34a', desc: 'Re-validate everything and save via a connector.',
                  make: (id) => ({ id, type: 'submit', connector: '' }) },
+    email:     { label: 'Email',     color: '#ea580c', desc: 'Send an email built from the answers (APEX_MAIL, or a connector).',
+                 make: (id) => ({ id, type: 'email', to: '', from: '', subject: '', body: '' }) },
     end:       { label: 'End',       color: '#475569', desc: 'Finish the conversation.',
                  make: (id) => ({ id, type: 'end', text: 'All done!' }) },
     repeat:    { label: 'Repeat',    color: '#0284c7', desc: 'Collect a list of items (line items, children, expenses), each with its own questions.',
@@ -321,6 +323,7 @@
       case 'summary': return [{ key: 'next', label: 'confirm' }];
       case 'lookup': return [{ key: 'next', label: 'next' }, { key: 'onNotFound', label: 'not found', optional: true }];
       case 'submit': return [{ key: 'onSuccess', label: 'success' }, { key: 'onError', label: 'error', optional: true }];
+      case 'email': return [{ key: 'next', label: 'sent' }, { key: 'onError', label: 'error', optional: true }];
       case 'verify': return [{ key: 'verified', label: 'verified' }, { key: 'failed', label: 'failed', optional: true }];
       case 'findRecord': return [{ key: 'found', label: 'found' }, { key: 'notFound', label: 'not found' },
         { key: 'tooMany', label: 'too many', optional: true }, { key: 'cancelled', label: 'none of these', optional: true }];
@@ -380,6 +383,9 @@
     return out;
   }
   function repeatNodes() { return S.flow.nodes.filter((n) => n.type === 'repeat' && n.slot); }
+  function fileSlots() {
+    return S.flow.nodes.filter((n) => n.type === 'ask' && n.slot && n.input && n.input.kind === 'file').map((n) => n.slot);
+  }
   // Names declared in the flow's "context" list (values the page passes to the widget).
   function contextNames() {
     return (S.flow.context || []).map((c) => (c && typeof c === 'object' ? c.name : c)).filter(Boolean).map(String);
@@ -480,6 +486,7 @@
     S.flow.nodes.forEach((n) => {
       if ((n.type === 'lookup' || n.type === 'submit') && n.connector) map[n.connector] = map[n.connector] || n.type;
       if (n.type === 'verify' && n.connector) map[n.connector] = map[n.connector] || 'sender';
+      if (n.type === 'email' && n.connector) map[n.connector] = map[n.connector] || 'mailer';
       if (n.type === 'ask') (n.validators || []).forEach((v) => {
         if (v.type === 'server' && v.connector) map[v.connector] = map[v.connector] || 'validator';
       });
@@ -513,7 +520,9 @@
         if (a.from === oldSlot) a.from = newSlot;
         if (typeof a.template === 'string') a.template = a.template.replace(re, '{{' + newSlot + '}}');
       });
-      ['text', 'prompt'].forEach((k) => { if (typeof n[k] === 'string') n[k] = n[k].replace(re, '{{' + newSlot + '}}'); });
+      ['text', 'prompt', 'to', 'cc', 'bcc', 'replyTo', 'from', 'subject', 'body', 'message', 'errorMessage']
+        .forEach((k) => { if (typeof n[k] === 'string') n[k] = n[k].replace(re, '{{' + newSlot + '}}'); });
+      if (n.type === 'email' && n.attachments) n.attachments = n.attachments.map((s) => (s === oldSlot ? newSlot : s));
       (n.branches || []).forEach((b) => fixCond(b.when));
       if (n.type === 'summary' && n.fields) n.fields = n.fields.map((s) => (s === oldSlot ? newSlot : s));
       (n.criteria || []).forEach((c) => { if (c.slot === oldSlot) c.slot = newSlot; });
@@ -781,7 +790,9 @@
           if (spec.kind === 'file') {
             if (isFilled(spec.maxSizeKb) && (spec.maxSizeKb < 1 || spec.maxSizeKb > 20480)) add('error', 'File size limit must be 1 to 20480 KB.', n.id);
             if (!spec.accept || !String(spec.accept).trim()) add('warning', 'Any type of file is accepted. Set the accepted types (e.g. .pdf, image/*).', n.id);
-            if (!f.nodes.some((x) => x.type === 'submit')) add('warning', 'Files are kept in FC_FILES; without a Submit step nothing ever reads them.', n.id);
+            if (!f.nodes.some((x) => x.type === 'submit' || (x.type === 'email' && (x.attachments || []).indexOf(n.slot) >= 0))) {
+              add('warning', 'Files are kept in FC_FILES; without a Submit step (or an Email that attaches it) nothing ever reads them.', n.id);
+            }
           }
           checkValidators(n.validators, n.id);
           break;
@@ -844,6 +855,19 @@
         case 'lookup': case 'submit':
           if (!n.connector) add('error', TYPES[n.type].label + ' has no connector.', n.id);
           break;
+        case 'email': {
+          if (!String(n.to || '').trim()) add('error', 'Email has no recipient (To).', n.id);
+          if (!String(n.subject || '').trim()) add('error', 'Email has no subject.', n.id);
+          if (!String(n.body || '').trim()) add('warning', 'Email has no message text.', n.id);
+          if (!n.connector && !String(n.from || '').trim()) add('error', 'Email needs a From address (APEX_MAIL requires one), or a connector that sends it.', n.id);
+          ['to', 'cc', 'bcc', 'replyTo', 'from', 'subject', 'body', 'message', 'errorMessage'].forEach((k) => placeholders(n[k], n.id));
+          ['to', 'cc', 'bcc', 'replyTo', 'from'].forEach((k) => String(n[k] || '').split(/[,;\n]+/).map((x) => x.trim()).filter(Boolean).forEach((a) => {
+            if (!/\{\{/.test(a) && !/^[^\s@<>,;"()]+@[^\s@<>,;"()]+\.[^\s@<>,;"()]+$/.test(a)) add('error', '"' + a + '" is not an email address.', n.id);
+          }));
+          const files = fileSlots();
+          (n.attachments || []).forEach((a) => { if (files.indexOf(a) < 0) add('error', 'Attachment "' + a + '" is not a file answer.', n.id); });
+          break;
+        }
         case 'set': {
           if (!(n.assign || []).length) add('warning', 'Set values sets nothing.', n.id);
           (n.assign || []).forEach((a) => {
@@ -1061,6 +1085,7 @@
       case 'condition': return (n.branches || []).length ? null : 'No branches yet';
       case 'menu': return (n.options || []).length ? (n.prompt || '') : 'No options yet';
       case 'lookup': case 'submit': return n.connector ? 'Calls ' + n.connector : '';
+      case 'email': return n.to ? 'To ' + n.to + (n.subject ? ': ' + n.subject : '') : 'No recipient yet';
       case 'verify': return n.slot ? 'Send a code to ' + n.slot + (n.connector ? ' via ' + n.connector : '') : '';
       case 'findRecord': return n.source ? (n.requireVerified ? '\uD83D\uDD12 ' : '') + 'Search ' + n.source + (n.as ? ' → ' + n.as : '') : '';
       case 'changeFields': return n.record ? 'Edit ' + (n.fields || []).length + ' field(s) of ' + n.record : '';
@@ -1431,7 +1456,7 @@
     );
     const editors = { message: textEditor, end: textEditor, ask: askEditor, condition: condEditor, lookup: connEditor, submit: connEditor,
                       summary: summaryEditor, verify: verifyEditor, findRecord: findEditor, changeFields: changeEditor, saveChanges: saveEditor,
-                      repeat: repeatEditor, bulkUpdate: bulkEditor, set: setEditor, menu: menuEditor };
+                      repeat: repeatEditor, bulkUpdate: bulkEditor, set: setEditor, menu: menuEditor, email: emailEditor };
     body.append(editors[n.type](n));
     if (n.type !== 'condition' && n.type !== 'menu' && n.type !== 'end') {
       body.append(h('h4', { class: 'sub', text: 'Connections' }));
@@ -1440,7 +1465,8 @@
         : n.type === 'repeat' ? 'When the list is done, go to'
         : n.type === 'bulkUpdate' && bulkTitles[p.key] ? bulkTitles[p.key] : PORT_TITLES[p.key], targetSelect(n, p.key),
         p.key === 'onNotFound' ? 'Optional. Used when the connector returns found: false.' :
-        p.key === 'onError' ? 'Optional. Without it a failed submit ends the conversation.' : PORT_HINTS[p.key] || null)));
+        p.key === 'onError' ? (n.type === 'email' ? 'Optional. Without it the flow shows the error and carries on to the next step.'
+          : 'Optional. Without it a failed submit ends the conversation.') : PORT_HINTS[p.key] || null)));
     }
     const probs = analyze().list.filter((x) => x.nodeId === n.id);
     if (probs.length) {
@@ -2102,6 +2128,41 @@
     return wrap;
   }
 
+  function emailEditor(n) {
+    const wrap = h('div');
+    const tpl = (label, key, ph, hint, multi) => {
+      const el = bound(() => n[key], (v) => setOrDelete(n, key, v), { key: n.id + '.e' + key, placeholder: ph, multiline: !!multi, rows: multi ? 6 : null });
+      wrap.append(F(label, el, hint), slotChips(el));
+    };
+    tpl('To', 'to', '{{email}}, team@example.com', 'Comma or semicolon separated. {{placeholders}} are filled in from the answers.');
+    tpl('Subject', 'subject', 'Your request {{reference}}');
+    tpl('Message', 'body', 'Hi {{name}},\n\nThanks for your request…', 'Plain text. Also sent as HTML, with the answers escaped.', true);
+    const files = fileSlots();
+    if (files.length) {
+      const box = h('div', { class: 'card' }, h('div', { class: 'card-h', text: 'Attach file answers' }));
+      files.forEach((s) => box.append(checkbox(s, (n.attachments || []).indexOf(s) >= 0, (c) => mutate(() => {
+        const cur = (n.attachments || []).filter((x) => x !== s);
+        if (c) cur.push(s);
+        if (cur.length) n.attachments = cur; else delete n.attachments;
+      }, { panel: true }))));
+      wrap.append(box);
+    }
+    wrap.append(h('h4', { class: 'sub', text: 'Sender' }));
+    wrap.append(F('From', bound(() => n.from, (v) => setOrDelete(n, 'from', v.trim()), { key: n.id + '.efrom', placeholder: 'no-reply@yourcompany.com' }),
+      'Required by APEX_MAIL. Use an address your mail server accepts.'));
+    wrap.append(h('div', { class: 'grid2' },
+      F('Cc', bound(() => n.cc, (v) => setOrDelete(n, 'cc', v), { key: n.id + '.ecc' })),
+      F('Bcc', bound(() => n.bcc, (v) => setOrDelete(n, 'bcc', v), { key: n.id + '.ebcc' }))));
+    wrap.append(F('Reply-to', bound(() => n.replyTo, (v) => setOrDelete(n, 'replyTo', v), { key: n.id + '.erep' })));
+    wrap.append(F('Send through connector (optional)', connectorInput(() => n.connector, (v) => setOrDelete(n, 'connector', v.trim()), n.id + '.econn'),
+      'Leave empty to queue the email with APEX_MAIL. A connector receives {"to", "cc", "bcc", "replyTo", "from", "subject", "body", "attachments"} and returns {"ok": true} or {"ok": false, "message": "…"}.'));
+    wrap.append(h('h4', { class: 'sub', text: 'Chat messages' }));
+    wrap.append(F('After sending (optional)', bound(() => n.message, (v) => setOrDelete(n, 'message', v), { key: n.id + '.emsg', placeholder: "I've emailed you a copy." })));
+    wrap.append(F('If sending fails', bound(() => n.errorMessage, (v) => setOrDelete(n, 'errorMessage', v), { key: n.id + '.eerr', placeholder: "Sorry, I couldn't send the email." })));
+    wrap.append(h('p', { class: 'hint', text: 'The email is not sent again when the user edits an answer and the flow replays. In Test, nothing is sent: the email is shown instead.' }));
+    return wrap;
+  }
+
   function menuEditor(n) {
     const wrap = h('div');
     const list = n.options = n.options || [];
@@ -2532,7 +2593,8 @@
     validator: [['Accept', { valid: true }], ['Reject', { valid: false, message: 'Rejected by the test mock.' }]],
     lookup: [['Not found', { found: false }], ['Found', { found: true, slots: {}, message: 'I found a matching record.' }]],
     submit: [['Success', { ok: true, slots: { reference: 'TEST-0001' } }], ['Failure', { ok: false, message: 'Test failure from the mock.' }]],
-    sender: [['Sent', { ok: true }], ['Sending fails', { ok: false, message: "Sorry, I couldn't send the code." }]]
+    sender: [['Sent', { ok: true }], ['Sending fails', { ok: false, message: "Sorry, I couldn't send the code." }]],
+    mailer: [['Sent', { ok: true }], ['Sending fails', { ok: false, message: "Sorry, I couldn't send the email." }]]
   };
   const mockFor = (id, role) => (S.mocks[id] !== undefined ? S.mocks[id] : JSON.stringify(ROLE_PRESETS[role][0][1], null, 2));
 
@@ -2717,6 +2779,7 @@
         try { res = JSON.parse(txt); } catch (e) { throw new Error('The test mock for "' + id + '" is not valid JSON.'); }
         // Verify: nothing is really sent in a test, so show the code to whoever is testing.
         if (uses[id] === 'sender' && res.ok !== false) toast('Test code for ' + p.to + ': ' + p.code, 12000);
+        if (uses[id] === 'mailer' && res.ok !== false) showTestEmail(p);
         return res;
       };
     });
@@ -2724,6 +2787,7 @@
     const appUser = (window.apex && apex.env && apex.env.APP_USER) || 'TEST_USER';
     testDebug = [];
     testEngine = FlowChatEngine.createEngine({ flows: [flow], connectors, dataSources: buildTestSources(), lovs: buildTestLovs(), appUser,
+      sendEmail: (m) => { showTestEmail(m); return { ok: true }; },
       onDebug: flow.debug ? (e) => { testDebug.push(e); } : null });
     const chat = $('simChat');
     chat.setAttribute('flow', flow.flowId || 'draft');
@@ -2735,6 +2799,19 @@
     updateTestNote();
     renderMocks();
     $('simState').textContent = '{}';
+  }
+
+  // Nothing is sent in a test: show the email that would go out.
+  function showTestEmail(m) {
+    const list = (a) => (a || []).join(', ');
+    toast('Test email (not sent) to ' + list(m.to) + ': ' + m.subject, 8000);
+    const d = modal('Test email (not sent)', { width: '520px' });
+    const row = (k, v) => (v ? h('div', null, h('b', { text: k + ': ' }), v) : null);
+    d.body.append(...[row('From', m.from || '(connector default)'), row('To', list(m.to)), row('Cc', list(m.cc)), row('Bcc', list(m.bcc)),
+      row('Reply-to', m.replyTo), row('Subject', m.subject),
+      row('Attachments', (m.attachments || []).map((a) => a.name).join(', ')),
+      h('pre', { class: 'mono', style: 'white-space:pre-wrap;margin-top:8px', text: m.body || '' })].filter(Boolean));
+    d.foot.append(h('button', { class: 'btn', text: 'Close', onclick: d.close }));
   }
 
   function updateTestNote() {

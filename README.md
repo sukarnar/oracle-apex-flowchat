@@ -47,6 +47,7 @@ tests/      engine.test.js           node tests/engine.test.js
             phase-e.test.js          node tests/phase-e.test.js (versions, debug, PII, resume, Repeat, Bulk update, files)
             set.test.js              node tests/set.test.js (Set values node, context variables)
             menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
+            email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
             apex-embed-test.html     designer inside a page-wide form, like APEX
             apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
             fake-apex-backend.js     emulates the FC_DESIGNER Ajax protocol in the browser (testing only)
@@ -301,6 +302,39 @@ reference is in `flows/flow.schema.json`, and `flows/loan_application.json` uses
   `slot` is optional: it keeps the chosen value for `{{topic}}`, conditions and the summary. An option
   with `when` is only offered while the condition holds. Back returns to the menu; an Edit replays
   through the option chosen before.
+- **Email node:** sends an email built from the answers:
+  ```json
+  { "id": "notify", "type": "email", "from": "no-reply@yourcompany.com",
+    "to": "{{email}}", "cc": "hr@yourcompany.com", "bcc": "", "replyTo": "",
+    "subject": "Your leave request for {{days}} days",
+    "body": "Hi {{name}},
+
+We received your request.
+
+HR team",
+    "attachments": ["receipt"],
+    "message": "I've emailed a copy to {{email}}.", "errorMessage": "Sorry, I couldn't send the email.",
+    "next": "done", "onError": "done" }
+  ```
+  - **APEX:** without a `connector`, FC_ENGINE queues the email with `APEX_MAIL` (`from` is then
+    required). APEX sends its mail queue after the commit, through the instance's SMTP settings;
+    the queue job runs every few minutes, or call `apex_mail.push_queue` to send at once. The FlowChat
+    request must run in an APEX session (the APEX transport does); over ORDS, use a connector.
+  - **Connector:** with `"connector": "my_mailer"`, the connector gets the usual payload plus
+    `to`, `cc`, `bcc` (arrays), `replyTo`, `from`, `subject`, `body` and `attachments`
+    (`[{slot, id, name, size, mimeType}]`; read the content from `FC_FILES` by `id` and `sessionId`).
+    It returns `{"ok": true}` or `{"ok": false, "message": "..."}`.
+  - **JavaScript engine:** pass `createEngine({ sendEmail: (msg) => ({ ok: true }) })`, or use a connector.
+    The designer's Test tab sends nothing; it shows the email instead.
+  - Templates take `{{placeholders}}`. Recipients are separated by commas or semicolons. Every
+    address is checked, there are at most 50 recipients, and line breaks are removed from the subject
+    and addresses. The body is plain text; it's also sent as HTML with the values escaped.
+  - **Attachments:** list file-answer slots in `attachments`.
+  - **On failure:** the user sees `errorMessage` and the flow goes to `onError`, or carries on to
+    `next` when there is none. The error is in the debug log (event `email`).
+  - **Edits:** an Edit that replays the flow doesn't send the email again.
+  - **Spam:** a `to` filled from an answer lets anyone using the flow send that email to any address,
+    so send to addresses typed by users only where that's fine (for example after a Verify step).
 - **Signed-in user:** `{{app_user}}` is built in and works in any message, prompt or condition
   (`{"slot": "app_user", "op": "=", "value": "ADMIN"}`) with no field or binding. In APEX, FC_ENGINE
   fills it from the APEX session (`APP_USER`), so the browser can't change it. A slot or context value
@@ -601,9 +635,12 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 70 unit tests (`tests/engine.test.js`,
+- The JavaScript engine and widget are tested: 75 unit tests (`tests/engine.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
-  `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`), plus manual end-to-end runs of the demos.
+  `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
+  `tests/email.test.js`), plus manual end-to-end runs of the demos.
+- **The Email node's PL/SQL (`run_email` in `FC_ENGINE`) has not been compiled or sent a real email
+  yet.** It mirrors the tested JavaScript engine.
 - **The Phase E PL/SQL (`FC_ENGINE`, `01_tables.sql`, `upgrade_phase_e.sql`, `14_seed_expense_flow.sql`)
   has not been compiled yet.** It mirrors the JavaScript engine, which is tested. Expect possible small
   compile fixes when you run `upgrade_phase_e.sql`.

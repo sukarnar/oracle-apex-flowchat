@@ -1202,6 +1202,172 @@ create or replace package body fc_engine as
   end menu_choice;
 
   ------------------------------------------------------------------------------
+  -- email: a message built from templates, sent with APEX_MAIL or through a connector
+  ------------------------------------------------------------------------------
+  function one_line (p in varchar2) return varchar2 is
+  begin
+    return trim(regexp_replace(p, '[' || chr(13) || chr(10) || ']+', ' '));
+  end one_line;
+
+  -- A filled-in recipient template split on commas, semicolons and line breaks.
+  function email_list (p_text in varchar2, p_v in json_object_t) return json_array_t is
+    l_out json_array_t := json_array_t();
+    l_s   varchar2(32767) := interpolate(p_text, p_v);
+    l_pat varchar2(20) := '[^,;' || chr(13) || chr(10) || ']+';
+    l_x   varchar2(4000);
+  begin
+    if l_s is null then return l_out; end if;
+    for i in 1 .. regexp_count(l_s, l_pat) loop
+      l_x := trim(regexp_substr(l_s, l_pat, 1, i));
+      if l_x is not null then l_out.append(l_x); end if;
+    end loop;
+    return l_out;
+  end email_list;
+
+  function joined (p in json_array_t) return varchar2 is
+    l varchar2(32767);
+  begin
+    for i in 0 .. p.get_size - 1 loop
+      l := l || case when i > 0 then ',' end || p.get_string(i);
+    end loop;
+    return l;
+  end joined;
+
+  function is_email (p in varchar2) return boolean is
+  begin
+    return regexp_like(p, '^[^[:space:]@<>,;"()]+@[^[:space:]@<>,;"()]+\.[^[:space:]@<>,;"()]+$');
+  end is_email;
+
+  -- The HTML part: the plain text with every character escaped and line breaks kept.
+  function email_html (p in clob) return clob is
+  begin
+    if p is null then return null; end if;
+    return '<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px">'
+        || replace(replace(replace(replace(replace(replace(p, '&', '&' || 'amp;'), '<', '&' || 'lt;'), '>', '&' || 'gt;'),
+                   '"', '&' || 'quot;'), chr(13), ''), chr(10), '<br>')
+        || '</div>';
+  end email_html;
+
+  -- Sends the email node's message; returns the next node (onError, else next, when sending fails).
+  function run_email (c in out nocopy t_ctx, p_node in json_object_t) return varchar2 is
+    l_id      varchar2(200)   := str(p_node, 'id');
+    l_v       json_object_t   := vals(c);
+    l_to      json_array_t    := email_list(str(p_node, 'to'), l_v);
+    l_cc      json_array_t    := email_list(str(p_node, 'cc'), l_v);
+    l_bcc     json_array_t    := email_list(str(p_node, 'bcc'), l_v);
+    l_reply   varchar2(4000)  := one_line(interpolate(str(p_node, 'replyTo'), l_v));
+    l_from    varchar2(4000)  := one_line(interpolate(str(p_node, 'from'), l_v));
+    l_subj    varchar2(4000)  := one_line(interpolate(str(p_node, 'subject'), l_v));
+    l_body    clob            := interpolate(str(p_node, 'body'), l_v);
+    l_slots   json_array_t    := arr(p_node, 'attachments');
+    l_att     json_array_t    := json_array_t();
+    l_all     json_array_t    := json_array_t();
+    l_f       json_object_t;
+    l_a       json_object_t;
+    l_pay     json_object_t;
+    l_res     json_object_t;
+    l_ev      json_object_t;
+    l_problem varchar2(4000);
+    l_mail_id number;
+  begin
+    for i in 0 .. l_slots.get_size - 1 loop
+      l_f := obj(c.slots, l_slots.get_string(i));
+      if l_f is not null and str(l_f, 'id') is not null then
+        l_a := copy(l_f);
+        l_a.put('slot', l_slots.get_string(i));
+        l_att.append(l_a);
+      end if;
+    end loop;
+
+    l_all := json_array_t.parse(l_to.to_clob);
+    for i in 0 .. l_cc.get_size - 1 loop l_all.append(l_cc.get_string(i)); end loop;
+    for i in 0 .. l_bcc.get_size - 1 loop l_all.append(l_bcc.get_string(i)); end loop;
+    if l_to.get_size = 0 then
+      l_problem := 'no recipient';
+    elsif l_all.get_size > 50 then
+      l_problem := 'more than 50 recipients';
+    else
+      if l_reply is not null then l_all.append(l_reply); end if;
+      if l_from is not null then l_all.append(l_from); end if;
+      for i in 0 .. l_all.get_size - 1 loop
+        if not is_email(l_all.get_string(i)) then
+          l_problem := 'not an email address: ' || substr(l_all.get_string(i), 1, 200);
+          exit;
+        end if;
+      end loop;
+      if l_problem is null and l_subj is null then l_problem := 'no subject'; end if;
+    end if;
+
+    if l_problem is null then
+      savepoint fc_email;
+      begin
+        if str(p_node, 'connector') is not null then
+          l_pay := json_object_t.parse(payload(c, l_id));
+          l_pay.put('to', l_to);
+          l_pay.put('cc', l_cc);
+          l_pay.put('bcc', l_bcc);
+          if l_reply is not null then l_pay.put('replyTo', l_reply); else l_pay.put_null('replyTo'); end if;
+          if l_from is not null then l_pay.put('from', l_from); else l_pay.put_null('from'); end if;
+          l_pay.put('subject', l_subj);
+          l_pay.put('body', l_body);
+          l_pay.put('attachments', l_att);
+          l_res := conn(c, l_id, str(p_node, 'connector'), l_pay.to_clob);
+          if str(l_res, 'ok') = 'false' then l_problem := nvl(str(l_res, 'message'), 'the sender reported a failure'); end if;
+        elsif l_from is null then
+          l_problem := 'no From address (APEX_MAIL needs "from" on the email node)';
+        else
+          -- Queued by APEX_MAIL; APEX sends the queue after the commit (its mail job runs every few minutes).
+          l_mail_id := apex_mail.send(p_to        => joined(l_to),
+                                      p_from      => l_from,
+                                      p_body      => l_body,
+                                      p_body_html => email_html(l_body),
+                                      p_subj      => l_subj,
+                                      p_cc        => joined(l_cc),
+                                      p_bcc       => joined(l_bcc),
+                                      p_replyto   => l_reply);
+          for i in 0 .. l_att.get_size - 1 loop
+            for r in (select content, filename, mime_type
+                        from fc_files
+                       where file_id = str(treat(l_att.get(i) as json_object_t), 'id')
+                         and session_id = c.session_id) loop
+              apex_mail.add_attachment(p_mail_id    => l_mail_id,
+                                       p_attachment => r.content,
+                                       p_filename   => r.filename,
+                                       p_mime_type  => r.mime_type);
+            end loop;
+          end loop;
+        end if;
+      exception when others then
+        rollback to fc_email;
+        l_problem := substr(sqlerrm, 1, 4000);
+        apex_debug.error('FlowChat email %s failed: %s', l_id, l_problem);
+      end;
+    end if;
+
+    if dbg_enabled(c) then
+      l_ev := json_object_t();
+      l_ev.put('event', 'email');
+      l_ev.put('node', l_id);
+      l_ev.put('to', l_to);
+      l_ev.put('subject', l_subj);
+      if l_att.get_size > 0 then l_ev.put('attachments', l_att.get_size); end if;
+      l_ev.put('sent', l_problem is null);
+      if l_problem is not null then l_ev.put('error', l_problem); end if;
+      dbg(c, l_id, l_ev);
+    end if;
+
+    if l_problem is not null then
+      add_msg(c, 'error', interpolate(coalesce(str(p_node, 'errorMessage'), str(l_res, 'message'),
+                                               'Sorry, I couldn''t send the email.'), vals(c)));
+      return nvl(str(p_node, 'onError'), str(p_node, 'next'));
+    end if;
+    if str(p_node, 'message') is not null then
+      add_msg(c, 'text', interpolate(str(p_node, 'message'), vals(c)));
+    end if;
+    return str(p_node, 'next');
+  end run_email;
+
+  ------------------------------------------------------------------------------
   -- records (findRecord / changeFields / saveChanges)
   ------------------------------------------------------------------------------
   function record_changes (p_rec in json_object_t) return json_object_t is
@@ -1939,7 +2105,7 @@ create or replace package body fc_engine as
         l_id := str(l_n, 'verified');
       elsif l_type = 'bulkUpdate' then
         l_id := str(l_n, 'done');
-      elsif l_type in ('message', 'lookup', 'set') then
+      elsif l_type in ('message', 'lookup', 'set', 'email') then
         l_id := str(l_n, 'next');
       else
         exit;
@@ -1980,6 +2146,14 @@ create or replace package body fc_engine as
         when 'set' then
           apply_set(c, l_node);
           l_id := str(l_node, 'next');
+
+        when 'email' then
+          -- Replaying an edit never sends the email again.
+          if c.replay then
+            l_id := str(l_node, 'next');
+          else
+            l_id := run_email(c, l_node);
+          end if;
 
         when 'menu' then
           -- Replaying an edit follows the earlier choice; otherwise the menu is always shown,

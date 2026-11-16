@@ -53,6 +53,11 @@
  * { save({sessionId, flowId, slot, name, mimeType, size, data}) -> id, remove({sessionId, fileId}) }
  * (default: kept in memory, read them with engine.getFile(sessionId, fileId)). A file answer's
  * slot value is {id, name, size, mimeType}; the content never travels in the session state.
+ *
+ * Email node: builds {to, cc, bcc, replyTo, from, subject, body, attachments} from templates over the
+ * answers and hands it to the node's connector, or to options.sendEmail(msg) -> {ok, message?} when the
+ * node names no connector. Attachments are file answers ({slot, id, name, size, mimeType}); read their
+ * content with engine.getFile(sessionId, id) (or from your own options.files store).
  */
 (function (global) {
   'use strict';
@@ -614,6 +619,58 @@
       else await run(ctx, opt.next);
     }
 
+    // ---- email: send a message built from templates, via a connector or options.sendEmail
+    var EMAIL_RE = /^[^\s@<>,;"()]+@[^\s@<>,;"()]+\.[^\s@<>,;"()]+$/;
+    var MAX_RECIPIENTS = 50;
+    function oneLine(s) { return String(s == null ? '' : s).replace(/[\r\n]+/g, ' ').trim(); }
+    function emailList(text, v) {
+      return interpolate(text || '', v).split(/[,;\r\n]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+    }
+    function buildEmail(ctx, node) {
+      var v = view(ctx);
+      var msg = { to: emailList(node.to, v), cc: emailList(node.cc, v), bcc: emailList(node.bcc, v),
+                  replyTo: oneLine(interpolate(node.replyTo || '', v)) || null,
+                  from: oneLine(interpolate(node.from || '', v)) || null,
+                  subject: oneLine(interpolate(node.subject || '', v)),
+                  body: interpolate(node.body || '', v), attachments: [] };
+      (node.attachments || []).forEach(function (slot) {
+        var f = ctx.st.slots[slot];
+        if (f && typeof f === 'object' && f.id) msg.attachments.push({ slot: slot, id: f.id, name: f.name, size: f.size, mimeType: f.mimeType });
+      });
+      return msg;
+    }
+    function emailProblem(msg) {
+      if (!msg.to.length) return 'no recipient';
+      if (msg.to.length + msg.cc.length + msg.bcc.length > MAX_RECIPIENTS) return 'more than ' + MAX_RECIPIENTS + ' recipients';
+      var bad = msg.to.concat(msg.cc, msg.bcc, msg.replyTo ? [msg.replyTo] : [], msg.from ? [msg.from] : [])
+        .filter(function (x) { return !EMAIL_RE.test(x); });
+      if (bad.length) return 'not an email address: ' + bad[0];
+      if (!msg.subject) return 'no subject';
+      return null;
+    }
+    // Sends the email; returns the next node (onError, else next, when sending fails).
+    async function runEmail(ctx, node) {
+      var msg = buildEmail(ctx, node), problem = emailProblem(msg), r = null;
+      if (!problem) {
+        try {
+          if (node.connector) r = await callConnector(ctx, node.connector, Object.assign({ nodeId: node.id }, msg));
+          else if (typeof options.sendEmail === 'function') {
+            r = await Promise.resolve(options.sendEmail(Object.assign({ sessionId: ctx.sid, flowId: ctx.flow.flowId, nodeId: node.id,
+                                                                        appUser: appUserOf(ctx) }, msg)));
+          } else problem = 'no email sender (give the node a connector, or pass options.sendEmail)';
+        } catch (e) { problem = (e && e.message) || String(e); }
+        if (!problem && r && r.ok === false) problem = r.message || 'the sender reported a failure';
+      }
+      dbg(ctx, { event: 'email', node: node.id, to: msg.to, cc: msg.cc.length ? msg.cc : undefined, subject: msg.subject,
+                 attachments: msg.attachments.length || undefined, sent: !problem, error: problem || undefined });
+      if (problem) {
+        say(ctx, 'error', interpolate(node.errorMessage || (r && r.message) || "Sorry, I couldn't send the email.", view(ctx)));
+        return node.onError || node.next;
+      }
+      if (node.message) say(ctx, 'text', interpolate(node.message, view(ctx)));
+      return node.next;
+    }
+
     // ---- set: initialise or copy values into slots
     function applySet(ctx, node) {
       (node.assign || []).forEach(function (a) {
@@ -822,7 +879,7 @@
         else if (n.type === 'menu') { var mc = menuChoice(ctx, n); if (!mc) break; id = mc.next; }
         else if (n.type === 'verify') id = n.verified;
         else if (n.type === 'bulkUpdate') id = n.done;
-        else if (n.type === 'message' || n.type === 'lookup' || n.type === 'set') id = n.next;
+        else if (n.type === 'message' || n.type === 'lookup' || n.type === 'set' || n.type === 'email') id = n.next;
         else break;
       }
       if (ctx.st.status === 'completed') done = total;
@@ -1306,6 +1363,11 @@
             if (nxt === AWAIT) return;
             if (nxt === null && st.status === 'failed') return;
             id = nxt;
+            break;
+          case 'email':
+            // Replaying an edit never sends the email again.
+            if (ctx.replay) { id = node.next; break; }
+            id = await runEmail(ctx, node);
             break;
           case 'lookup':
             if (ctx.replay) { id = node.next; break; }
