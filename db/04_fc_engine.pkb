@@ -34,6 +34,7 @@ create or replace package body fc_engine as
   g_dbg_sid varchar2(32);
 
   function field_def (p_change_node in json_object_t, p_field in varchar2) return json_object_t;   -- forward
+  function menu_spec (c in out nocopy t_ctx, p_node in json_object_t) return json_object_t;        -- forward
 
   ------------------------------------------------------------------------------
   -- scalar helpers
@@ -950,6 +951,7 @@ create or replace package body fc_engine as
     end if;
     l_nid := str(c.slot_nodes, p_name);
     if l_nid is null then return null; end if;
+    if str(get_node(c, l_nid), 'type') = 'menu' then return menu_spec(c, get_node(c, l_nid)); end if;
     return eff_spec(c, input_spec(get_node(c, l_nid)));
   end spec_for;
 
@@ -1134,6 +1136,70 @@ create or replace package body fc_engine as
     end loop;
     return str(p_node, 'else');
   end pick_branch;
+
+  ------------------------------------------------------------------------------
+  -- menu: static options shown as pills, each leading to its own next node
+  ------------------------------------------------------------------------------
+  -- The options offered now (an option with a "when" condition only while it holds).
+  function menu_options (c in out nocopy t_ctx, p_node in json_object_t) return json_array_t is
+    l_all json_array_t := arr(p_node, 'options');
+    l_out json_array_t := json_array_t();
+    l_o   json_object_t;
+    l_v   json_object_t := vals(c);
+  begin
+    for i in 0 .. l_all.get_size - 1 loop
+      if l_all.get(i).is_object then
+        l_o := treat(l_all.get(i) as json_object_t);
+        if str(l_o, 'value') is not null and (obj(l_o, 'when') is null or eval_cond(l_v, obj(l_o, 'when'))) then
+          l_out.append(l_o);
+        end if;
+      end if;
+    end loop;
+    return l_out;
+  end menu_options;
+
+  -- The input spec the widget shows: a choice drawn as pills.
+  function menu_spec (c in out nocopy t_ctx, p_node in json_object_t) return json_object_t is
+    l_opts json_array_t := menu_options(c, p_node);
+    l_out  json_array_t := json_array_t();
+    l_o    json_object_t;
+    l_e    json_object_t;
+    l_v    json_object_t := vals(c);
+    l_spec json_object_t := json_object_t();
+  begin
+    for i in 0 .. l_opts.get_size - 1 loop
+      l_o := treat(l_opts.get(i) as json_object_t);
+      l_e := json_object_t();
+      l_e.put('value', str(l_o, 'value'));
+      l_e.put('label', interpolate(nvl(str(l_o, 'label'), str(l_o, 'value')), l_v));
+      l_out.append(l_e);
+    end loop;
+    l_spec.put('kind', 'choice');
+    l_spec.put('display', 'buttons');
+    l_spec.put('options', l_out);
+    if str(p_node, 'invalidMessage') is not null then l_spec.put('parseMessage', str(p_node, 'invalidMessage')); end if;
+    return l_spec;
+  end menu_spec;
+
+  -- The option chosen last time (kept in the slot, or per node in state.menus when there's no slot).
+  function menu_choice (c in out nocopy t_ctx, p_node in json_object_t) return json_object_t is
+    l_val  varchar2(4000);
+    l_opts json_array_t;
+    l_o    json_object_t;
+  begin
+    if str(p_node, 'slot') is not null then
+      l_val := str(c.slots, str(p_node, 'slot'));
+    else
+      l_val := str(obj(c.state, 'menus'), str(p_node, 'id'));
+    end if;
+    if l_val is null then return null; end if;
+    l_opts := menu_options(c, p_node);
+    for i in 0 .. l_opts.get_size - 1 loop
+      l_o := treat(l_opts.get(i) as json_object_t);
+      if str(l_o, 'value') = l_val then return l_o; end if;
+    end loop;
+    return null;
+  end menu_choice;
 
   ------------------------------------------------------------------------------
   -- records (findRecord / changeFields / saveChanges)
@@ -1866,6 +1932,9 @@ create or replace package body fc_engine as
         l_id := str(l_n, 'next');
       elsif l_type = 'condition' then
         l_id := pick_branch(l_v, l_n);
+      elsif l_type = 'menu' then
+        exit when menu_choice(c, l_n) is null;
+        l_id := str(menu_choice(c, l_n), 'next');
       elsif l_type = 'verify' then
         l_id := str(l_n, 'verified');
       elsif l_type = 'bulkUpdate' then
@@ -1911,6 +1980,25 @@ create or replace package body fc_engine as
         when 'set' then
           apply_set(c, l_node);
           l_id := str(l_node, 'next');
+
+        when 'menu' then
+          -- Replaying an edit follows the earlier choice; otherwise the menu is always shown,
+          -- so a flow can come back to it (e.g. "Anything else?" looping to the main menu).
+          if c.replay and menu_choice(c, l_node) is not null and nvl(c.force_ask, '~') <> l_id then
+            l_id := str(menu_choice(c, l_node), 'next');
+          else
+            if c.replay then c.state.put('editing', true); end if;
+            c.replay := false;
+            c.force_ask := null;
+            c.state.put('current', l_id);
+            if str(l_node, 'prompt') is not null then
+              add_msg(c, 'text', interpolate(str(l_node, 'prompt'), vals(c)));
+            end if;
+            if menu_options(c, l_node).get_size = 0 then
+              add_msg(c, 'error', nvl(str(l_node, 'emptyMessage'), 'There''s nothing to choose from here right now.'));
+            end if;
+            return;
+          end if;
 
         when 'condition' then
           l_prev := l_id;
@@ -2108,6 +2196,14 @@ create or replace package body fc_engine as
         l_aw.put('input', turn_input(c, input_spec(l_node)));
         if str(c.slots, l_slot) is not null then l_aw.put('value', c.slots.get(l_slot)); else l_aw.put_null('value'); end if;
 
+      elsif l_type = 'menu' then
+        l_aw.put('type', 'ask');
+        l_aw.put('slot', nvl(str(l_node, 'slot'), '#menu'));
+        l_aw.put('label', coalesce(str(l_node, 'label'), str(l_node, 'slot'), 'Choice'));
+        l_aw.put('input', menu_spec(c, l_node));
+        l_aw.put_null('value');
+        l_aw.put('menu', true);
+
       elsif l_type = 'summary' then
         l_aw.put('type', 'summary');
         l_aw.put('confirmLabel', nvl(str(l_node, 'confirmLabel'), 'Confirm & submit'));
@@ -2297,7 +2393,8 @@ create or replace package body fc_engine as
       if l_type = 'repeat' and not c.repeat_slots.has(str(l_node, 'slot')) then
         c.repeat_slots.put(str(l_node, 'slot'), str(l_node, 'id'));
       end if;
-      if l_type in ('ask', 'repeat') and not c.slot_nodes.has(str(l_node, 'slot')) then
+      if (l_type in ('ask', 'repeat') or (l_type = 'menu' and str(l_node, 'slot') is not null))
+         and not c.slot_nodes.has(str(l_node, 'slot')) then
         c.slot_nodes.put(str(l_node, 'slot'), str(l_node, 'id'));
       elsif l_type = 'changeFields' and not c.change_nodes.has(str(l_node, 'record')) then
         c.change_nodes.put(str(l_node, 'record'), str(l_node, 'id'));
@@ -2952,6 +3049,36 @@ create or replace package body fc_engine as
   ------------------------------------------------------------------------------
   -- resume: the current question again, unchanged (after a page reload)
   ------------------------------------------------------------------------------
+  procedure handle_menu (c in out nocopy t_ctx, p_node in json_object_t, p_in in json_object_t) is
+    l_parsed json_object_t := parse_value(menu_spec(c, p_node), str(p_in, 'value'));
+    l_val    varchar2(4000) := str(l_parsed, 'value');
+    l_opt    json_object_t;
+    l_menus  json_object_t;
+  begin
+    if str(l_parsed, 'error') is not null or l_val is null then
+      add_msg(c, 'error', coalesce(str(l_parsed, 'error'), str(p_node, 'invalidMessage'), 'Please choose one of the options.'));
+      return;
+    end if;
+    if str(p_node, 'slot') is not null then
+      c.slots.put(str(p_node, 'slot'), l_val);
+      touch(c, str(p_node, 'slot'));
+    else
+      l_menus := copy(obj(c.state, 'menus'));
+      l_menus.put(str(p_node, 'id'), l_val);
+      c.state.put('menus', l_menus);
+    end if;
+    l_opt := menu_choice(c, p_node);
+    c.history.append(str(p_node, 'id'));
+    dbg_kv(c, 'branch', str(p_node, 'id'), 'choice', l_val, 'next', str(l_opt, 'next'));
+    if get_bool(c.state, 'editing') then
+      c.state.put('editing', false);
+      c.replay := true;
+      run(c, str(c.flow, 'start'));
+    else
+      run(c, str(l_opt, 'next'));
+    end if;
+  end handle_menu;
+
   procedure reprompt (c in out nocopy t_ctx) is
     l_cur  varchar2(200) := str(c.state, 'current');
     l_node json_object_t;
@@ -2971,6 +3098,8 @@ create or replace package body fc_engine as
     case str(l_node, 'type')
       when 'ask' then
         add_msg(c, 'text', interpolate(str(l_node, 'prompt'), l_v));
+      when 'menu' then
+        if str(l_node, 'prompt') is not null then add_msg(c, 'text', interpolate(str(l_node, 'prompt'), l_v)); end if;
       when 'summary' then
         add_summary(c, l_node);
       when 'verify' then
@@ -3127,6 +3256,7 @@ create or replace package body fc_engine as
       c.state.put_null('verifiedLast');
       c.state.put('repeat', json_object_t());
       c.state.put('bulk', json_object_t());
+      c.state.put('menus', json_object_t());
       fc_data.set_verified(null);
       seed_context(c);
       add_msg(c, 'text', 'Okay, let''s start over.');
@@ -3220,6 +3350,9 @@ create or replace package body fc_engine as
           run(c, str(l_node, 'next'));
         end if;
       end if;
+
+    elsif l_type = 'menu' then
+      handle_menu(c, l_node, l_in);
 
     elsif l_type = 'summary' then
       if lower(trim(str(l_in, 'value'))) in ('confirm', 'yes', 'y', 'ok', 'submit', 'save') then

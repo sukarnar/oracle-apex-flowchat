@@ -121,6 +121,9 @@
                  make: (id) => ({ id, type: 'ask', slot: 'field', label: 'New field', prompt: 'What is your …?', input: { kind: 'text' } }) },
     condition: { label: 'Condition', color: '#d97706', desc: 'Branch on captured answers.',
                  make: (id) => ({ id, type: 'condition', branches: [{ when: { slot: '', op: '=', value: '' } }] }) },
+    menu:      { label: 'Menu',      color: '#e11d48', desc: 'Offer fixed options as buttons (pills); each option leads to its own step.',
+                 make: (id) => ({ id, type: 'menu', prompt: 'What would you like to do?',
+                                  options: [{ value: 'option_1', label: 'Option 1' }, { value: 'option_2', label: 'Option 2' }] }) },
     lookup:    { label: 'Lookup',    color: '#0891b2', desc: 'Fetch data (e.g. a customer) and prefill fields.',
                  make: (id) => ({ id, type: 'lookup', connector: '' }) },
     summary:   { label: 'Summary',   color: '#7c3aed', desc: 'Show all answers with Edit buttons, then confirm.',
@@ -328,6 +331,8 @@
       case 'bulkUpdate': return [{ key: 'done', label: 'done' }, { key: 'none', label: 'none' },
         { key: 'tooMany', label: 'too many', optional: true }, { key: 'cancelled', label: 'cancelled', optional: true },
         { key: 'partial', label: 'partly failed', optional: true }];
+      case 'menu':
+        return (n.options || []).map((o, i) => ({ key: 'option:' + i, label: o.label || o.value || 'option ' + (i + 1) }));
       case 'condition':
         return (n.branches || []).map((b, i) => ({ key: 'branch:' + i, label: condText(b.when) || 'branch ' + (i + 1) }))
           .concat([{ key: 'else', label: 'else' }]);
@@ -336,9 +341,15 @@
   }
   function getPort(n, key) {
     if (key.indexOf('branch:') === 0) { const b = (n.branches || [])[+key.slice(7)]; return b && b.next; }
+    if (key.indexOf('option:') === 0) { const o = (n.options || [])[+key.slice(7)]; return o && o.next; }
     return n[key];
   }
   function setPort(n, key, target) {
+    if (key.indexOf('option:') === 0) {
+      const o = (n.options || [])[+key.slice(7)];
+      if (o) { if (target) o.next = target; else delete o.next; }
+      return;
+    }
     if (key.indexOf('branch:') === 0) {
       const b = (n.branches || [])[+key.slice(7)];
       if (b) { if (target) b.next = target; else delete b.next; }
@@ -373,6 +384,11 @@
   function contextNames() {
     return (S.flow.context || []).map((c) => (c && typeof c === 'object' ? c.name : c)).filter(Boolean).map(String);
   }
+  function menuSlots() {
+    const out = [];
+    S.flow.nodes.forEach((n) => { if (n.type === 'menu' && n.slot && out.indexOf(n.slot) < 0) out.push(n.slot); });
+    return out;
+  }
   function setSlots() {
     const out = [];
     S.flow.nodes.forEach((n) => { if (n.type === 'set') (n.assign || []).forEach((a) => { if (a.slot && out.indexOf(a.slot) < 0) out.push(a.slot); }); });
@@ -387,7 +403,7 @@
   }
   function knownSlots() {
     const s = askSlots();
-    setSlots().concat(contextNames()).forEach((k) => { if (s.indexOf(k) < 0) s.push(k); });
+    menuSlots().concat(setSlots(), contextNames()).forEach((k) => { if (s.indexOf(k) < 0) s.push(k); });
     contextNames().forEach((k) => { if (s.indexOf('context.' + k) < 0) s.push('context.' + k); });
     repeatNodes().forEach((n) => { [n.slot, n.slot + '.count'].forEach((k) => { if (s.indexOf(k) < 0) s.push(k); }); });
     Object.keys(S.flow.bindings || {}).forEach((k) => { if (s.indexOf(k) < 0) s.push(k); });
@@ -492,7 +508,7 @@
       if (c.not) fixCond(c.not);
     };
     f.nodes.forEach((n) => {
-      if (n.type === 'ask' && n.slot === oldSlot) n.slot = newSlot;
+      if ((n.type === 'ask' || n.type === 'menu') && n.slot === oldSlot) n.slot = newSlot;
       if (n.type === 'set') (n.assign || []).forEach((a) => {
         if (a.from === oldSlot) a.from = newSlot;
         if (typeof a.template === 'string') a.template = a.template.replace(re, '{{' + newSlot + '}}');
@@ -732,6 +748,28 @@
         else if (!t && !p.optional && n.type !== 'end') add('warning', '"' + p.label + '" is not connected; the conversation would stop here.', n.id);
       });
       switch (n.type) {
+        case 'menu': {
+          const opts = n.options || [];
+          if (!opts.length) add('error', 'Menu has no options.', n.id);
+          if (!n.prompt) add('warning', 'Menu has no question text; only the buttons are shown.', n.id);
+          else placeholders(n.prompt, n.id);
+          if (n.slot) {
+            if (n.slot === BUILTIN_USER) add('error', '"' + BUILTIN_USER + '" is set by the server and can\'t be changed.', n.id);
+            else if (!/^[a-z][a-z0-9_]{0,99}$/.test(n.slot)) add('error', 'Field name "' + n.slot + '" must be lowercase letters, digits and _.', n.id);
+          }
+          const seenVals = {};
+          opts.forEach((o, i) => {
+            const v = String(o.value === undefined || o.value === null ? '' : o.value).trim();
+            if (!v) add('error', 'Option ' + (i + 1) + ' has no value.', n.id);
+            else if (seenVals[v]) add('error', 'Two options have the value "' + v + '".', n.id);
+            seenVals[v] = true;
+            if (!o.label) add('warning', 'Option ' + (i + 1) + ' has no label, so its value "' + v + '" is shown.', n.id);
+            else placeholders(o.label, n.id);
+            if (o.when) checkCond(o.when, n.id);
+          });
+          if (opts.length && opts.every((o) => o.when)) add('warning', 'Every option has a condition; when none holds the menu shows no buttons.', n.id);
+          break;
+        }
         case 'ask': {
           const spec = n.input || {};
           if (!n.slot) add('error', 'Ask has no field (slot) name.', n.id);
@@ -1015,12 +1053,13 @@
   // ======================================================================== canvas
   let canvas, world, nodesEl, edgeLayer;
 
-  function nodeWidth(n) { return Math.max(NODE_W, ports(n).length * 96); }
+  function nodeWidth(n) { return Math.max(NODE_W, ports(n).length * (n.type === 'menu' ? 132 : 96)); }
 
   function nodeSummary(n) {
     switch (n.type) {
       case 'ask': return n.prompt;
       case 'condition': return (n.branches || []).length ? null : 'No branches yet';
+      case 'menu': return (n.options || []).length ? (n.prompt || '') : 'No options yet';
       case 'lookup': case 'submit': return n.connector ? 'Calls ' + n.connector : '';
       case 'verify': return n.slot ? 'Send a code to ' + n.slot + (n.connector ? ' via ' + n.connector : '') : '';
       case 'findRecord': return n.source ? (n.requireVerified ? '\uD83D\uDD12 ' : '') + 'Search ' + n.source + (n.as ? ' → ' + n.as : '') : '';
@@ -1392,9 +1431,9 @@
     );
     const editors = { message: textEditor, end: textEditor, ask: askEditor, condition: condEditor, lookup: connEditor, submit: connEditor,
                       summary: summaryEditor, verify: verifyEditor, findRecord: findEditor, changeFields: changeEditor, saveChanges: saveEditor,
-                      repeat: repeatEditor, bulkUpdate: bulkEditor, set: setEditor };
+                      repeat: repeatEditor, bulkUpdate: bulkEditor, set: setEditor, menu: menuEditor };
     body.append(editors[n.type](n));
-    if (n.type !== 'condition' && n.type !== 'end') {
+    if (n.type !== 'condition' && n.type !== 'menu' && n.type !== 'end') {
       body.append(h('h4', { class: 'sub', text: 'Connections' }));
       const bulkTitles = { done: 'After updating, go to', cancelled: 'If the user cancels, go to' };
       ports(n).forEach((p) => body.append(F(n.type === 'summary' ? 'After confirm, go to'
@@ -2063,6 +2102,63 @@
     return wrap;
   }
 
+  function menuEditor(n) {
+    const wrap = h('div');
+    const list = n.options = n.options || [];
+    const pr = bound(() => n.prompt, (v) => setOrDelete(n, 'prompt', v), { key: n.id + '.mp', placeholder: 'What would you like to do?', multiline: true });
+    wrap.append(F('Question', pr), slotChips(pr));
+    wrap.append(h('p', { class: 'hint', text: 'The options show as buttons (pills); the user can also type an option\'s label or number. ' +
+      'Each option goes to its own step. A menu shows again every time the flow reaches it, so later steps can loop back to it.' }));
+    const slots = knownSlots().filter((s) => s !== BUILTIN_USER).concat([BUILTIN_USER]);
+    list.forEach((o, i) => {
+      const kp = n.id + '.o' + i;
+      const card = h('div', { class: 'card' });
+      card.append(h('div', { class: 'card-h' },
+        h('span', { class: 'grow', text: 'Option ' + (i + 1) }),
+        h('button', { class: 'x', text: '↑', title: 'Move up', disabled: i === 0, onclick: () => mutate(() => { list.splice(i - 1, 0, list.splice(i, 1)[0]); }, { panel: true }) }),
+        h('button', { class: 'x', text: '×', title: 'Remove', onclick: () => mutate(() => list.splice(i, 1), { panel: true }) })));
+      card.append(h('div', { class: 'grid2' },
+        F('Button text', bound(() => o.label, (v) => setOrDelete(o, 'label', v), { key: kp + '.l', placeholder: 'Apply for leave' })),
+        F('Value', bound(() => (o.value === undefined ? '' : String(o.value)), (v) => { o.value = v.trim(); }, { key: kp + '.v', placeholder: 'leave' }),
+          'Stored in the field (if any) and used in conditions.')));
+      card.append(F('Then go to', targetSelect(n, 'option:' + i)));
+      const w = o.when && !o.when.all && !o.when.any && !o.when.not ? o.when : null;
+      if (o.when && !w) {
+        card.append(h('p', { class: 'hint', text: 'Shown only when: ' + condText(o.when) + ' (edit it in the JSON tab).' }));
+      } else {
+        const on = !!w;
+        card.append(checkbox('Show only when…', on, (c) => mutate(() => { if (c) o.when = { slot: '', op: '=', value: '' }; else delete o.when; }, { panel: true })));
+        if (on) {
+          const slotOpts = [['', 'field…']].concat(slots.map((x) => [x, x]));
+          if (w.slot && slots.indexOf(w.slot) < 0) slotOpts.push([w.slot, w.slot + ' (unknown)']);
+          const valIn = h('input', { class: 'in', placeholder: w.op === 'in' ? 'A, B, C' : 'value' });
+          valIn.value = Array.isArray(w.value) ? w.value.join(', ') : (w.value === undefined ? '' : w.value);
+          valIn.hidden = w.op === 'empty' || w.op === 'notEmpty';
+          valIn.addEventListener('change', () => mutate(() => {
+            w.value = w.op === 'in' ? valIn.value.split(',').map((x) => x.trim()).filter(Boolean) : valIn.value;
+          }));
+          card.append(h('div', { class: 'rowx' },
+            sel(slotOpts, w.slot || '', (v) => mutate(() => { w.slot = v; }), { mono: true }),
+            sel(OPS, w.op || '=', (v) => mutate(() => { w.op = v; if (v === 'empty' || v === 'notEmpty') delete w.value; }, { panel: true })),
+            valIn));
+        }
+      }
+      wrap.append(card);
+    });
+    wrap.append(h('button', { class: 'lnk', text: '+ Add option', onclick: () => mutate(() => {
+      let k = list.length + 1;
+      while (list.some((o) => String(o.value) === 'option_' + k)) k++;
+      list.push({ value: 'option_' + k, label: 'Option ' + k });
+    }, { panel: true }) }));
+    wrap.append(h('h4', { class: 'sub', text: 'Remember the choice (optional)' }));
+    const slotIn = h('input', { class: 'in mono', value: n.slot || '', placeholder: 'e.g. topic' });
+    slotIn.addEventListener('change', () => mutate(() => setOrDelete(n, 'slot', slotIn.value.trim() || null), { panel: true }));
+    wrap.append(h('div', { class: 'grid2' },
+      F('Field', slotIn, 'Saves the chosen value, e.g. for {{topic}}, conditions and the summary.'),
+      F('Label', bound(() => n.label, (v) => setOrDelete(n, 'label', v), { key: n.id + '.ml', placeholder: 'Topic' }))));
+    return wrap;
+  }
+
   function setEditor(n) {
     const wrap = h('div');
     const list = n.assign = n.assign || [];
@@ -2403,13 +2499,14 @@
       h('p', { class: 'hint', text: 'Is each field asked on every path to ' + cv.goal + '? (' + cv.paths + ' path' + (cv.paths === 1 ? '' : 's') + ' analysed)' }));
     const tbl = h('table', { class: 'cov' }, h('tr', null, h('th', { text: 'Field' }), h('th', { text: 'Asked in' }), h('th', { text: 'Coverage' }), h('th', { text: 'Bound to' })));
     const counts = repeatNodes().map((n) => n.slot + '.count');
-    const setBy = setSlots(), ctxNames = contextNames();
+    const setBy = setSlots(), ctxNames = contextNames(), menuBy = menuSlots();
     knownSlots().filter((s) => counts.indexOf(s) < 0).forEach((s) => {
       const askers = S.flow.nodes.filter((n) => (n.type === 'ask' || n.type === 'repeat') && n.slot === s).map((n) => n.id);
       const b = S.flow.bindings[s] || {};
       const c = cv.cov[s];
       const label = askers.length ? (c === 'always' ? 'every path' : c === 'sometimes' ? 'some paths' : 'unreachable')
         : /^context\./.test(s) ? 'page context'
+        : menuBy.indexOf(s) >= 0 ? 'menu choice'
         : setBy.indexOf(s) >= 0 ? 'Set values'
         : ctxNames.indexOf(s) >= 0 ? 'page context'
         : (s.indexOf('.') > 0 ? 'from record' : 'set by connector');

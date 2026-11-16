@@ -383,7 +383,7 @@
       var nodes = {}, slotNodes = {}, changeNodes = {}, findNodes = {}, repeatNodes = [];
       flow.nodes.forEach(function (n) {
         nodes[n.id] = n;
-        if ((n.type === 'ask' || n.type === 'repeat') && !slotNodes[n.slot]) slotNodes[n.slot] = n;
+        if ((n.type === 'ask' || n.type === 'repeat' || (n.type === 'menu' && n.slot)) && !slotNodes[n.slot]) slotNodes[n.slot] = n;
         if (n.type === 'repeat') repeatNodes.push(n);
         if (n.type === 'changeFields' && !changeNodes[n.record]) changeNodes[n.record] = n;
         if (n.type === 'findRecord' && !findNodes[n.as]) findNodes[n.as] = n;
@@ -587,6 +587,33 @@
       });
     }
 
+    // ---- menu: static options shown as pills, each leading to its own next node
+    function menuOptions(ctx, node) {
+      var v = view(ctx);
+      return (node.options || []).filter(function (o) { return o && isFilled(o.value) && (!o.when || evalCond(o.when, v)); });
+    }
+    function menuSpec(ctx, node) {
+      return { kind: 'choice', display: 'buttons',
+               options: menuOptions(ctx, node).map(function (o) { return { value: String(o.value), label: interpolate(o.label || String(o.value), view(ctx)) }; }) };
+    }
+    // The option chosen last time (kept in the slot, or per node when the menu has no slot).
+    function menuChoice(ctx, node) {
+      var v = node.slot ? ctx.st.slots[node.slot] : (ctx.st.menus || {})[node.id];
+      return isFilled(v) ? menuOptions(ctx, node).find(function (o) { return String(o.value) === String(v); }) || null : null;
+    }
+    async function handleMenu(ctx, node, payload) {
+      var st = ctx.st, spec = menuSpec(ctx, node);
+      var parsed = parseValue(Object.assign({}, spec, { parseMessage: node.invalidMessage }), payload.value);
+      if (parsed.error || !isFilled(parsed.value)) { say(ctx, 'error', parsed.error || node.invalidMessage || 'Please choose one of the options.'); return; }
+      var opt = menuOptions(ctx, node).find(function (o) { return String(o.value) === parsed.value; });
+      if (node.slot) { st.slots[node.slot] = parsed.value; touch(ctx, node.slot); }
+      else { st.menus = st.menus || {}; st.menus[node.id] = parsed.value; }
+      st.history.push(node.id);
+      dbg(ctx, { event: 'branch', node: node.id, choice: parsed.value, next: opt.next || null });
+      if (st.editing) { st.editing = false; ctx.replay = true; await run(ctx, ctx.flow.start); }
+      else await run(ctx, opt.next);
+    }
+
     // ---- set: initialise or copy values into slots
     function applySet(ctx, node) {
       (node.assign || []).forEach(function (a) {
@@ -644,6 +671,7 @@
         return f ? eff(ctx, f.input) : null;
       }
       var n = ctx.slotNodes[name];
+      if (n && n.type === 'menu') return menuSpec(ctx, n);
       return n && n.type === 'ask' ? eff(ctx, n.input) : null;
     }
     function displayValue(ctx, name) {
@@ -791,6 +819,7 @@
           id = n.next;
         }
         else if (n.type === 'condition') id = pickBranch(n, v);
+        else if (n.type === 'menu') { var mc = menuChoice(ctx, n); if (!mc) break; id = mc.next; }
         else if (n.type === 'verify') id = n.verified;
         else if (n.type === 'bulkUpdate') id = n.done;
         else if (n.type === 'message' || n.type === 'lookup' || n.type === 'set') id = n.next;
@@ -1118,6 +1147,7 @@
       if (!n) return;
       switch (n.type) {
         case 'ask': say(ctx, 'text', interpolate(n.prompt, v)); break;
+        case 'menu': if (n.prompt) say(ctx, 'text', interpolate(n.prompt, v)); break;
         case 'summary': ctx.out.push(summaryMessage(ctx, n)); break;
         case 'verify':
           say(ctx, 'text', interpolate((n.prompts || {}).resume || 'Please enter the code I sent to {{' + n.slot + '}}.', verifyValues(ctx, n)));
@@ -1242,6 +1272,18 @@
             applySet(ctx, node);
             id = node.next;
             break;
+          case 'menu': {
+            // Replaying an edit follows the earlier choice; otherwise the menu is always shown, so it can
+            // be returned to (e.g. "Anything else?" looping back to the main menu).
+            var chosen = menuChoice(ctx, node);
+            if (ctx.replay && chosen && ctx.forceAsk !== id) { id = chosen.next; break; }
+            if (ctx.replay) st.editing = true;
+            ctx.replay = false; ctx.forceAsk = null;
+            st.current = id;
+            if (node.prompt) say(ctx, 'text', interpolate(node.prompt, view(ctx)));
+            if (!menuOptions(ctx, node).length) say(ctx, 'error', node.emptyMessage || "There's nothing to choose from here right now.");
+            return;
+          }
           case 'condition':
             nxt = pickBranch(node, view(ctx));
             dbg(ctx, { event: 'branch', node: id, next: nxt || null });
@@ -1369,6 +1411,9 @@
                  input: turnInput(ctx, n.input),
                  value: isFilled(st.slots[n.slot]) ? st.slots[n.slot] : null };
           if (!aw.input.kind) aw.input.kind = 'text';
+        } else if (n.type === 'menu') {
+          aw = { type: 'ask', nodeId: n.id, slot: n.slot || '#menu', label: n.label || n.slot || 'Choice',
+                 input: menuSpec(ctx, n), value: null, menu: true };
         } else if (n.type === 'summary') {
           aw = { type: 'summary', nodeId: n.id, confirmLabel: n.confirmLabel || 'Confirm & submit' };
         } else if (n.type === 'verify') {
@@ -1479,7 +1524,7 @@
         Object.keys(view(ctx)).forEach(function (k) { touch(ctx, k); });
         await removeSessionFiles(ctx);
         st.slots = {}; st.history = []; st.editing = false; st.records = {}; st.results = {}; st.editingField = null;
-        st.verify = {}; st.verified = {}; st.verifiedLast = null; st.repeat = {}; st.bulk = {};
+        st.verify = {}; st.verified = {}; st.verifiedLast = null; st.repeat = {}; st.bulk = {}; st.menus = {};
         seedContext(ctx);
         say(ctx, 'text', "Okay, let's start over.");
         await run(ctx, ctx.flow.start);
@@ -1528,6 +1573,8 @@
           if (st.editing) { st.editing = false; ctx.replay = true; await run(ctx, ctx.flow.start); }
           else await run(ctx, node.next);
         }
+      } else if (node.type === 'menu') {
+        await handleMenu(ctx, node, payload);
       } else if (node.type === 'summary') {
         if (/^(confirm|yes|y|ok|submit|save)$/i.test(String(payload.value || '').trim())) await run(ctx, node.next);
         else say(ctx, 'text', 'Tap "' + (node.confirmLabel || 'Confirm & submit') + '", or use Edit next to any answer to change it.');

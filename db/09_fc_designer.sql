@@ -120,7 +120,7 @@ create or replace package body fc_designer as
     l_ports  constant sys.odcivarchar2list := sys.odcivarchar2list(
                'next', 'else', 'onNotFound', 'onSuccess', 'onError', 'found', 'notFound', 'tooMany', 'cancelled',
                'done', 'noChanges', 'saved', 'conflict', 'forbidden', 'error', 'verified', 'failed', 'none', 'partial');
-    l_types  constant varchar2(200) := ',message,ask,condition,lookup,summary,submit,end,verify,findRecord,changeFields,saveChanges,repeat,bulkUpdate,set,';
+    l_types  constant varchar2(200) := ',message,ask,condition,lookup,summary,submit,end,verify,findRecord,changeFields,saveChanges,repeat,bulkUpdate,set,menu,';
     procedure err (p in varchar2) is
     begin
       if length(l_errs) > 3500 then return; end if;
@@ -152,6 +152,12 @@ create or replace package body fc_designer as
         l_br := l_n.get_array('branches');
         for b in 0 .. l_br.get_size - 1 loop
           check_target(jstr(l_n, 'id') || '.branch' || (b + 1), jstr(treat(l_br.get(b) as json_object_t), 'next'));
+        end loop;
+      end if;
+      if jstr(l_n, 'type') = 'menu' and l_n.has('options') and l_n.get('options').is_array then
+        l_br := l_n.get_array('options');
+        for b in 0 .. l_br.get_size - 1 loop
+          check_target(jstr(l_n, 'id') || '.option' || (b + 1), jstr(treat(l_br.get(b) as json_object_t), 'next'));
         end loop;
       end if;
     end loop;

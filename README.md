@@ -46,6 +46,7 @@ tests/      engine.test.js           node tests/engine.test.js
             appuser.test.js          node tests/appuser.test.js (built-in {{app_user}})
             phase-e.test.js          node tests/phase-e.test.js (versions, debug, PII, resume, Repeat, Bulk update, files)
             set.test.js              node tests/set.test.js (Set values node, context variables)
+            menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
             apex-embed-test.html     designer inside a page-wide form, like APEX
             apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
             fake-apex-backend.js     emulates the FC_DESIGNER Ajax protocol in the browser (testing only)
@@ -285,6 +286,21 @@ reference is in `flows/flow.schema.json`, and `flows/loan_application.json` uses
   `from` copies a slot, `alias.field`, `context.<name>`, `<list>.count` or `app_user`. A Set node runs
   again when the flow is replayed after an Edit, so use `onlyIfEmpty` for defaults the user may change
   later. `app_user` can't be set.
+- **Menu node:** fixed options shown as buttons (pills), each leading to its own step, like a menu:
+  ```json
+  { "id": "main", "type": "menu", "prompt": "What can I help with?", "slot": "topic",
+    "options": [
+      { "value": "leave",   "label": "Apply for leave",  "next": "ask_days" },
+      { "value": "payslip", "label": "Payslip question", "next": "payslip_info" },
+      { "value": "admin",   "label": "Admin tools",      "next": "admin",
+        "when": { "slot": "context.role", "op": "=", "value": "ADMIN" } },
+      { "value": "bye",     "label": "Nothing, thanks",  "next": "end" } ] }
+  ```
+  The user taps a pill, or types an option's label or number. A menu is shown every time the flow
+  reaches it, so a later step can loop back (e.g. an "Anything else?" menu whose "Yes" goes to `main`).
+  `slot` is optional: it keeps the chosen value for `{{topic}}`, conditions and the summary. An option
+  with `when` is only offered while the condition holds. Back returns to the menu; an Edit replays
+  through the option chosen before.
 - **Signed-in user:** `{{app_user}}` is built in and works in any message, prompt or condition
   (`{"slot": "app_user", "op": "=", "value": "ADMIN"}`) with no field or binding. In APEX, FC_ENGINE
   fills it from the APEX session (`APP_USER`), so the browser can't change it. A slot or context value
@@ -585,9 +601,9 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 65 unit tests (`tests/engine.test.js`,
+- The JavaScript engine and widget are tested: 70 unit tests (`tests/engine.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
-  `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`), plus manual end-to-end runs of the demos.
+  `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`), plus manual end-to-end runs of the demos.
 - **The Phase E PL/SQL (`FC_ENGINE`, `01_tables.sql`, `upgrade_phase_e.sql`, `14_seed_expense_flow.sql`)
   has not been compiled yet.** It mirrors the JavaScript engine, which is tested. Expect possible small
   compile fixes when you run `upgrade_phase_e.sql`.

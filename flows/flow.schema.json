@@ -47,8 +47,27 @@
         { "$ref": "#/$defs/end" },
         { "$ref": "#/$defs/verify" },
         { "$ref": "#/$defs/findRecord" }, { "$ref": "#/$defs/changeFields" }, { "$ref": "#/$defs/saveChanges" },
-        { "$ref": "#/$defs/repeat" }, { "$ref": "#/$defs/bulkUpdate" }, { "$ref": "#/$defs/set" }
+        { "$ref": "#/$defs/repeat" }, { "$ref": "#/$defs/bulkUpdate" }, { "$ref": "#/$defs/set" }, { "$ref": "#/$defs/menu" }
       ]
+    },
+
+    "menu": {
+      "description": "Fixed options shown as buttons (pills); each option leads to its own next node. Shown every time the flow reaches it, so later steps can loop back.",
+      "properties": {
+        "type": { "const": "menu" },
+        "prompt": { "type": "string" },
+        "slot": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,99}$", "description": "Optional field that keeps the chosen value" },
+        "label": { "type": "string" },
+        "invalidMessage": { "type": "string" },
+        "emptyMessage": { "type": "string" },
+        "options": { "type": "array", "minItems": 1, "items": { "type": "object", "required": ["value", "next"],
+          "properties": {
+            "value": { "type": ["string", "number"] },
+            "label": { "type": "string", "description": "Button text; may use {{placeholders}}" },
+            "when": { "$ref": "#/$defs/condExpr", "description": "Show the option only while this holds" },
+            "next": { "$ref": "#/$defs/id" } } } }
+      },
+      "required": ["options"]
     },
 
     "set": {

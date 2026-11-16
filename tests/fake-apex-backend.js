@@ -96,7 +96,7 @@
 
   var PORTS = ['next', 'else', 'onNotFound', 'onSuccess', 'onError', 'found', 'notFound', 'tooMany', 'cancelled',
                'done', 'noChanges', 'saved', 'conflict', 'forbidden', 'error', 'verified', 'failed', 'none', 'partial'];
-  var TYPES = ['message', 'ask', 'condition', 'lookup', 'summary', 'submit', 'end', 'verify', 'findRecord', 'changeFields', 'saveChanges', 'repeat', 'bulkUpdate', 'set'];
+  var TYPES = ['message', 'ask', 'condition', 'lookup', 'summary', 'submit', 'end', 'verify', 'findRecord', 'changeFields', 'saveChanges', 'repeat', 'bulkUpdate', 'set', 'menu'];
   function validationErrors(def) {
     var errs = [], ids = {};
     if (!/^[a-z0-9_]{1,100}$/.test(def.flowId || '')) errs.push('flowId must be lowercase letters, digits and _');
@@ -111,6 +111,7 @@
     def.nodes.forEach(function (n) {
       PORTS.forEach(function (p) { if (n[p] && !ids[n[p]]) errs.push(n.id + '.' + p + ' points to missing node "' + n[p] + '"'); });
       (n.branches || []).forEach(function (b, i) { if (b.next && !ids[b.next]) errs.push(n.id + '.branch' + (i + 1) + ' points to missing node "' + b.next + '"'); });
+      if (n.type === 'menu') (n.options || []).forEach(function (o, i) { if (o.next && !ids[o.next]) errs.push(n.id + '.option' + (i + 1) + ' points to missing node "' + o.next + '"'); });
     });
     return errs.join('; ');
   }
