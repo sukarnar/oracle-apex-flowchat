@@ -1269,6 +1269,8 @@ create or replace package body fc_engine as
     l_ev      json_object_t;
     l_problem varchar2(4000);
     l_mail_id number;
+    l_file_id varchar2(32);
+    l_sid     varchar2(100)   := c.session_id;
   begin
     for i in 0 .. l_slots.get_size - 1 loop
       l_f := obj(c.slots, l_slots.get_string(i));
@@ -1326,10 +1328,11 @@ create or replace package body fc_engine as
                                       p_bcc       => joined(l_bcc),
                                       p_replyto   => l_reply);
           for i in 0 .. l_att.get_size - 1 loop
+            l_file_id := str(treat(l_att.get(i) as json_object_t), 'id');
             for r in (select content, filename, mime_type
                         from fc_files
-                       where file_id = str(treat(l_att.get(i) as json_object_t), 'id')
-                         and session_id = c.session_id) loop
+                       where file_id = l_file_id
+                         and session_id = l_sid) loop
               apex_mail.add_attachment(p_mail_id    => l_mail_id,
                                        p_attachment => r.content,
                                        p_filename   => r.filename,
