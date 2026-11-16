@@ -45,6 +45,7 @@ tests/      engine.test.js           node tests/engine.test.js
             mine.test.js             node tests/mine.test.js (Find record by row filter only)
             appuser.test.js          node tests/appuser.test.js (built-in {{app_user}})
             phase-e.test.js          node tests/phase-e.test.js (versions, debug, PII, resume, Repeat, Bulk update, files)
+            set.test.js              node tests/set.test.js (Set values node, context variables)
             apex-embed-test.html     designer inside a page-wide form, like APEX
             apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
             fake-apex-backend.js     emulates the FC_DESIGNER Ajax protocol in the browser (testing only)
@@ -265,8 +266,25 @@ reference is in `flows/flow.schema.json`, and `flows/loan_application.json` uses
   payload to a URL. The payload is `{sessionId, flowId, nodeId, slots, context, appUser}` (plus
   `slot` and `value` for validators and lookups). `appUser` is the signed-in user, set by the server
   from the APEX session, so a connector can trust it; `context` comes from the page and can't be trusted.
-- **Context:** values passed at start (the `context` attribute) whose names match a slot
-  pre-fill that slot.
+- **Context variables:** values the page passes at start (the `context` attribute,
+  `context="dept:P10_DEPT,emp_id:P10_EMP_ID"`). Every one is readable as `{{context.dept}}` in messages,
+  prompts, conditions (`{"slot": "context.dept", ...}`), search criteria and Set values. Declare them in
+  the designer's flow settings under **Context variables** (`"context": ["dept", "emp_id"]`): a declared
+  name also fills the field of the same name, so `{{dept}}` works and connectors get it in `slots`.
+  (A context value also fills an asked or bound field of the same name, as before.) Context comes from
+  the browser: show it and search with it, but never use it to decide what a user may see.
+- **Set values node:** initialises or copies values without asking anything, in order:
+  ```json
+  { "id": "init", "type": "set", "assign": [
+      { "slot": "status", "value": "NEW" },
+      { "slot": "priority", "value": "LOW", "onlyIfEmpty": true },
+      { "slot": "dept", "from": "context.dept" },
+      { "slot": "title", "template": "Request from {{app_user}} for {{dept}}" },
+      { "slot": "note", "clear": true } ], "next": "ask_amount" }
+  ```
+  `from` copies a slot, `alias.field`, `context.<name>`, `<list>.count` or `app_user`. A Set node runs
+  again when the flow is replayed after an Edit, so use `onlyIfEmpty` for defaults the user may change
+  later. `app_user` can't be set.
 - **Signed-in user:** `{{app_user}}` is built in and works in any message, prompt or condition
   (`{"slot": "app_user", "op": "=", "value": "ADMIN"}`) with no field or binding. In APEX, FC_ENGINE
   fills it from the APEX session (`APP_USER`), so the browser can't change it. A slot or context value
@@ -567,9 +585,9 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 60 unit tests (`tests/engine.test.js`,
+- The JavaScript engine and widget are tested: 64 unit tests (`tests/engine.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
-  `tests/appuser.test.js`, `tests/phase-e.test.js`), plus manual end-to-end runs of the demos.
+  `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`), plus manual end-to-end runs of the demos.
 - **The Phase E PL/SQL (`FC_ENGINE`, `01_tables.sql`, `upgrade_phase_e.sql`, `14_seed_expense_flow.sql`)
   has not been compiled yet.** It mirrors the JavaScript engine, which is tested. Expect possible small
   compile fixes when you run `upgrade_phase_e.sql`.

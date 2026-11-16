@@ -9,6 +9,9 @@
     "version":  { "type": "integer", "minimum": 1 },
     "name":     { "type": "string" },
     "start":    { "type": "string", "description": "Id of the first node" },
+    "context":  { "type": "array", "description": "Context variables the page passes in (<flow-chat context=\"dept:P10_DEPT\">). Each fills the slot of the same name; every context value is also readable as context.<name>.",
+                  "items": { "oneOf": [{ "type": "string", "pattern": "^[a-z][a-z0-9_]{0,99}$" },
+                                       { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" }, "label": { "type": "string" } } }] } },
     "debug":    { "type": "boolean", "default": false, "description": "Log every step, branch, connector call and search (FC_EVENTS rows with direction DBG; onDebug in the JS engine). PII values are masked." },
     "piiSlots": { "type": "array", "items": { "type": "string" }, "description": "Slots (e.g. set by a lookup or page context) whose values logs must redact. For asked questions use \"pii\" on the question." },
     "resumeText": { "type": "string", "description": "Shown when a conversation is picked up again after a page reload (input {\"command\": \"resume\"})." },
@@ -44,8 +47,25 @@
         { "$ref": "#/$defs/end" },
         { "$ref": "#/$defs/verify" },
         { "$ref": "#/$defs/findRecord" }, { "$ref": "#/$defs/changeFields" }, { "$ref": "#/$defs/saveChanges" },
-        { "$ref": "#/$defs/repeat" }, { "$ref": "#/$defs/bulkUpdate" }
+        { "$ref": "#/$defs/repeat" }, { "$ref": "#/$defs/bulkUpdate" }, { "$ref": "#/$defs/set" }
       ]
+    },
+
+    "set": {
+      "description": "Initialise or copy values into slots, in order, without asking anything. Runs again when the flow is replayed after an Edit.",
+      "properties": {
+        "type": { "const": "set" },
+        "assign": { "type": "array", "items": { "type": "object", "required": ["slot"],
+          "properties": {
+            "slot": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,99}$" },
+            "value": { "description": "A fixed value (text, number or boolean)" },
+            "template": { "type": "string", "description": "Text with {{placeholders}}" },
+            "from": { "type": "string", "description": "Copy of a slot, alias.field, context.<name>, <list>.count or app_user" },
+            "clear": { "type": "boolean" },
+            "onlyIfEmpty": { "type": "boolean", "default": false, "description": "Keep a value that is already there" } } } },
+        "next": { "$ref": "#/$defs/id" }
+      },
+      "required": ["assign", "next"]
     },
 
     "pii": { "description": "Mask this value in FC_EVENTS and debug logs: true = [redacted], \"last4\" = only the last 4 characters", "enum": [true, false, "last4"] },

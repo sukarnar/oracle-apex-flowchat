@@ -245,6 +245,11 @@
     return out;
   }
 
+  // Names in a flow's "context" list: ["dept", {"name": "emp_id", "label": "..."}] -> ["dept", "emp_id"]
+  function contextNames(flow) {
+    return (flow.context || []).map(function (c) { return c && typeof c === 'object' ? c.name : c; }).filter(Boolean).map(String);
+  }
+
   // ---------------------------------------------------------------- conditions
   function asNumber(v) {
     if (typeof v === 'number') return v;
@@ -560,6 +565,9 @@
       (ctx.repeatNodes || []).forEach(function (n) {
         v[n.slot + '.count'] = Array.isArray(ctx.st.slots[n.slot]) ? ctx.st.slots[n.slot].length : 0;
       });
+      // Every value the page passed in (the widget's context attribute) as "context.<name>".
+      var cin = ctx.st.context || {};
+      Object.keys(cin).forEach(function (k) { v['context.' + k] = cin[k]; });
       v.app_user = appUserOf(ctx);
       return v;
     }
@@ -569,10 +577,28 @@
       return isFilled(u) ? String(u) : null;
     }
 
+    // Context values prefill the slot of the same name when it is asked, bound, or declared in the
+    // flow's "context" list. (All of them are also readable as {{context.<name>}}.)
     function seedContext(ctx) {
-      var ctxIn = ctx.st.context || {};
+      var ctxIn = ctx.st.context || {}, declared = contextNames(ctx.flow);
       Object.keys(ctxIn).forEach(function (k) {
-        if (isFilled(ctxIn[k]) && (ctx.slotNodes[k] || (ctx.flow.bindings || {})[k])) ctx.st.slots[k] = ctxIn[k];
+        if (k === 'app_user') return;
+        if (isFilled(ctxIn[k]) && (ctx.slotNodes[k] || (ctx.flow.bindings || {})[k] || declared.indexOf(k) >= 0)) ctx.st.slots[k] = ctxIn[k];
+      });
+    }
+
+    // ---- set: initialise or copy values into slots
+    function applySet(ctx, node) {
+      (node.assign || []).forEach(function (a) {
+        if (!a || !a.slot || a.slot === 'app_user') return;
+        if (a.onlyIfEmpty && isFilled(ctx.st.slots[a.slot])) return;
+        var vals = view(ctx), v;
+        if (a.clear) v = null;
+        else if ('from' in a) v = vals[a.from];
+        else if ('template' in a) v = interpolate(a.template, vals);
+        else v = a.value;
+        if (isFilled(v)) ctx.st.slots[a.slot] = clone(v); else delete ctx.st.slots[a.slot];
+        touch(ctx, a.slot);
       });
     }
 
@@ -767,7 +793,7 @@
         else if (n.type === 'condition') id = pickBranch(n, v);
         else if (n.type === 'verify') id = n.verified;
         else if (n.type === 'bulkUpdate') id = n.done;
-        else if (n.type === 'message' || n.type === 'lookup') id = n.next;
+        else if (n.type === 'message' || n.type === 'lookup' || n.type === 'set') id = n.next;
         else break;
       }
       if (ctx.st.status === 'completed') done = total;
@@ -1210,6 +1236,10 @@
         switch (node.type) {
           case 'message':
             if (!ctx.replay) say(ctx, 'text', interpolate(node.text, view(ctx)));
+            id = node.next;
+            break;
+          case 'set':
+            applySet(ctx, node);
             id = node.next;
             break;
           case 'condition':

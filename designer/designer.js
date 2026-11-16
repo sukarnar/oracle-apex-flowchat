@@ -115,6 +115,8 @@
   const TYPES = {
     message:   { label: 'Message',   color: '#64748b', desc: 'The assistant says something.',
                  make: (id) => ({ id, type: 'message', text: 'New message' }) },
+    set:       { label: 'Set values', color: '#4f46e5', desc: 'Initialise or copy values into fields: defaults, values from page context, text built from answers.',
+                 make: (id) => ({ id, type: 'set', assign: [{ slot: '', value: '', onlyIfEmpty: true }] }) },
     ask:       { label: 'Ask',       color: '#2563eb', desc: 'Ask a question and capture one form field.',
                  make: (id) => ({ id, type: 'ask', slot: 'field', label: 'New field', prompt: 'What is your …?', input: { kind: 'text' } }) },
     condition: { label: 'Condition', color: '#d97706', desc: 'Branch on captured answers.',
@@ -312,7 +314,7 @@
 
   function ports(n) {
     switch (n.type) {
-      case 'message': case 'ask': return [{ key: 'next', label: 'next' }];
+      case 'message': case 'ask': case 'set': return [{ key: 'next', label: 'next' }];
       case 'summary': return [{ key: 'next', label: 'confirm' }];
       case 'lookup': return [{ key: 'next', label: 'next' }, { key: 'onNotFound', label: 'not found', optional: true }];
       case 'submit': return [{ key: 'onSuccess', label: 'success' }, { key: 'onError', label: 'error', optional: true }];
@@ -367,8 +369,19 @@
     return out;
   }
   function repeatNodes() { return S.flow.nodes.filter((n) => n.type === 'repeat' && n.slot); }
+  // Names declared in the flow's "context" list (values the page passes to the widget).
+  function contextNames() {
+    return (S.flow.context || []).map((c) => (c && typeof c === 'object' ? c.name : c)).filter(Boolean).map(String);
+  }
+  function setSlots() {
+    const out = [];
+    S.flow.nodes.forEach((n) => { if (n.type === 'set') (n.assign || []).forEach((a) => { if (a.slot && out.indexOf(a.slot) < 0) out.push(a.slot); }); });
+    return out;
+  }
   function knownSlots() {
     const s = askSlots();
+    setSlots().concat(contextNames()).forEach((k) => { if (s.indexOf(k) < 0) s.push(k); });
+    contextNames().forEach((k) => { if (s.indexOf('context.' + k) < 0) s.push('context.' + k); });
     repeatNodes().forEach((n) => { [n.slot, n.slot + '.count'].forEach((k) => { if (s.indexOf(k) < 0) s.push(k); }); });
     Object.keys(S.flow.bindings || {}).forEach((k) => { if (s.indexOf(k) < 0) s.push(k); });
     recordFields().forEach((k) => { if (s.indexOf(k) < 0) s.push(k); });
@@ -473,6 +486,10 @@
     };
     f.nodes.forEach((n) => {
       if (n.type === 'ask' && n.slot === oldSlot) n.slot = newSlot;
+      if (n.type === 'set') (n.assign || []).forEach((a) => {
+        if (a.from === oldSlot) a.from = newSlot;
+        if (typeof a.template === 'string') a.template = a.template.replace(re, '{{' + newSlot + '}}');
+      });
       ['text', 'prompt'].forEach((k) => { if (typeof n[k] === 'string') n[k] = n[k].replace(re, '{{' + newSlot + '}}'); });
       (n.branches || []).forEach((b) => fixCond(b.when));
       if (n.type === 'summary' && n.fields) n.fields = n.fields.map((s) => (s === oldSlot ? newSlot : s));
@@ -782,6 +799,23 @@
         case 'lookup': case 'submit':
           if (!n.connector) add('error', TYPES[n.type].label + ' has no connector.', n.id);
           break;
+        case 'set': {
+          if (!(n.assign || []).length) add('warning', 'Set values sets nothing.', n.id);
+          (n.assign || []).forEach((a) => {
+            if (!a.slot) { add('error', 'A value has no field name.', n.id); return; }
+            if (a.slot === BUILTIN_USER) add('error', '"' + BUILTIN_USER + '" is set by the server and can\'t be changed.', n.id);
+            else if (!/^[a-z][a-z0-9_]{0,99}$/.test(a.slot)) add('error', 'Field name "' + a.slot + '" must be lowercase letters, digits and _.', n.id);
+            if ('from' in a) {
+              if (!a.from) add('error', 'Copy into "' + a.slot + '" has no source.', n.id);
+              else if (slots.indexOf(a.from) < 0 && a.from !== BUILTIN_USER && aliases().indexOf(String(a.from).split('.')[0]) < 0) {
+                add('warning', '"' + a.slot + '" copies "' + a.from + '", which the flow never sets' +
+                  (/^context\./.test(a.from) ? ' (declare it under Context variables in flow settings).' : '.'), n.id);
+              }
+            }
+            if ('template' in a) placeholders(a.template, n.id);
+          });
+          break;
+        }
         case 'condition':
           if (!(n.branches || []).length) add('warning', 'Condition has no branches.', n.id);
           (n.branches || []).forEach((b) => checkCond(b.when, n.id));
@@ -835,6 +869,7 @@
           if (!n.source) add('error', 'Find record has no data source.', n.id);
           else if (!src) add('warning', 'Data source "' + n.source + '" is not in the designer catalog, so its fields can\'t be checked. Add it in the Data tab.', n.id);
           if (!/^[a-z][a-z0-9_]{0,49}$/.test(n.as || '')) add('error', 'Record alias must use lowercase letters, digits and _.', n.id);
+          else if (n.as === 'context') add('error', 'The alias "context" is reserved for page context values.', n.id);
           else if (findNodes().filter((x) => x.as === n.as).length > 1) add('error', 'Another Find record already uses the alias "' + n.as + '".', n.id);
           if (!crit.length && !n.byRowFilter) add('error', 'Find record has no search criteria. Add one, or choose "The signed-in user\'s records".', n.id);
           crit.forEach((c) => {
@@ -981,6 +1016,8 @@
       case 'findRecord': return n.source ? (n.requireVerified ? '\uD83D\uDD12 ' : '') + 'Search ' + n.source + (n.as ? ' → ' + n.as : '') : '';
       case 'changeFields': return n.record ? 'Edit ' + (n.fields || []).length + ' field(s) of ' + n.record : '';
       case 'saveChanges': return n.record ? 'Save changes to ' + n.record : '';
+      case 'set': return (n.assign || []).filter((a) => a.slot).map((a) => a.slot + (a.clear ? ' := (empty)' : 'from' in a ? ' := ' + (a.from || '?')
+        : 'template' in a ? ' := "' + a.template + '"' : ' := ' + JSON.stringify(a.value))).join('; ') || 'Nothing set yet';
       case 'repeat': return n.slot ? 'List of ' + (n.itemLabel || 'item') + 's → ' + n.slot + ' (' + (isFilled(n.min) ? n.min : 1) + '–' + (n.max || 20) + ')' : '';
       case 'bulkUpdate': return n.source ? 'Update ' + Object.keys(n.set || {}).join(', ') + ' in ' + n.source + ' (max ' + (n.maxRows || 50) + ')' : '';
       case 'summary': return n.mode === 'changes' ? 'Review changes to ' + (n.record || '?') : n.text;
@@ -1345,7 +1382,7 @@
     );
     const editors = { message: textEditor, end: textEditor, ask: askEditor, condition: condEditor, lookup: connEditor, submit: connEditor,
                       summary: summaryEditor, verify: verifyEditor, findRecord: findEditor, changeFields: changeEditor, saveChanges: saveEditor,
-                      repeat: repeatEditor, bulkUpdate: bulkEditor };
+                      repeat: repeatEditor, bulkUpdate: bulkEditor, set: setEditor };
     body.append(editors[n.type](n));
     if (n.type !== 'condition' && n.type !== 'end') {
       body.append(h('h4', { class: 'sub', text: 'Connections' }));
@@ -2014,6 +2051,50 @@
     return wrap;
   }
 
+  function setEditor(n) {
+    const wrap = h('div');
+    const list = n.assign = n.assign || [];
+    wrap.append(h('p', { class: 'hint', text: 'Runs in order without asking anything, so a value can use the ones above it. ' +
+      'Runs again when the flow is replayed after an Edit: tick "Only if empty" for defaults the user may change later.' }));
+    const sources = knownSlots().filter((x) => x !== BUILTIN_USER).concat([BUILTIN_USER]);
+    list.forEach((a, i) => {
+      const kp = n.id + '.a' + i;
+      const mode = a.clear ? 'clear' : 'from' in a ? 'from' : 'template' in a ? 'template' : 'value';
+      const card = h('div', { class: 'card' });
+      const slotIn = h('input', { class: 'in mono', value: a.slot || '', placeholder: 'field_name' });
+      slotIn.addEventListener('change', () => mutate(() => { a.slot = slotIn.value.trim(); }, { panel: true }));
+      card.append(h('div', { class: 'card-h' },
+        h('span', { class: 'grow', text: 'Value ' + (i + 1) }),
+        h('button', { class: 'x', text: '↑', title: 'Move up', disabled: i === 0, onclick: () => mutate(() => { list.splice(i - 1, 0, list.splice(i, 1)[0]); }, { panel: true }) }),
+        h('button', { class: 'x', text: '×', title: 'Remove', onclick: () => mutate(() => list.splice(i, 1), { panel: true }) })));
+      card.append(h('div', { class: 'grid2' },
+        F('Field', slotIn),
+        F('Set it to', sel([['value', 'A fixed value'], ['template', 'Text with placeholders'], ['from', 'A copy of another value'], ['clear', 'Empty (clear it)']],
+          mode, (v) => mutate(() => {
+            delete a.value; delete a.template; delete a.from; delete a.clear;
+            if (v === 'value') a.value = ''; else if (v === 'template') a.template = ''; else if (v === 'from') a.from = ''; else a.clear = true;
+          }, { panel: true })))));
+      if (mode === 'value') {
+        card.append(F('Value', bound(() => (typeof a.value === 'string' ? a.value : JSON.stringify(a.value)), (v) => {
+          const t = v.trim();
+          a.value = /^-?\d+(\.\d+)?$/.test(t) ? Number(t) : t === 'true' ? true : t === 'false' ? false : v;
+        }, { key: kp + '.v', placeholder: 'NEW' }), 'Numbers and true/false are stored as such; anything else as text.'));
+      } else if (mode === 'template') {
+        const ta = bound(() => a.template, (v) => { a.template = v; }, { key: kp + '.t', placeholder: 'Request from {{app_user}} for {{context.dept}}' });
+        card.append(F('Text', ta), slotChips(ta));
+      } else if (mode === 'from') {
+        const opts = [['', '— choose a value —']].concat(sources.map((x) => [x, x]));
+        if (a.from && sources.indexOf(a.from) < 0) opts.push([a.from, a.from + ' (not set by this flow)']);
+        card.append(F('Copy of', sel(opts, a.from || '', (v) => mutate(() => { a.from = v; }, { panel: true }), { mono: true }),
+          'An answer, a record field (alias.field), a context value (context.name) or app_user.'));
+      }
+      if (mode !== 'clear') card.append(checkbox('Only if empty (keep a value that is already there)', a.onlyIfEmpty, (c) => mutate(() => setOrDelete(a, 'onlyIfEmpty', c || null))));
+      wrap.append(card);
+    });
+    wrap.append(h('button', { class: 'lnk', text: '+ Add value', onclick: () => mutate(() => { list.push({ slot: '', value: '', onlyIfEmpty: true }); }, { panel: true }) }));
+    return wrap;
+  }
+
   function repeatEditor(n) {
     const wrap = h('div');
     const slotIn = h('input', { class: 'in mono', value: n.slot || '' });
@@ -2226,6 +2307,32 @@
       h('div', { class: 'grid2' }, F('Flow id', idIn), F('Version', h('input', { class: 'in', value: f.version || 1, disabled: true }), 'Set when published')),
       F('Name', bound(() => f.name, (v) => setOrDelete(f, 'name', v), { key: 'flow.name' })),
       F('Start node', sel([['', '—']].concat(f.nodes.map((n) => [n.id, n.id + '  (' + TYPES[n.type].label + ')'])), f.start, (v) => mutate(() => { f.start = v; }), { mono: true })));
+
+    wrap.append(h('h4', { class: 'sub', text: 'Context variables' }),
+      h('p', { class: 'hint' }, 'Values the page passes in, e.g. ', h('code', { text: '<flow-chat context="dept:P10_DEPT,emp_id:P10_EMP_ID">' }),
+        '. Each one fills the field of the same name and can be used as ', h('code', { text: '{{dept}}' }), ' or ', h('code', { text: '{{context.dept}}' }),
+        ' in messages, conditions, searches and Set values. They come from the browser, so never use them to decide what a user may see.'));
+    const ctxTbl = h('table', { class: 'cov' }, h('tr', null, h('th', { text: 'Name' }), h('th', { text: 'Test value' }), h('th')));
+    contextNames().forEach((name, i) => {
+      const k = 'ctx:' + name;
+      const tv = h('input', { class: 'in', value: S.mocks[k] !== undefined ? S.mocks[k] : '', placeholder: '(Test tab only)' });
+      tv.addEventListener('change', () => { if (tv.value === '') delete S.mocks[k]; else S.mocks[k] = tv.value; save(); S.testStale = true; updateTestNote(); });
+      ctxTbl.append(h('tr', null, h('td', { class: 'mono', text: name }), h('td', null, tv),
+        h('td', null, h('button', { class: 'x', text: '×', title: 'Remove', onclick: () => mutate(() => {
+          f.context.splice(i, 1); if (!f.context.length) delete f.context;
+        }, { panel: true }) }))));
+    });
+    const newCtx = h('input', { class: 'in mono', placeholder: 'new_name' });
+    const addCtx = () => {
+      const v = newCtx.value.trim();
+      if (!/^[a-z][a-z0-9_]{0,99}$/.test(v)) { toast('Names: lowercase letters, digits and _, starting with a letter.'); return; }
+      if (v === BUILTIN_USER) { toast('"' + BUILTIN_USER + '" is set by the server.'); return; }
+      if (contextNames().indexOf(v) >= 0) { toast('"' + v + '" is already declared.'); return; }
+      mutate(() => { f.context = (f.context || []).concat([v]); }, { panel: true });
+    };
+    newCtx.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addCtx(); } });
+    ctxTbl.append(h('tr', null, h('td', null, newCtx), h('td', null, h('button', { class: 'lnk', text: '+ Add', onclick: addCtx })), h('td')));
+    wrap.append(ctxTbl);
 
     wrap.append(h('h4', { class: 'sub', text: 'Logging' }),
       checkbox('Debug logging: write every step, branch, connector call and search to FC_EVENTS (direction DBG)', f.debug,
@@ -2507,7 +2614,9 @@
       onDebug: flow.debug ? (e) => { testDebug.push(e); } : null });
     const chat = $('simChat');
     chat.setAttribute('flow', flow.flowId || 'draft');
-    chat.configure({ transport: new FlowChat.LocalTransport(testEngine), adapter: new FlowChat.NoneAdapter() });
+    const testContext = {};
+    contextNames().forEach((name) => { if (S.mocks['ctx:' + name] !== undefined) testContext[name] = S.mocks['ctx:' + name]; });
+    chat.configure({ transport: new FlowChat.LocalTransport(testEngine), adapter: new FlowChat.NoneAdapter(), context: testContext });
     chat.start();
     S.testStale = false;
     updateTestNote();

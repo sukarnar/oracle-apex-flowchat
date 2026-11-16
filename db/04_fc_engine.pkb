@@ -198,6 +198,8 @@ create or replace package body fc_engine as
     l_cur   json_object_t;
     l_flds  json_key_list;
     l_rep   json_key_list;
+    l_ctx   json_object_t := obj(c.state, 'context');
+    l_ck    json_key_list;
   begin
     if l_alias is not null then
       for i in 1 .. l_alias.count loop
@@ -218,6 +220,15 @@ create or replace package body fc_engine as
       if l_rep is not null then
         for i in 1 .. l_rep.count loop
           l_v.put(l_rep(i) || '.count', arr(c.slots, l_rep(i)).get_size);
+        end loop;
+      end if;
+    end if;
+    -- Every value the page passed in (the widget's context attribute) as "context.<name>".
+    if l_ctx is not null then
+      l_ck := l_ctx.get_keys;
+      if l_ck is not null then
+        for i in 1 .. l_ck.count loop
+          l_v.put('context.' || l_ck(i), l_ctx.get(l_ck(i)));
         end loop;
       end if;
     end if;
@@ -311,6 +322,51 @@ create or replace package body fc_engine as
       touch(c, l_keys(i));
     end loop;
   end merge_slots;
+
+  -- Set node: initialise or copy values into slots, in order (a later one sees the earlier ones).
+  --   {"slot": "s", "value": ...} | {"slot": "s", "template": "Hi {{name}}"} | {"slot": "s", "from": "context.dept"}
+  --   | {"slot": "s", "clear": true}; "onlyIfEmpty": true keeps a value that is already there.
+  procedure apply_set (c in out nocopy t_ctx, p_node in json_object_t) is
+    l_list json_array_t := arr(p_node, 'assign');
+    l_a    json_object_t;
+    l_slot varchar2(200);
+    l_v    json_object_t;
+    l_from varchar2(300);
+    l_txt  varchar2(32767);
+  begin
+    for i in 0 .. l_list.get_size - 1 loop
+      if l_list.get(i).is_object then
+        l_a    := treat(l_list.get(i) as json_object_t);
+        l_slot := str(l_a, 'slot');
+        if l_slot is not null and l_slot <> 'app_user'
+           and not (get_bool(l_a, 'onlyIfEmpty') and str(c.slots, l_slot) is not null) then
+          l_v := vals(c);
+          if get_bool(l_a, 'clear') then
+            if c.slots.has(l_slot) then c.slots.remove(l_slot); end if;
+          elsif l_a.has('from') then
+            l_from := str(l_a, 'from');
+            if str(l_v, l_from) is not null then
+              c.slots.put(l_slot, l_v.get(l_from));
+            elsif c.slots.has(l_slot) then
+              c.slots.remove(l_slot);
+            end if;
+          elsif l_a.has('template') then
+            l_txt := interpolate(str(l_a, 'template'), l_v);
+            if l_txt is not null then
+              c.slots.put(l_slot, l_txt);
+            elsif c.slots.has(l_slot) then
+              c.slots.remove(l_slot);
+            end if;
+          elsif str(l_a, 'value') is not null then
+            c.slots.put(l_slot, l_a.get('value'));
+          elsif c.slots.has(l_slot) then
+            c.slots.remove(l_slot);
+          end if;
+          touch(c, l_slot);
+        end if;
+      end if;
+    end loop;
+  end apply_set;
 
   function failed (c in out nocopy t_ctx) return varchar2 is
   begin
@@ -1814,7 +1870,7 @@ create or replace package body fc_engine as
         l_id := str(l_n, 'verified');
       elsif l_type = 'bulkUpdate' then
         l_id := str(l_n, 'done');
-      elsif l_type in ('message', 'lookup') then
+      elsif l_type in ('message', 'lookup', 'set') then
         l_id := str(l_n, 'next');
       else
         exit;
@@ -1850,6 +1906,10 @@ create or replace package body fc_engine as
       case l_type
         when 'message' then
           if not c.replay then add_msg(c, 'text', interpolate(str(l_node, 'text'), vals(c))); end if;
+          l_id := str(l_node, 'next');
+
+        when 'set' then
+          apply_set(c, l_node);
           l_id := str(l_node, 'next');
 
         when 'condition' then
@@ -2245,18 +2305,29 @@ create or replace package body fc_engine as
     end loop;
   end load_flow;
 
-  -- Context values whose key is a known slot (asked or bound) prefill that slot.
+  -- Context values whose key is a known slot (asked, bound, or declared in the flow's "context"
+  -- list) prefill that slot. All of them are also readable as {{context.<name>}}.
   procedure seed_context (c in out nocopy t_ctx) is
     l_ctx  json_object_t := obj(c.state, 'context');
     l_bind json_object_t := obj(c.flow, 'bindings');
+    l_decl json_array_t  := arr(c.flow, 'context');
+    l_names varchar2(32767) := ',';
     l_keys json_key_list;
   begin
     if l_ctx is null then return; end if;
+    for i in 0 .. l_decl.get_size - 1 loop
+      if l_decl.get(i).is_object then
+        l_names := l_names || str(treat(l_decl.get(i) as json_object_t), 'name') || ',';
+      else
+        l_names := l_names || el_str(l_decl.get(i)) || ',';
+      end if;
+    end loop;
     l_keys := l_ctx.get_keys;
     if l_keys is null then return; end if;
     for i in 1 .. l_keys.count loop
-      if str(l_ctx, l_keys(i)) is not null
-         and (c.slot_nodes.has(l_keys(i)) or (l_bind is not null and l_bind.has(l_keys(i)))) then
+      if str(l_ctx, l_keys(i)) is not null and l_keys(i) <> 'app_user'
+         and (c.slot_nodes.has(l_keys(i)) or (l_bind is not null and l_bind.has(l_keys(i)))
+              or instr(l_names, ',' || l_keys(i) || ',') > 0) then
         c.slots.put(l_keys(i), l_ctx.get(l_keys(i)));
       end if;
     end loop;
