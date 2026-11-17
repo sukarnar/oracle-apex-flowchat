@@ -1,0 +1,109 @@
+{
+  "flowId": "leave_agent_demo",
+  "name": "Leave assistant (agent demo)",
+  "debug": true,
+  "start": "menu",
+  "nodes": [
+    {
+      "id": "menu",
+      "type": "menu",
+      "prompt": "Hi {{app_user}}! What would you like to do?",
+      "options": [
+        { "value": "apply", "label": "Apply for leave", "next": "agent_apply" },
+        { "value": "book", "label": "Let the assistant book it", "next": "agent_book" },
+        { "value": "status", "label": "My leave and requests", "next": "agent_status" }
+      ],
+      "ui": { "x": 0, "y": 0 }
+    },
+    {
+      "id": "agent_apply",
+      "type": "agent",
+      "provider": "corp_llm",
+      "intro": "Let me help you with your leave application.",
+      "goal": "Help {{app_user}} prepare a leave request. First check their balance with get_leave_balance and read the leave_policy skill. Then collect the leave type, the first day, the number of working days and a short reason, asking one question at a time. Check the request against the policy and the balance, explain any problem, and call finish when everything is valid. Do not book anything yourself: the user submits the request afterwards.",
+      "tools": ["get_leave_balance"],
+      "skills": ["leave_policy"],
+      "outputs": [
+        { "name": "leave_type", "label": "Leave type", "kind": "choice", "options": ["annual", "sick", "unpaid"] },
+        { "name": "start_date", "label": "First day", "kind": "date", "description": "First day of leave" },
+        { "name": "days", "label": "Working days", "kind": "number", "min": 0.5, "max": 30 },
+        { "name": "reason", "label": "Reason", "kind": "text", "required": false, "description": "Short reason; required for unpaid leave" }
+      ],
+      "exits": [
+        { "name": "main_menu", "description": "the user wants to do something else", "next": "menu" }
+      ],
+      "limits": { "maxSteps": 15, "maxQuestions": 8, "maxCallsPerTurn": 4 },
+      "errorMessage": "Sorry, the assistant couldn't finish this.",
+      "next": "review",
+      "onError": "fallback",
+      "ui": { "x": -320, "y": 200 }
+    },
+    {
+      "id": "review",
+      "type": "summary",
+      "text": "Here's your leave request. Please check it:",
+      "confirmLabel": "Submit request",
+      "next": "submit",
+      "ui": { "x": -320, "y": 400 }
+    },
+    {
+      "id": "submit",
+      "type": "submit",
+      "connector": "leave_submit",
+      "onSuccess": "done_submit",
+      "onError": "review",
+      "ui": { "x": -320, "y": 580 }
+    },
+    {
+      "id": "done_submit",
+      "type": "end",
+      "text": "Request {{reference}} is submitted. Your manager will review it.",
+      "ui": { "x": -320, "y": 760 }
+    },
+    {
+      "id": "agent_book",
+      "type": "agent",
+      "provider": "corp_llm",
+      "goal": "Book leave for {{app_user}}. Check the balance with get_leave_balance and read the leave_policy skill. Ask for anything missing (leave type, first day, working days, and a reason for unpaid leave). When the request is valid, call book_leave; the user is asked to confirm it. When book_leave succeeds, call finish with its reference. If the user cancels, ask whether to change something or stop.",
+      "tools": ["get_leave_balance", "book_leave"],
+      "skills": ["leave_policy"],
+      "outputs": [
+        { "name": "reference", "label": "Reference", "kind": "text", "description": "The reference book_leave returned" }
+      ],
+      "exits": [
+        { "name": "main_menu", "description": "the user wants to stop or do something else", "next": "menu" }
+      ],
+      "limits": { "maxSteps": 15, "maxQuestions": 8 },
+      "next": "done_book",
+      "onError": "fallback",
+      "ui": { "x": 0, "y": 200 }
+    },
+    {
+      "id": "done_book",
+      "type": "end",
+      "text": "Booked. Your reference is {{reference}}.",
+      "ui": { "x": 0, "y": 400 }
+    },
+    {
+      "id": "agent_status",
+      "type": "agent",
+      "provider": "corp_llm",
+      "goal": "Answer {{app_user}}'s questions about their leave. Use get_leave_balance and list_my_leave, keep answers short, and ask if there is anything else. When they are done, call finish. If they want to apply for leave, hand off to apply.",
+      "tools": ["get_leave_balance", "list_my_leave"],
+      "outputs": [],
+      "exits": [
+        { "name": "apply", "description": "the user wants to apply for leave", "next": "agent_apply" }
+      ],
+      "limits": { "maxSteps": 12, "maxQuestions": 6 },
+      "next": "menu",
+      "onError": "fallback",
+      "ui": { "x": 320, "y": 200 }
+    },
+    {
+      "id": "fallback",
+      "type": "end",
+      "text": "Please use the leave form, or contact HR.",
+      "ui": { "x": 320, "y": 400 }
+    }
+  ]
+}

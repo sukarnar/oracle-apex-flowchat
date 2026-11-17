@@ -35,6 +35,7 @@ db/         install.sql              first-time install: runs 01..07, 09..12 in 
             13_seed_loan_flow.sql    generated: publishes loan_application with the country and branch lists
             14_seed_expense_flow.sql FC_DEMO_EXPENSES.submit_claim connector + publishes expense_claim
             15_ai_tables.sql         FC_AI_PROVIDERS, FC_AI_TOOLS, FC_AI_SKILLS (Agent node registries)
+            16_seed_agent_demo.sql   Agent demo: FC_DEMO_LEAVE tables and connectors, 3 tools, a skill, flow leave_agent_demo
 demo/       index.html               create demo (runs in the browser using the JS engine)
             update.html              search and update demo, with a live table and a conflict button
             verify.html              public-page demo: one-time code first, with an in-page outbox
@@ -750,6 +751,9 @@ model calls `load_skill` for the full text.
 - **JavaScript engine:** pass `aiProviders`, `aiTools` and `aiSkills` to `createEngine`.
   `FlowChatEngine.openAIProvider({baseUrl, model, apiKey, fetchOptions})` builds a provider for
   Node.js; pass a certificate through `fetchOptions` (an undici Agent with `ca`, `cert` and `key`).
+
+**Try it:** `@16_seed_agent_demo.sql` sets up a leave assistant (flow `leave_agent_demo`, also under
+Samples in the designer). It uses a provider registered as `corp_llm`.
 
 **Install:**
 - On an existing install, run `@upgrade_phase_f.sql`. It creates the three tables and recompiles

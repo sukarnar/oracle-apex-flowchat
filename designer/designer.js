@@ -26,6 +26,7 @@
     (ROOT.dataset.sampleUrl ? ROOT.dataset.sampleUrl.replace(/[^/]*$/, '') : '../flows/');
   const SAMPLES = [
     { file: 'loan_application.json', label: 'Loan application', desc: 'Create: ask, branch, summary, submit' },
+    { file: 'leave_agent_demo.json', label: 'Leave assistant (agent)', desc: 'Agent: gather then submit, book with a write tool, answer questions' },
     { file: 'update_application.json', label: 'Update application', desc: 'Search & update: find, change, save' },
     { file: 'update_application_public.json', label: 'Update (public page)', desc: 'Verify a one-time code, then find and update' }
   ];
