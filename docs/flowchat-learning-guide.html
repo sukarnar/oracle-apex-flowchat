@@ -1,0 +1,871 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>FlowChat for Little Learners</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;700;800&family=Nunito:wght@400;600;700&family=JetBrains+Mono:wght@500&display=swap">
+<style>
+/* Layout: a storybook that scrolls; each chapter is a page, the playground is a three-part table (map, chat, form). */
+:root {
+  --paper: #f2f6fb;
+  --sheet: #ffffff;
+  --ink: #1d2740;
+  --soft: #5b6782;
+  --line: #d6dfeb;
+  --accent: #4f46e5;
+  --good: #15803d;
+  --bad: #c2410c;
+  --hl: #fff3b0;
+  /* the designer's own node colors */
+  --n-message: #64748b; --n-ask: #2563eb; --n-condition: #d97706; --n-menu: #e11d48;
+  --n-lookup: #0891b2; --n-summary: #7c3aed; --n-submit: #16a34a; --n-end: #475569;
+  --n-agent: #0f766e; --n-email: #ea580c; --n-rest: #4f46e5; --n-repeat: #0284c7;
+  --n-verify: #9333ea; --n-find: #0d9488; --n-change: #db2777; --n-save: #059669; --n-set: #0f766e;
+  --display: "Baloo 2", "Trebuchet MS", system-ui, sans-serif;
+  --body: "Nunito", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+  --r: 18px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #121827; --sheet: #1b2335; --ink: #e8edf7; --soft: #a3aec6; --line: #2c3750;
+    --accent: #8b85ff; --good: #4ade80; --bad: #fb923c; --hl: #4a3f12;
+    --n-message: #94a3b8; --n-ask: #60a5fa; --n-condition: #fbbf24; --n-menu: #fb7185;
+    --n-lookup: #22d3ee; --n-summary: #a78bfa; --n-submit: #4ade80; --n-end: #94a3b8;
+    --n-agent: #2dd4bf; --n-email: #fb923c; --n-rest: #8b85ff; --n-repeat: #38bdf8;
+    --n-verify: #c084fc; --n-find: #2dd4bf; --n-change: #f472b6; --n-save: #34d399; --n-set: #2dd4bf;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #121827; --sheet: #1b2335; --ink: #e8edf7; --soft: #a3aec6; --line: #2c3750;
+  --accent: #8b85ff; --good: #4ade80; --bad: #fb923c; --hl: #4a3f12;
+  --n-message: #94a3b8; --n-ask: #60a5fa; --n-condition: #fbbf24; --n-menu: #fb7185;
+  --n-lookup: #22d3ee; --n-summary: #a78bfa; --n-submit: #4ade80; --n-end: #94a3b8;
+  --n-agent: #2dd4bf; --n-email: #fb923c; --n-rest: #8b85ff; --n-repeat: #38bdf8;
+  --n-verify: #c084fc; --n-find: #2dd4bf; --n-change: #f472b6; --n-save: #34d399; --n-set: #2dd4bf;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink); font-family: var(--body); font-size: 17px; line-height: 1.6;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 64px;
+}
+.wrap { max-width: 1080px; margin: 0 auto; }
+h1, h2, h3 { font-family: var(--display); line-height: 1.15; text-wrap: balance; margin: 0; }
+h1 { font-size: clamp(2.3rem, 6vw, 3.8rem); font-weight: 800; }
+h2 { font-size: clamp(1.7rem, 4vw, 2.3rem); font-weight: 800; }
+h3 { font-size: 1.25rem; font-weight: 700; }
+p { margin: 0; max-width: 65ch; }
+.lead { font-size: 1.2rem; color: var(--soft); }
+.kicker { font-family: var(--display); font-weight: 700; letter-spacing: .06em; text-transform: uppercase; font-size: .85rem; color: var(--accent); }
+section { padding-block: 56px 8px; display: grid; gap: 18px; }
+.grown { display: inline-flex; gap: 6px; align-items: center; font-family: var(--mono); font-size: .78rem; color: var(--soft);
+         border: 1px dashed var(--line); border-radius: 999px; padding: 2px 10px; white-space: nowrap; }
+.grown b { font-weight: 500; color: var(--ink); }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+/* hero */
+.hero { display: grid; grid-template-columns: 1.15fr 1fr; gap: 32px; align-items: center; padding-block: 40px 8px; }
+.hero .text { display: grid; gap: 16px; min-width: 0; }
+.scene { background: var(--sheet); border: 2px solid var(--line); border-radius: 24px; padding: 18px; display: grid; gap: 10px; min-width: 0; }
+.bub { max-width: 85%; padding: 9px 14px; border-radius: 16px; font-size: .98rem; }
+.bub.bot { background: color-mix(in srgb, var(--n-ask) 14%, var(--sheet)); border-bottom-left-radius: 4px; }
+.bub.me { justify-self: end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+.paperform { border-top: 2px dashed var(--line); padding-top: 10px; display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; font-size: .9rem; }
+.paperform span:nth-child(odd) { color: var(--soft); }
+.paperform span:nth-child(even) { border-bottom: 2px solid var(--line); font-weight: 700; }
+.paperform .fresh { background: var(--hl); border-radius: 4px; }
+
+/* big idea */
+.compare { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.panel { background: var(--sheet); border: 2px solid var(--line); border-radius: var(--r); padding: 20px; display: grid; gap: 10px; align-content: start; min-width: 0; }
+.panel h3 { display: flex; gap: 10px; align-items: center; }
+.boxes { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.boxes i { height: 22px; border: 2px solid var(--line); border-radius: 4px; }
+.onebyone { display: grid; gap: 8px; }
+
+/* playground */
+.play { display: grid; grid-template-columns: 210px minmax(0, 1fr) 230px; gap: 16px; align-items: start; }
+.card { background: var(--sheet); border: 2px solid var(--line); border-radius: var(--r); padding: 16px; min-width: 0; }
+.card h3 { font-size: 1rem; margin-bottom: 10px; color: var(--soft); text-transform: uppercase; letter-spacing: .06em; }
+.map { list-style: none; margin: 0; padding: 0; display: grid; gap: 0; }
+.map li { display: grid; grid-template-columns: 22px 1fr; gap: 10px; align-items: start; position: relative; padding-bottom: 12px; }
+.map li:not(:last-child)::after { content: ""; position: absolute; left: 10px; top: 22px; bottom: 0; width: 2px; background: var(--line); }
+.stone { width: 22px; height: 22px; border-radius: 50%; border: 3px solid var(--c); background: var(--sheet); display: grid; place-items: center;
+         font-size: 12px; font-weight: 800; color: #fff; transition: transform .2s; }
+.map li.done .stone { background: var(--c); }
+.map li.now .stone { background: var(--c); transform: scale(1.25); box-shadow: 0 0 0 6px color-mix(in srgb, var(--c) 25%, transparent); }
+.map .lbl { font-size: .88rem; line-height: 1.25; }
+.map .lbl small { display: block; color: var(--soft); font-family: var(--mono); font-size: .7rem; }
+.map li.now .lbl { font-weight: 800; }
+.map li.skip .lbl { opacity: .45; text-decoration: line-through; }
+.chat { display: grid; gap: 10px; align-content: start; min-height: 360px; }
+.log { display: grid; gap: 8px; align-content: start; max-height: 380px; overflow-y: auto; padding-right: 4px; }
+.answer { display: flex; flex-wrap: wrap; gap: 8px; border-top: 2px dashed var(--line); padding-top: 10px; }
+.answer input { flex: 1 1 140px; min-width: 0; font: inherit; padding: 8px 12px; border-radius: 12px; border: 2px solid var(--line); background: var(--paper); color: var(--ink); }
+button { font: inherit; font-weight: 700; cursor: pointer; border-radius: 999px; padding: 8px 16px; border: 2px solid var(--accent); background: var(--accent); color: #fff; }
+button.ghost { background: transparent; color: var(--accent); }
+button:disabled { opacity: .5; cursor: default; }
+.bub.err { background: color-mix(in srgb, var(--bad) 15%, var(--sheet)); color: var(--bad); font-weight: 700; }
+.bub.ok { background: color-mix(in srgb, var(--good) 15%, var(--sheet)); color: var(--good); font-weight: 700; }
+.bub.sum { background: color-mix(in srgb, var(--n-summary) 12%, var(--sheet)); }
+.bub.sum ul { margin: 6px 0 0; padding-left: 18px; }
+.form { display: grid; gap: 10px; }
+.form label { display: grid; gap: 2px; font-size: .85rem; color: var(--soft); }
+.form output { min-height: 36px; border: 2px solid var(--line); border-radius: 10px; padding: 5px 10px; color: var(--ink); font-weight: 700; background: var(--paper); transition: background .4s; }
+.form output.pop { background: var(--hl); }
+.why { background: color-mix(in srgb, var(--accent) 9%, var(--sheet)); border: 2px solid color-mix(in srgb, var(--accent) 30%, var(--line)); border-radius: var(--r); padding: 14px 18px; display: grid; gap: 4px; }
+.why b { font-family: var(--display); font-size: 1.1rem; }
+
+/* stones gallery */
+.groups { display: grid; gap: 26px; }
+.group h3 { margin-bottom: 10px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.tile { background: var(--sheet); border: 2px solid var(--line); border-radius: var(--r); padding: 14px 16px; display: grid; gap: 6px; align-content: start; min-width: 0; }
+.tile .name { display: flex; gap: 8px; align-items: center; font-family: var(--display); font-weight: 800; font-size: 1.1rem; }
+.tile .name i { width: 14px; height: 14px; border-radius: 50%; background: var(--c); flex: none; }
+.tile p { font-size: .95rem; }
+.tile .grown { justify-self: start; }
+
+/* team */
+.team { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; align-items: stretch; }
+.who { background: var(--sheet); border: 2px solid var(--line); border-radius: var(--r); padding: 14px; display: grid; gap: 6px; align-content: start; position: relative; }
+.who .pic { font-family: var(--display); font-size: 2rem; line-height: 1; color: var(--accent); }
+.who p { font-size: .92rem; }
+.team .who:not(:last-child)::after { content: "→"; position: absolute; right: -11px; top: 18px; font-weight: 800; color: var(--soft); background: var(--paper); line-height: 1; }
+
+/* safety */
+.rules { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.rule { background: var(--sheet); border: 2px solid var(--line); border-left: 8px solid var(--c); border-radius: var(--r); padding: 16px 18px; display: grid; gap: 6px; }
+.token { font-family: var(--mono); background: color-mix(in srgb, var(--n-verify) 15%, var(--sheet)); border-radius: 6px; padding: 0 6px; }
+
+/* quiz */
+.quiz { display: grid; gap: 14px; }
+.q { background: var(--sheet); border: 2px solid var(--line); border-radius: var(--r); padding: 16px 18px; display: grid; gap: 10px; }
+.q .opts { display: flex; flex-wrap: wrap; gap: 8px; }
+.q .opts button { background: transparent; color: var(--ink); border-color: var(--line); font-weight: 600; }
+.q .opts button.right { border-color: var(--good); background: color-mix(in srgb, var(--good) 15%, var(--sheet)); }
+.q .opts button.wrong { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, var(--sheet)); }
+.q .fb { font-weight: 700; min-height: 1.6em; }
+.score { font-family: var(--display); font-size: 1.3rem; }
+
+/* glossary */
+.tbl { overflow-x: auto; background: var(--sheet); border: 2px solid var(--line); border-radius: var(--r); }
+table { border-collapse: collapse; width: 100%; min-width: 560px; font-size: .95rem; }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-family: var(--display); font-size: 1rem; }
+td:first-child { font-weight: 700; }
+td code { font-family: var(--mono); font-size: .82rem; }
+tr:last-child td { border-bottom: 0; }
+
+/* every stone up close */
+.how { background: var(--sheet); border: 2px solid var(--line); border-radius: var(--r); padding: 18px 20px; display: grid; gap: 8px; }
+.how ol { margin: 0; padding-left: 22px; display: grid; gap: 4px; }
+.index { display: flex; flex-wrap: wrap; gap: 8px; }
+.index a { display: inline-flex; gap: 6px; align-items: center; text-decoration: none; color: var(--ink); font-weight: 700; font-size: .9rem;
+           border: 2px solid var(--line); background: var(--sheet); border-radius: 999px; padding: 4px 12px; }
+.index a i { width: 10px; height: 10px; border-radius: 50%; background: var(--c); }
+.index a:hover { border-color: var(--c); }
+.nodes { display: grid; gap: 22px; }
+.node { background: var(--sheet); border: 2px solid var(--line); border-top: 8px solid var(--c); border-radius: var(--r); padding: 20px; display: grid; gap: 14px; scroll-margin-top: 16px; }
+.node header { display: grid; gap: 4px; }
+.node header h3 { font-size: 1.6rem; display: flex; flex-wrap: wrap; gap: 10px; align-items: baseline; }
+.node header .grown { font-size: .75rem; }
+.node .kid { font-size: 1.08rem; }
+.node .cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; }
+.node .col { display: grid; gap: 12px; align-content: start; min-width: 0; }
+.node h4 { margin: 0; font-family: var(--display); font-size: 1rem; text-transform: uppercase; letter-spacing: .06em; color: var(--soft); }
+.node ul { margin: 0; padding-left: 20px; display: grid; gap: 3px; }
+.fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; font-size: .92rem; }
+.fields code { font-family: var(--mono); font-size: .8rem; color: var(--c); font-weight: 500; }
+.mini { display: grid; gap: 6px; background: var(--paper); border-radius: 14px; padding: 12px; }
+.mini .bub { font-size: .9rem; padding: 6px 12px; }
+.mini .note { font-size: .8rem; color: var(--soft); font-style: italic; justify-self: center; text-align: center; }
+pre.code { margin: 0; background: var(--paper); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; overflow-x: auto;
+           font-family: var(--mono); font-size: .78rem; line-height: 1.5; color: var(--ink); }
+pre.code .k { color: var(--c); }
+.ports { display: flex; flex-wrap: wrap; gap: 6px; }
+.ports span { font-family: var(--mono); font-size: .75rem; border: 2px solid var(--c); border-radius: 999px; padding: 1px 9px; }
+.tip { border-left: 4px solid var(--c); padding: 4px 0 4px 12px; font-size: .95rem; }
+.tip b { font-family: var(--display); }
+.recipes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.recipe { background: var(--sheet); border: 2px solid var(--line); border-radius: var(--r); padding: 16px; display: grid; gap: 10px; align-content: start; }
+.chain { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; font-size: .82rem; font-weight: 700; }
+.chain span { border-radius: 999px; padding: 2px 9px; color: #fff; background: var(--c); }
+.chain em { color: var(--soft); font-style: normal; }
+
+@media (max-width: 900px) {
+  .recipes { grid-template-columns: 1fr; }
+  .play { grid-template-columns: 1fr 1fr; }
+  .play .chatcard { grid-column: 1 / -1; order: -1; }
+  .team { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .team .who::after { display: none; }
+}
+@media (max-width: 640px) {
+  .hero, .compare, .rules, .play, .node .cols { grid-template-columns: 1fr; }
+  .team { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+<header class="hero">
+  <div class="text">
+    <span class="kicker">A learning guide for FlowChat</span>
+    <h1>A friendly helper that fills in forms by chatting</h1>
+    <p class="lead">Forms are big sheets full of empty boxes. FlowChat is a helper who asks you one question at a time, listens, and writes each answer into the right box for you.</p>
+    <p>This guide explains it the way you would explain it to a five-year-old. Each idea also shows its <span class="grown"><b>grown-up word</b></span> so you can find it in the real tool.</p>
+  </div>
+  <div class="scene" aria-label="A small example of FlowChat">
+    <div class="bub bot">Hi! What's your name?</div>
+    <div class="bub me">Mia</div>
+    <div class="bub bot">How many scoops would you like, Mia?</div>
+    <div class="bub me">2</div>
+    <div class="paperform"><span>Name</span><span class="fresh">Mia</span><span>Scoops</span><span class="fresh">2</span><span>Sprinkles</span><span>&nbsp;</span></div>
+  </div>
+</header>
+
+<section aria-labelledby="idea">
+  <span class="kicker">Chapter 1</span>
+  <h2 id="idea">The big idea</h2>
+  <div class="compare">
+    <div class="panel">
+      <h3>The old way: one big scary sheet</h3>
+      <div class="boxes" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+      <p>You see every box at once. You don't know where to start, and some boxes don't even apply to you.</p>
+    </div>
+    <div class="panel">
+      <h3>The FlowChat way: a chat, one box at a time</h3>
+      <div class="onebyone"><div class="bub bot">Do you want a cone or a cup?</div><div class="bub me">Cone</div></div>
+      <p>The helper only asks what matters for <em>you</em>. If you pick a cup, it never asks about sprinkles on a cone.</p>
+    </div>
+  </div>
+  <p>The helper and the form are side by side on the same page. Every time you answer, the matching box on the form fills itself in. <span class="grown"><b>binding</b> an answer to a page item</span></p>
+</section>
+
+<section aria-labelledby="map">
+  <span class="kicker">Chapter 2</span>
+  <h2 id="map">The helper follows a map</h2>
+  <p>The helper doesn't make things up. Someone draws a map first: a path of stepping stones. At each stone the helper does one small job, then hops to the next stone the map points to. <span class="grown"><b>flow</b> made of <b>nodes</b></span></p>
+  <p>Every answer gets a name tag, like <em>name</em> or <em>scoops</em>, so the helper can remember it and put it in the right box later. <span class="grown"><b>slot</b></span></p>
+  <p>Try it. Walk through this little ice cream map. Watch the stone that lights up, and watch the order slip on the right fill itself in.</p>
+
+  <div class="play">
+    <div class="card"><h3>The map</h3><ol class="map" id="stones"></ol></div>
+    <div class="card chatcard">
+      <h3>The chat</h3>
+      <div class="chat">
+        <div class="log" id="log" aria-live="polite"></div>
+        <div class="answer" id="answer"></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>The order slip</h3>
+      <div class="form">
+        <label>Name <output id="f-name"></output></label>
+        <label>Cone or cup <output id="f-holder"></output></label>
+        <label>Sprinkles <output id="f-sprinkles"></output></label>
+        <label>Scoops <output id="f-scoops"></output></label>
+      </div>
+    </div>
+  </div>
+  <div class="why" id="why" aria-live="polite"><b>What just happened?</b><span>Press Start to begin.</span></div>
+</section>
+
+<section aria-labelledby="stones-h">
+  <span class="kicker">Chapter 3</span>
+  <h2 id="stones-h">All the kinds of stepping stones</h2>
+  <p>Each kind of stone has its own color in the drawing tool, so you can tell them apart at a glance. Here they are, sorted into families.</p>
+  <div class="groups" id="groups"></div>
+</section>
+
+<section aria-labelledby="close-h">
+  <span class="kicker">Chapter 4</span>
+  <h2 id="close-h">Every stone, up close</h2>
+  <p>Now let's open each stone and look inside. For every stone you'll see when to use it, the settings it has, a tiny chat to show what the person sees, and the real recipe the drawing board saves for you.</p>
+  <div class="how">
+    <h3>Adding any stone takes the same five steps</h3>
+    <ol>
+      <li>In the drawing board, click the stone in the list on the left. It appears on the map.</li>
+      <li>With the stone selected, fill in its settings in the <b>Properties</b> tab on the right.</li>
+      <li>Draw its arrows: drag from a little dot at the bottom of the stone to the next stone, or pick the next stone under <b>Connections</b>.</li>
+      <li>Open the <b>Test</b> tab and chat with your map. Nothing real is sent or saved there; pretend answers stand in for databases, emails and websites.</li>
+      <li>Press <b>Save draft</b> while you work, and <b>Publish</b> when it's ready. Each publish gets a new version number. (Without the database, use <b>Export JSON</b> to save the map as a file.)</li>
+    </ol>
+    <p>You never have to type the recipes below by hand. The drawing board writes them. They're here so you can see what each setting means.</p>
+  </div>
+  <nav class="index" id="node-index" aria-label="Jump to a stone"></nav>
+  <div class="nodes" id="nodes"></div>
+
+  <h3 style="margin-top:12px">Putting stones together</h3>
+  <p>Stones are like Lego: a few simple ones make most maps. Here are three you'll build again and again.</p>
+  <div class="recipes" id="recipes"></div>
+</section>
+
+<section aria-labelledby="team-h">
+  <span class="kicker">Chapter 5</span>
+  <h2 id="team-h">The team that makes it work</h2>
+  <p>FlowChat is not one thing. It is a small team, and each member has one job.</p>
+  <div class="team">
+    <div class="who"><div class="pic">✎</div><h3>The drawing board</h3><p>Where a grown-up draws the map with boxes and arrows, then tests it with pretend answers.</p><span class="grown"><b>designer</b></span></div>
+    <div class="who"><div class="pic">⌘</div><h3>The map</h3><p>The finished drawing, saved as a list of stones and arrows. It can have version numbers, like "map 1" and "map 2".</p><span class="grown"><b>flow JSON</b></span></div>
+    <div class="who"><div class="pic">⚙</div><h3>The brain</h3><p>Reads the map, checks every answer, and decides what to say next. There are twin brains that follow the same rules: one lives in the database, one in the web page.</p><span class="grown"><b>engine</b>: PL/SQL and JS</span></div>
+    <div class="who"><div class="pic">☺</div><h3>The chat window</h3><p>The little window with bubbles and buttons that you see and type into.</p><span class="grown"><b>widget</b></span></div>
+    <div class="who"><div class="pic">▦</div><h3>Snap-on bricks</h3><p>Ready-made pieces that snap the drawing board and the chat window into an Oracle APEX app, like building blocks.</p><span class="grown"><b>region plugins</b></span></div>
+  </div>
+  <p>The chat window never decides anything by itself. It only shows what the brain says and sends back what you typed. That way nobody can cheat by poking at the web page.</p>
+</section>
+
+<section aria-labelledby="safe-h">
+  <span class="kicker">Chapter 6</span>
+  <h2 id="safe-h">How the helper keeps you safe</h2>
+  <div class="rules">
+    <div class="rule" style="--c: var(--n-ask)"><h3>It checks every answer</h3><p>If the map says "1 to 3 scoops" and you type 7, the helper kindly says no and asks again. The brain checks, not the chat window, so nobody can sneak past. <span class="grown"><b>validation</b></span></p></div>
+    <div class="rule" style="--c: var(--n-verify)"><h3>Secrets stay secret</h3><p>Private things, like a phone number, are hidden in the notebook where the helper writes down what happened. The robot helper only ever sees a sticker like <span class="token">[PII_1]</span> instead of the real secret. <span class="grown"><b>PII masking</b> and <b>placeholders</b></span></p></div>
+    <div class="rule" style="--c: var(--n-rest)"><h3>Only call numbers on the fridge</h3><p>The helper can phone other computers to ask things, but only the ones a grown-up wrote on the approved list. The map can't add new numbers, and the passwords stay locked in a drawer. <span class="grown"><b>FC_REST_ENDPOINTS</b> and <b>Web Credentials</b></span></p></div>
+    <div class="rule" style="--c: var(--n-submit)"><h3>"Are you sure?" before big things</h3><p>Before saving or changing anything important, the helper reads it back and waits for you to say yes. If someone else changed the same thing first, it tells you instead of overwriting it. <span class="grown"><b>confirm</b> and <b>conflict check</b></span></p></div>
+  </div>
+</section>
+
+<section aria-labelledby="robot-h">
+  <span class="kicker">Chapter 7</span>
+  <h2 id="robot-h">The clever robot stone</h2>
+  <p>Most stones do exactly what the map says. One special stone holds a clever robot that can think. You give it a goal, like "help Sam ask for time off", and it works out which questions to ask. <span class="grown"><b>Agent node</b> with an <b>AI model</b></span></p>
+  <p>The robot has a toolbox. It can only use the tools a grown-up put in it: look something up, find a record and let you pick it, phone an approved computer, or fill in a box. <span class="grown"><b>tools</b>, <b>skills</b>, <b>pick_record</b>, <b>set_field</b></span></p>
+  <p>The robot never talks to you behind the brain's back. Every question it asks goes through the brain, which checks your answer the normal way. If the robot gets stuck or tries too many times, the brain stops it and takes another path. <span class="grown"><b>limits</b> and <b>onError</b></span></p>
+</section>
+
+<section aria-labelledby="quiz-h">
+  <span class="kicker">Chapter 8</span>
+  <h2 id="quiz-h">Quick quiz</h2>
+  <div class="quiz" id="quiz"></div>
+  <p class="score" id="score" aria-live="polite"></p>
+</section>
+
+<section aria-labelledby="words-h">
+  <span class="kicker">For grown-ups</span>
+  <h2 id="words-h">Kid words and grown-up words</h2>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>In this guide</th><th>In FlowChat</th><th>Where you meet it</th></tr></thead>
+      <tbody>
+        <tr><td>The map</td><td>Flow</td><td>Designer, <code>FC_FLOWS</code> and <code>FC_FLOW_VERSIONS</code></td></tr>
+        <tr><td>A stepping stone</td><td>Node</td><td><code>"type": "ask"</code>, <code>"condition"</code>, <code>"rest"</code>...</td></tr>
+        <tr><td>An answer's name tag</td><td>Slot</td><td><code>"slot": "scoops"</code>, <code>{{scoops}}</code> in messages</td></tr>
+        <tr><td>Filling the box on the form</td><td>Binding</td><td><code>"bindings": {"scoops": {"apex": "P10_SCOOPS"}}</code></td></tr>
+        <tr><td>The brain</td><td>Engine</td><td><code>FC_ENGINE</code> package, <code>flowchat-engine.js</code></td></tr>
+        <tr><td>The chat window</td><td>Widget</td><td><code>&lt;flow-chat&gt;</code> element, FlowChat Chat region plugin</td></tr>
+        <tr><td>The drawing board</td><td>Designer</td><td>FlowChat Designer region plugin</td></tr>
+        <tr><td>Phoning a friend</td><td>Lookup connector, REST call</td><td><code>FC_CONNECTORS</code>, <code>FC_REST_ENDPOINTS</code></td></tr>
+        <tr><td>The toy box</td><td>Data source</td><td><code>FC_DATA_SOURCES</code>, Find record and Save changes</td></tr>
+        <tr><td>The secret sticker</td><td>PII placeholder</td><td><code>"pii": true</code>, <code>piiSlots</code>, <code>[PII_1]</code></td></tr>
+        <tr><td>The robot's toolbox</td><td>Agent tools and skills</td><td><code>FC_AI_TOOLS</code>, <code>FC_AI_SKILLS</code>, <code>FC_AI_PROVIDERS</code></td></tr>
+        <tr><td>The helper's notebook</td><td>Event log</td><td><code>FC_EVENTS</code>, <code>"debug": true</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+</div>
+
+<script>
+(function () {
+  // ---------- the stepping-stone families (Chapter 3)
+  var FAMILIES = [
+    { title: 'Talking stones', items: [
+      ['Message', 'n-message', 'The helper says something, like "Hi!" or "Thanks!", and hops on.', 'message'],
+      ['Ask', 'n-ask', 'The helper asks one question and waits. It checks the answer: a number must be a number, a date must be a real date.', 'ask + input kind'],
+      ['Summary', 'n-summary', 'The helper reads back everything you said, with a little Edit button next to each answer, and asks "Is this right?"', 'summary'],
+      ['End', 'n-end', 'The last stone. The helper says goodbye and the chat is finished.', 'end'] ] },
+    { title: 'Choosing stones', items: [
+      ['Condition', 'n-condition', 'A fork in the path. "If you picked a cone, go this way. Otherwise, go that way."', 'condition, branches'],
+      ['Menu', 'n-menu', 'A row of doors to pick from, shown as buttons. Each door leads to a different path.', 'menu, options'],
+      ['Set values', 'n-set', 'The helper quietly writes something down without asking, like today\'s date or a starting value.', 'set'] ] },
+    { title: 'Phone-a-friend stones', items: [
+      ['Lookup', 'n-lookup', 'The helper phones a friend inside the database to look something up, like "Do we already know this customer?"', 'lookup + connector'],
+      ['REST call', 'n-rest', 'The helper phones another computer on the internet, like a weather service, and copies parts of the reply into boxes. Only approved numbers.', 'rest + FC_REST_ENDPOINTS'],
+      ['Email', 'n-email', 'The helper writes a letter from your answers and posts it, for example "We got your request".', 'email, APEX_MAIL'],
+      ['Submit', 'n-submit', 'The helper checks every answer one more time, then drops the finished form in the mailbox.', 'submit'] ] },
+    { title: 'Toy-box stones (changing things you already have)', items: [
+      ['Verify', 'n-verify', 'Before opening your toy box, the helper sends a secret code to your email and asks you to say it back.', 'verify, one-time code'],
+      ['Find record', 'n-find', 'The helper looks through the toy box for your toy. If it finds a few, it shows cards so you can point at the right one.', 'findRecord, data source'],
+      ['Change fields', 'n-change', 'You say what to fix on the toy: "the color should be blue".', 'changeFields'],
+      ['Save changes', 'n-save', 'The helper puts the fixed toy back. If someone else changed it meanwhile, it tells you instead of squashing their change.', 'saveChanges, conflict'],
+      ['Repeat', 'n-repeat', 'For lists: "Tell me about each thing in your lunchbox." It asks the same small questions for every item.', 'repeat, line items'],
+      ['Bulk update', 'n-save', 'Change the same thing on lots of toys at once, after you say yes.', 'bulkUpdate'] ] },
+    { title: 'The robot stone', items: [
+      ['Agent', 'n-agent', 'A clever robot with a goal and a toolbox. It decides which questions to ask, uses its tools, then fills in the boxes.', 'agent, AI model'] ] }
+  ];
+  var groups = document.getElementById('groups');
+  FAMILIES.forEach(function (f) {
+    var g = document.createElement('div'); g.className = 'group';
+    var h = document.createElement('h3'); h.textContent = f.title; g.appendChild(h);
+    var tiles = document.createElement('div'); tiles.className = 'tiles';
+    f.items.forEach(function (it) {
+      var t = document.createElement('div'); t.className = 'tile'; t.style.setProperty('--c', 'var(--' + it[1] + ')');
+      t.innerHTML = '<div class="name"><i></i></div><p></p><span class="grown"><b></b></span>';
+      t.querySelector('.name').appendChild(document.createTextNode(it[0]));
+      t.querySelector('p').textContent = it[2];
+      t.querySelector('.grown b').textContent = it[3];
+      tiles.appendChild(t);
+    });
+    g.appendChild(tiles); groups.appendChild(g);
+  });
+
+  // ---------- the ice cream playground (Chapter 2): a tiny flow and a tiny engine
+  var FLOW = [
+    { id: 'hi', type: 'message', color: 'n-message', label: 'Say hello', text: "Hi! I'm your ice cream helper. Let's fill in your order slip.", next: 'name',
+      why: 'A <b>Message</b> stone. The helper just talks, then hops to the next stone by itself.' },
+    { id: 'name', type: 'ask', color: 'n-ask', label: 'Ask your name', slot: 'name', text: "What's your name?", input: 'text', next: 'holder',
+      check: function (v) { return v.trim().length < 2 ? 'Please tell me a name with at least 2 letters.' : null; },
+      why: 'An <b>Ask</b> stone. The helper waits for you. Your answer gets the name tag <code>name</code> and jumps into the Name box on the slip.' },
+    { id: 'holder', type: 'menu', color: 'n-menu', label: 'Cone or cup?', slot: 'holder', text: 'Do you want a cone or a cup, {{name}}?',
+      options: [['Cone', 'Cone'], ['Cup', 'Cup']], next: 'isCone',
+      why: 'A <b>Menu</b> stone: buttons to pick from. The helper used <code>{{name}}</code> to say your name back to you.' },
+    { id: 'isCone', type: 'condition', color: 'n-condition', label: 'Is it a cone?', test: function (s) { return s.holder === 'Cone'; }, yes: 'sprinkles', no: 'scoops',
+      why: 'A <b>Condition</b> stone, a fork in the path. You never see it. It looked at your answer and chose the way to go.' },
+    { id: 'sprinkles', type: 'ask', color: 'n-ask', label: 'Sprinkles?', slot: 'sprinkles', text: 'Sprinkles on your cone?', options: [['Yes', 'Yes'], ['No', 'No']], next: 'scoops',
+      why: 'Only cones get this question. A cup skips this stone completely, because the fork sent it the other way.' },
+    { id: 'scoops', type: 'ask', color: 'n-ask', label: 'How many scoops?', slot: 'scoops', text: 'How many scoops? You can have 1, 2 or 3.', input: 'number', next: 'summary',
+      check: function (v) { var n = Number(v); return !/^\s*\d+\s*$/.test(v) ? "That isn't a number. Try 1, 2 or 3." : (n < 1 || n > 3) ? 'Only 1, 2 or 3 scoops fit on top!' : null; },
+      why: 'Another <b>Ask</b> stone, with a rule: 1 to 3. Try typing 7 to see the helper say no kindly and ask again.' },
+    { id: 'summary', type: 'summary', color: 'n-summary', label: 'Read it back', text: "Here's your order. Is it right?", next: 'submit',
+      why: 'A <b>Summary</b> stone. The helper reads everything back. In the real tool each line has an Edit button.' },
+    { id: 'submit', type: 'submit', color: 'n-submit', label: 'Send to kitchen', text: 'Sending your order to the kitchen...', next: 'end',
+      why: 'A <b>Submit</b> stone. The brain checks every answer once more, then saves the order. That is the "mailbox".' },
+    { id: 'end', type: 'end', color: 'n-end', label: 'Say goodbye', text: 'Yum! Your ice cream is on its way, {{name}}.',
+      why: 'The <b>End</b> stone. The chat is finished. Press Start over to walk the map again, and try the other path.' }
+  ];
+  var byId = {}; FLOW.forEach(function (n) { byId[n.id] = n; });
+  var slots, visited, current;
+  var stonesEl = document.getElementById('stones'), logEl = document.getElementById('log'), ansEl = document.getElementById('answer'), whyEl = document.getElementById('why');
+
+  function fill(t) { return t.replace(/\{\{(\w+)\}\}/g, function (_, k) { return slots[k] || ''; }); }
+  function say(text, cls) { var b = document.createElement('div'); b.className = 'bub ' + (cls || 'bot'); b.textContent = text; logEl.appendChild(b); logEl.scrollTop = logEl.scrollHeight; return b; }
+  function explain(html) { whyEl.innerHTML = '<b>What just happened?</b><span>' + html + '</span>'; }
+  function drawMap() {
+    stonesEl.innerHTML = '';
+    var cone = slots.holder === 'Cone', cupChosen = slots.holder === 'Cup';
+    FLOW.forEach(function (n, i) {
+      var li = document.createElement('li');
+      li.style.setProperty('--c', 'var(--' + n.color + ')');
+      if (visited.indexOf(n.id) >= 0) li.className = 'done';
+      if (n.id === current) li.className = 'now';
+      if (n.id === 'sprinkles' && cupChosen) li.className = 'skip';
+      li.innerHTML = '<span class="stone" aria-hidden="true">' + (visited.indexOf(n.id) >= 0 && n.id !== current ? '✓' : '') + '</span><span class="lbl"></span>';
+      var l = li.querySelector('.lbl'); l.textContent = n.label;
+      var s = document.createElement('small'); s.textContent = n.type; l.appendChild(s);
+      stonesEl.appendChild(li);
+    });
+  }
+  function setBox(slot, v) {
+    var o = document.getElementById('f-' + slot); if (!o) return;
+    o.textContent = v; o.classList.add('pop'); setTimeout(function () { o.classList.remove('pop'); }, 900);
+  }
+  function buttons(list) {
+    ansEl.innerHTML = '';
+    list.forEach(function (b) { var x = document.createElement('button'); x.type = 'button'; x.textContent = b[0]; if (b[2]) x.className = 'ghost'; x.onclick = b[1]; ansEl.appendChild(x); });
+  }
+  function textBox(n) {
+    ansEl.innerHTML = '';
+    var f = document.createElement('form');
+    f.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;width:100%';
+    var i = document.createElement('input'); i.id = 'play-answer'; i.setAttribute('aria-label', 'Your answer'); i.autocomplete = 'off';
+    i.inputMode = n.input === 'number' ? 'numeric' : 'text';
+    var b = document.createElement('button'); b.type = 'submit'; b.textContent = 'Send';
+    f.appendChild(i); f.appendChild(b);
+    f.addEventListener('submit', function (e) { e.preventDefault(); if (i.value.trim()) answer(n, i.value.trim()); });
+    ansEl.appendChild(f); i.focus({ preventScroll: true });
+  }
+  function answer(n, v) {
+    say(v, 'me');
+    var bad = n.check && n.check(v);
+    if (bad) { say(bad, 'err'); explain('The brain checked your answer and said no. It stays on the same stone and asks again. Nothing went into the slip.'); textBox(n); return; }
+    slots[n.slot] = n.input === 'number' ? String(Number(v)) : v;
+    setBox(n.slot, slots[n.slot]);
+    go(n.next);
+  }
+  function go(id) {
+    var n = byId[id]; current = id; visited.push(id); drawMap(); explain(n.why);
+    if (n.type === 'message') { say(fill(n.text)); setTimeout(function () { go(n.next); }, 900); buttons([]); return; }
+    if (n.type === 'condition') { var nx = n.test(slots) ? n.yes : n.no; setTimeout(function () { go(nx); }, 1300); buttons([]); return; }
+    if (n.type === 'ask' || n.type === 'menu') {
+      say(fill(n.text));
+      if (n.options) buttons(n.options.map(function (o) { return [o[0], function () { answer(n, o[1]); }]; }));
+      else textBox(n);
+      return;
+    }
+    if (n.type === 'summary') {
+      var b = say(n.text, 'bot sum'), ul = document.createElement('ul');
+      [['Name', 'name'], ['Holder', 'holder'], ['Sprinkles', 'sprinkles'], ['Scoops', 'scoops']].forEach(function (p) {
+        if (!slots[p[1]]) return; var li = document.createElement('li'); li.textContent = p[0] + ': ' + slots[p[1]]; ul.appendChild(li);
+      });
+      b.appendChild(ul);
+      buttons([['Yes, send it', function () { say('Yes, send it', 'me'); go(n.next); }], ['Start over', start, true]]);
+      return;
+    }
+    if (n.type === 'submit') { say(n.text); buttons([]); setTimeout(function () { say('Saved! Order number ICE-' + (100 + Math.floor(Math.random() * 900)), 'ok'); go(n.next); }, 1200); return; }
+    if (n.type === 'end') { say(fill(n.text), 'ok'); buttons([['Start over', start]]); }
+  }
+  function start() {
+    slots = {}; visited = []; current = null; logEl.innerHTML = '';
+    ['name', 'holder', 'sprinkles', 'scoops'].forEach(function (k) { document.getElementById('f-' + k).textContent = ''; });
+    go('hi');
+  }
+  // resting state: the map drawn, a Start button waiting
+  slots = {}; visited = []; current = null; drawMap();
+  say("Press Start and I'll take your ice cream order.");
+  buttons([['Start', start]]);
+
+  // ---------- every stone up close (Chapter 4)
+  var NODES = [
+    { id: 'message', name: 'Message', c: 'n-message', grown: '"type": "message"',
+      kid: 'The helper says something out loud, then walks on to the next stone without waiting.',
+      use: ['Saying hello or thank you', 'Giving a tip before a hard question', 'Telling someone what happens next'],
+      fields: [['text', 'What the helper says. {{name}} puts in an answer.'], ['next', 'The stone to go to afterwards.']],
+      chat: [['bot', 'Hi Sam! I\'ll help you book a meeting room.'], ['note', 'no waiting: the next stone starts right away']],
+      json: { id: 'welcome', type: 'message', text: "Hi {{context.first_name}}! I'll help you book a meeting room.", next: 'ask_date' },
+      ports: ['next'],
+      tip: 'Keep messages short. Two short messages read better than one long one.' },
+
+    { id: 'ask', name: 'Ask', c: 'n-ask', grown: '"type": "ask"',
+      kid: 'The helper asks one question, waits for the answer, checks it, and writes it on the form.',
+      use: ['Every box on the form that the person fills in', 'Anything you need checked: a number in a range, a real date, an email address'],
+      fields: [['slot', 'The answer\'s name tag, like amount. Lowercase letters, digits and _.'],
+               ['label', 'The box name people see in the summary.'],
+               ['prompt', 'The question.'],
+               ['input.kind', 'text, email, number, date, choice, yesno or file.'],
+               ['input.min / max', 'Smallest and biggest number (or minDate / maxDate for dates).'],
+               ['input.options', 'For choice: the buttons. Or optionsFrom: a list from the database.'],
+               ['validators', 'Extra rules: a pattern (regex) or a check by a database connector.'],
+               ['pii', 'true for private answers: hidden in logs and from the robot.'],
+               ['skipIfFilled', 'Skip the question when a Lookup already filled the answer.']],
+      chat: [['bot', 'How much would you like to borrow?'], ['me', '25k'], ['note', 'the form box gets 25000'], ['bot', 'What is the loan for?'], ['note', 'typing "900" would get: The smallest loan is $1,000.']],
+      json: { id: 'ask_amount', type: 'ask', slot: 'amount', label: 'Loan amount', prompt: 'How much would you like to borrow?',
+              input: { kind: 'number', min: 1000, max: 500000, prefix: '$', minMessage: 'The smallest loan is $1,000.' }, next: 'ask_purpose' },
+      ports: ['next'],
+      tip: 'Kinds understand everyday answers: "25k" is 25000, "tomorrow" is a date, "yes" and "nope" work for yes/no. The brain checks the answer, so the form always gets clean values.' },
+
+    { id: 'condition', name: 'Condition', c: 'n-condition', grown: '"type": "condition"',
+      kid: 'A fork in the path. The helper looks at the answers so far and picks which way to walk. The person never sees it.',
+      use: ['Asking extra questions only for some people', 'Skipping questions that don\'t apply', 'Sending big requests to a different path'],
+      fields: [['branches', 'A list of tests, checked from the top. The first that is true wins.'],
+               ['when', '{slot, op, value}. op is =, !=, >, >=, <, <=, in, empty or notEmpty. Mix tests with all, any and not.'],
+               ['else', 'Where to go when no test is true.']],
+      chat: [['me', '250000'], ['note', 'amount > 100000, so the helper takes the "big loan" path'], ['bot', 'For loans this size, what is your yearly income?']],
+      json: { id: 'is_large_loan', type: 'condition',
+              branches: [{ when: { all: [{ slot: 'amount', op: '>', value: 100000 }, { slot: 'purpose', op: '!=', value: 'home' }] }, next: 'ask_income' }],
+              'else': 'review' },
+      ports: ['branch 1', 'branch 2...', 'else'],
+      tip: 'Always connect else. A fork with a missing path stops the conversation there.' },
+
+    { id: 'menu', name: 'Menu', c: 'n-menu', grown: '"type": "menu"',
+      kid: 'A row of doors shown as buttons. Each door leads to its own path, and paths can come back to the menu later.',
+      use: ['A main menu: "What would you like to do?"', '"Anything else?" at the end, looping back', 'Choices where each one needs different questions'],
+      fields: [['prompt', 'The question above the buttons.'],
+               ['options', 'Each has a value, a label (button text) and next (its own path).'],
+               ['options[].when', 'Show this button only when a test is true.'],
+               ['slot', 'Optional: also keep the choice as an answer.']],
+      chat: [['bot', 'What would you like to do?'], ['note', '[ Book a room ]  [ Cancel a booking ]  [ Ask a question ]'], ['me', 'Cancel a booking']],
+      json: { id: 'main_menu', type: 'menu', prompt: 'What would you like to do?', slot: 'task',
+              options: [{ value: 'book', label: 'Book a room', next: 'ask_date' },
+                        { value: 'cancel', label: 'Cancel a booking', next: 'find_booking' },
+                        { value: 'admin', label: 'Room settings', when: { slot: 'context.is_admin', op: '=', value: 'Y' }, next: 'settings' }] },
+      ports: ['one per option'],
+      tip: 'Use Menu when each choice changes the path. Use an Ask with kind choice when it\'s just an answer for the form.' },
+
+    { id: 'set', name: 'Set values', c: 'n-set', grown: '"type": "set"',
+      kid: 'The helper quietly writes something on the form without asking: a starting value, a copy, or text built from other answers.',
+      use: ['Defaults, like country = AU', 'Copying a page value or the signed-in user', 'Building a title from other answers'],
+      fields: [['assign', 'A list of things to write, in order.'],
+               ['value', 'A fixed value.'],
+               ['from', 'Copy of another answer, rec.field, context.name, list.count or app_user.'],
+               ['template', 'Text with {{placeholders}}.'],
+               ['clear', 'Empty the answer.'],
+               ['onlyIfEmpty', 'Keep a value that is already there.']],
+      chat: [['note', 'nothing is shown: the order slip just gets new values']],
+      json: { id: 'defaults', type: 'set',
+              assign: [{ slot: 'country', value: 'AU', onlyIfEmpty: true }, { slot: 'requested_by', from: 'app_user' },
+                       { slot: 'title', template: 'Leave for {{name}} ({{days}} days)' }], next: 'ask_type' },
+      ports: ['next'],
+      tip: '{{app_user}} is filled by the server from the signed-in APEX user, so nobody can pretend to be someone else.' },
+
+    { id: 'lookup', name: 'Lookup', c: 'n-lookup', grown: '"type": "lookup" + FC_CONNECTORS',
+      kid: 'The helper phones a friend in the database: "Do we know this person?" The friend can fill in answers so they aren\'t asked again.',
+      use: ['Prefilling a known customer\'s details', 'Checking whether something exists before going on'],
+      fields: [['connector', 'An id in FC_CONNECTORS: a PL/SQL function or a REST URL. It gets every answer so far.'],
+               ['onNotFound', 'Where to go when the friend says found: false.']],
+      chat: [['me', 'ann@example.com'], ['bot', 'Welcome back, Ann! I\'ve filled in your details.']],
+      json: { id: 'find_customer', type: 'lookup', connector: 'customer_by_email', next: 'ask_amount', onNotFound: 'ask_name' },
+      extra: 'The connector answers with JSON like {"found": true, "slots": {"name": "Ann Lee"}, "message": "Welcome back, Ann!"}',
+      ports: ['next', 'not found'],
+      tip: 'Pair it with skipIfFilled on the later Ask stones, so prefilled answers aren\'t asked again.' },
+
+    { id: 'rest', name: 'REST call', c: 'n-rest', grown: '"type": "rest" + FC_REST_ENDPOINTS',
+      kid: 'The helper phones another computer on the internet and copies parts of its reply into boxes. It may only phone numbers on the approved list.',
+      use: ['Exchange rates, weather, postcodes, stock levels', 'Creating something in another system (with POST)'],
+      fields: [['endpoint', 'An id in FC_REST_ENDPOINTS. The address and password live there, not in the map.'],
+               ['method / path', 'GET, POST, PUT, PATCH or DELETE, and a path like /rates/{{currency}}.'],
+               ['query', 'Extra ?name=value parts.'],
+               ['body', 'For POST and friends: JSON. "{{amount}}" alone keeps a number a number.'],
+               ['map', 'Box name ← where the value is in the reply, like $.rate or $.items[0].id.'],
+               ['onNotFound / onError', 'Where to go for a 404, or for any other problem.']],
+      chat: [['me', 'EUR'], ['bot', 'Today\'s rate is 1.08.']],
+      json: { id: 'get_rate', type: 'rest', endpoint: 'fx_rates', method: 'GET', path: '/rates/{{currency}}',
+              query: { amount: '{{amount}}' }, map: { rate: '$.rate', rate_date: '$.date' },
+              message: "Today's rate is {{rate}}.", next: 'ask_amount', onNotFound: 'ask_currency', onError: 'manual_rate' },
+      ports: ['ok', '404', 'error'],
+      tip: 'If the person edits an earlier answer, a GET runs again quietly. Other methods never run twice.' },
+
+    { id: 'email', name: 'Email', c: 'n-email', grown: '"type": "email"',
+      kid: 'The helper writes a letter from the answers and posts it.',
+      use: ['"We got your request" receipts', 'Telling a team about a new request', 'Sending a file the person uploaded'],
+      fields: [['to, cc, bcc', 'Addresses, separated by commas. Can use {{email}}.'],
+               ['from', 'The sender. Needed when APEX_MAIL sends it.'],
+               ['subject, body', 'The letter, with {{placeholders}}.'],
+               ['attachments', 'File answers to attach.'],
+               ['connector', 'Optional: your own sender instead of APEX_MAIL.']],
+      chat: [['bot', 'I\'ve emailed a copy to ann@example.com.']],
+      json: { id: 'notify', type: 'email', from: 'no-reply@yourcompany.com', to: '{{email}}', bcc: 'hr@yourcompany.com',
+              subject: 'Your leave request for {{days}} days', body: 'Hi {{name}},\n\nWe got your request.\n\nHR team',
+              message: "I've emailed a copy to {{email}}.", next: 'done', onError: 'done' },
+      ports: ['sent', 'error'],
+      tip: 'If "to" comes from an answer, anyone could make it email any address. Put a Verify stone first when that matters.' },
+
+    { id: 'summary', name: 'Summary', c: 'n-summary', grown: '"type": "summary"',
+      kid: 'The helper reads back everything and asks "Is this right?". Each line has an Edit button that jumps back to that question.',
+      use: ['Just before Submit, every time', 'With mode "changes": showing old → new for a record being changed'],
+      fields: [['text', 'The words above the list.'], ['fields', 'Which answers to show (default: all).'],
+               ['confirmLabel', 'The button text, like "Send my request".'], ['mode, record', '"changes" and the record name for update maps.']],
+      chat: [['bot', 'Here\'s what I have. Please check:'], ['note', 'Name: Ann Lee  [Edit]   Amount: $25,000  [Edit]'], ['me', 'Confirm & submit']],
+      json: { id: 'review', type: 'summary', text: "Here's what I have. Please check:", confirmLabel: 'Confirm & submit', next: 'submit_app' },
+      ports: ['confirm'],
+      tip: 'After an Edit, the helper walks the map again with the new answer, so forks and questions stay correct.' },
+
+    { id: 'submit', name: 'Submit', c: 'n-submit', grown: '"type": "submit"',
+      kid: 'The helper checks every answer one last time, then drops the form in the mailbox.',
+      use: ['Saving a new request, application or order'],
+      fields: [['connector', 'The FC_CONNECTORS id that saves it. It gets every answer.'],
+               ['onSuccess', 'Where to go when it worked.'], ['onError', 'Where to go when it failed. Without it the chat ends as failed.']],
+      chat: [['bot', 'Saved! Your reference is LN-1042.']],
+      json: { id: 'submit_app', type: 'submit', connector: 'save_application', onSuccess: 'done', onError: 'sorry' },
+      extra: 'The connector answers {"ok": true, "message": "Saved!", "slots": {"reference": "LN-1042"}} or {"ok": false, "message": "..."}',
+      ports: ['success', 'error'],
+      tip: 'With the chat plugin you can also let the APEX page save it: set When Finished to Submit Page.' },
+
+    { id: 'end', name: 'End', c: 'n-end', grown: '"type": "end"',
+      kid: 'The last stone. The helper says goodbye and the chat is finished.',
+      use: ['The end of every path, including error paths'],
+      fields: [['text', 'The goodbye message. Can use {{reference}}.']],
+      chat: [['bot', 'All done! Your reference is LN-1042.']],
+      json: { id: 'done', type: 'end', text: 'All done! Your reference is {{reference}}.' },
+      ports: [],
+      tip: 'Give error paths their own friendly End, like "Please call us on 1300 000 000".' },
+
+    { id: 'verify', name: 'Verify', c: 'n-verify', grown: '"type": "verify"',
+      kid: 'Before opening someone\'s toy box, the helper sends a secret code to their email or phone and asks them to say it back.',
+      use: ['Public pages where people look up or change their own records'],
+      fields: [['slot', 'The answer the code goes to, like email.'], ['channel', 'email or sms.'],
+               ['connector', 'Sends the code. Gets {channel, to, code, ttlMinutes}.'],
+               ['codeLength, ttlMinutes', 'How long the code is and how long it works.'],
+               ['maxAttempts, maxResends', 'Wrong tries allowed, and how many new codes.'],
+               ['verified / failed', 'Where to go after.']],
+      chat: [['bot', 'I\'ve sent a 6-digit code to ann@example.com. Please enter it here.'], ['me', '482913'], ['note', 'the code is right, so the helper walks on to the verified arrow']],
+      json: { id: 'check_email', type: 'verify', slot: 'email', channel: 'email', connector: 'send_code',
+              codeLength: 6, ttlMinutes: 10, maxAttempts: 3, verified: 'find_app', failed: 'locked_out' },
+      ports: ['verified', 'failed'],
+      tip: 'Only a scrambled copy of the code is stored. Then set requireVerified on Find record, so nobody can search before passing.' },
+
+    { id: 'findRecord', name: 'Find record', c: 'n-find', grown: '"type": "findRecord" + FC_DATA_SOURCES',
+      kid: 'The helper looks in the toy box for the right toy. If there are a few, it shows little cards so the person can point at theirs.',
+      use: ['The start of every "change something" map', 'Finding an order, a booking or an application'],
+      fields: [['source', 'The FC_DATA_SOURCES id (a table with rules on what can be read and changed).'],
+               ['as', 'A short name for the found record, like app. Then {{app.status}} works.'],
+               ['criteria', 'Which answers to search with: field, op (eq, starts, contains, gte, lte) and slot.'],
+               ['card', 'What each card shows, like {{reference}} · {{status}}.'],
+               ['found / notFound / tooMany / cancelled', 'Where to go.']],
+      chat: [['bot', 'I found 2 matching records. Which one?'], ['note', '[ LN-1042 · Approved ]  [ LN-1077 · Pending ]  [ None of these ]'], ['me', 'LN-1077 · Pending']],
+      json: { id: 'find_app', type: 'findRecord', source: 'loan_apps', as: 'app',
+              criteria: [{ field: 'email', op: 'eq', slot: 'email' }], card: { title: '{{reference}}', subtitle: '{{status}}' },
+              requireVerified: 'email', found: 'edit_app', notFound: 'no_app' },
+      ports: ['found', 'not found', 'too many', 'none of these'],
+      tip: 'The data source\'s row filter always applies, for example "only rows of the signed-in user".' },
+
+    { id: 'changeFields', name: 'Change fields', c: 'n-change', grown: '"type": "changeFields"',
+      kid: 'The helper shows the toy\'s details and asks what to fix. The person can fix one thing or several, then says Done.',
+      use: ['Letting people update their own record, one field at a time'],
+      fields: [['record', 'The name from Find record, like app.'],
+               ['fields', 'Which fields may change, each with a label and its own input rules.'],
+               ['editableWhen', 'Lock a field unless a test is true, like status = Pending.'],
+               ['done / noChanges', 'Where to go.']],
+      chat: [['bot', 'What would you like to change?'], ['note', '[ Phone ]  [ Amount ]  [ Done ]'], ['me', 'Phone'], ['bot', 'What\'s the new phone number?']],
+      json: { id: 'edit_app', type: 'changeFields', record: 'app', prompt: 'What would you like to change?',
+              fields: [{ field: 'phone', label: 'Phone', pii: true },
+                       { field: 'amount', label: 'Amount', input: { kind: 'number', min: 1000 },
+                         editableWhen: { slot: 'app.status', op: '=', value: 'PENDING' }, lockedMessage: 'The amount is fixed once approved.' }],
+              done: 'review_changes', noChanges: 'nothing_changed' },
+      ports: ['done', 'no changes'],
+      tip: 'Follow it with a Summary in mode "changes", so people see old → new before saving.' },
+
+    { id: 'saveChanges', name: 'Save changes', c: 'n-save', grown: '"type": "saveChanges"',
+      kid: 'The helper puts the fixed toy back. If someone else changed it meanwhile, it says so instead of squashing their change.',
+      use: ['After Change fields and a changes Summary'],
+      fields: [['record', 'The record name, like app.'],
+               ['saved / conflict / forbidden / error', 'Where to go for each outcome.']],
+      chat: [['bot', 'Your changes are saved.']],
+      json: { id: 'save_app', type: 'saveChanges', record: 'app', savedText: 'Your changes are saved.', saved: 'done', conflict: 'review_changes' },
+      ports: ['saved', 'conflict', 'forbidden', 'error'],
+      tip: 'Only the changed fields are sent. Point conflict back to the Summary: the newest values load, with the person\'s edits on top.' },
+
+    { id: 'repeat', name: 'Repeat', c: 'n-repeat', grown: '"type": "repeat"',
+      kid: 'For lists. "Tell me about each thing in your lunchbox." The helper asks the same small questions for every item, with Add, Remove and Done buttons.',
+      use: ['Expense lines, children, products in an order'],
+      fields: [['slot', 'The list\'s name tag. {{expenses.count}} is how many.'],
+               ['itemLabel', 'What one item is called, like expense.'],
+               ['min, max', 'Fewest and most items.'],
+               ['fields', 'The questions for each item, each with its own input rules.'],
+               ['itemTitle', 'How an item is shown, like {{description}} ({{amount}}).']],
+      chat: [['bot', 'Expense 1: what was it for?'], ['me', 'Taxi'], ['bot', 'How much was it?'], ['me', '42.50'], ['note', '[ Add another expense ]  [ Done ]']],
+      json: { id: 'expenses', type: 'repeat', slot: 'expenses', label: 'Expenses', itemLabel: 'expense', min: 1, max: 20,
+              itemTitle: '{{description}} ({{amount}})',
+              fields: [{ field: 'description', label: 'Description', prompt: 'Expense {{n}}: what was it for?' },
+                       { field: 'amount', label: 'Amount', prompt: 'How much was it?', input: { kind: 'number', min: 0.01, prefix: '$' } }],
+              next: 'review' },
+      ports: ['done'],
+      tip: 'The whole list goes to the Submit connector as one JSON array.' },
+
+    { id: 'bulkUpdate', name: 'Bulk update', c: 'n-save', grown: '"type": "bulkUpdate"',
+      kid: 'Change the same thing on lots of toys at once. The helper first says how many it found and waits for a yes.',
+      use: ['"Close all my open tickets"', '"Move all my bookings on Friday to room B"'],
+      fields: [['source, criteria', 'What to search, like Find record.'],
+               ['set', 'What to change: a fixed value or an answer.'],
+               ['maxRows', 'The most it will change at once.'],
+               ['done / none / tooMany / cancelled / partial', 'Where to go.']],
+      chat: [['bot', 'I found 3 open tickets. Close all of them?'], ['note', '[ Update 3 ]  [ Cancel ]'], ['me', 'Update 3'], ['bot', 'Done: 3 tickets closed.']],
+      json: { id: 'close_all', type: 'bulkUpdate', source: 'tickets', byRowFilter: true,
+              set: { status: { value: 'CLOSED', label: 'Status' } }, maxRows: 50, done: 'done', none: 'nothing_open' },
+      ports: ['done', 'none', 'too many', 'cancelled', 'partly failed'],
+      tip: 'Each row is still checked on its own: the row filter, which fields may change, and version conflicts.' },
+
+    { id: 'agent', name: 'Agent', c: 'n-agent', grown: '"type": "agent" + FC_AI_PROVIDERS',
+      kid: 'A clever robot with a goal and a toolbox. It decides what to ask, uses its tools, and fills in the boxes when it\'s done.',
+      use: ['Tasks where the questions depend on the answers in ways too twisty to draw', 'Helping people who don\'t know what to pick'],
+      fields: [['provider', 'Which AI model (FC_AI_PROVIDERS id).'],
+               ['goal, instructions', 'The job, in plain words.'],
+               ['inputs', 'Answers the robot may see.'],
+               ['outputs', 'The boxes it must fill, each with a kind and rules, like an Ask.'],
+               ['tools, skills', 'What it may use (FC_AI_TOOLS, FC_AI_SKILLS).'],
+               ['exits', 'Other paths it may choose, like "payslip questions".'],
+               ['limits, onError', 'How many steps it gets, and where to go if it gets stuck.']],
+      chat: [['bot', 'You have 12 annual leave days left. What type of leave is it?'], ['note', '[ Annual ]  [ Sick ]'], ['me', 'Annual'], ['bot', 'How many days?']],
+      json: { id: 'leave_helper', type: 'agent', provider: 'corp_llm', goal: 'Help {{app_user}} request leave.',
+              inputs: ['context.emp_id'], tools: ['get_leave_balance', 'public_holidays'], skills: ['leave_policy'],
+              outputs: [{ name: 'leave_type', label: 'Leave type', kind: 'choice', options: ['annual', 'sick'] },
+                        { name: 'days', label: 'Days', kind: 'number', min: 1 }],
+              exits: [{ name: 'payslip', description: 'questions about pay', next: 'payslip_help' }],
+              next: 'review', onError: 'manual_form' },
+      ports: ['finished', 'one per exit', 'error'],
+      tip: 'Test it in the Test tab with a pretend script first. The robot never sees private values: they travel as stickers like [PII_1].' }
+  ];
+
+  var idx = document.getElementById('node-index'), nodesEl = document.getElementById('nodes');
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+  function jsonHtml(o) {
+    var esc = JSON.stringify(o, null, 2).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return esc.replace(/^(\s*)("[^"]+")(:)/gm, '$1<span class="k">$2</span>$3');
+  }
+  NODES.forEach(function (n) {
+    var a = el('a'); a.href = '#stone-' + n.id; a.style.setProperty('--c', 'var(--' + n.c + ')');
+    a.appendChild(el('i')); a.appendChild(document.createTextNode(n.name)); idx.appendChild(a);
+
+    var art = el('article', 'node'); art.id = 'stone-' + n.id; art.style.setProperty('--c', 'var(--' + n.c + ')');
+    var hd = el('header'), h = el('h3'); h.appendChild(document.createTextNode(n.name));
+    var g = el('span', 'grown'); g.appendChild(el('b', null, n.grown)); h.appendChild(g); hd.appendChild(h);
+    hd.appendChild(el('p', 'kid', n.kid)); art.appendChild(hd);
+
+    var cols = el('div', 'cols'), left = el('div', 'col'), right = el('div', 'col');
+    left.appendChild(el('h4', null, 'Use it for'));
+    var ul = el('ul'); n.use.forEach(function (u) { ul.appendChild(el('li', null, u)); }); left.appendChild(ul);
+    left.appendChild(el('h4', null, 'Its settings'));
+    var fl = el('div', 'fields'); n.fields.forEach(function (f) { fl.appendChild(el('code', null, f[0])); fl.appendChild(el('span', null, f[1])); }); left.appendChild(fl);
+    if (n.ports.length) {
+      left.appendChild(el('h4', null, 'Its arrows'));
+      var pp = el('div', 'ports'); n.ports.forEach(function (p) { pp.appendChild(el('span', null, p)); }); left.appendChild(pp);
+    }
+    right.appendChild(el('h4', null, 'What the person sees'));
+    var mini = el('div', 'mini'); n.chat.forEach(function (m) { mini.appendChild(el('div', m[0] === 'note' ? 'note' : 'bub ' + m[0], m[1])); }); right.appendChild(mini);
+    right.appendChild(el('h4', null, 'The recipe'));
+    var pre = el('pre', 'code'); pre.innerHTML = jsonHtml(n.json); pre.tabIndex = 0; pre.setAttribute('aria-label', n.name + ' example'); right.appendChild(pre);
+    if (n.extra) right.appendChild(el('p', null, n.extra));
+    cols.appendChild(left); cols.appendChild(right); art.appendChild(cols);
+    var tip = el('p', 'tip'); tip.appendChild(el('b', null, 'Good to know: ')); tip.appendChild(document.createTextNode(n.tip)); art.appendChild(tip);
+    nodesEl.appendChild(art);
+  });
+
+  var RECIPES = [
+    { title: 'Fill in a new form', text: 'The most common map. Ask the questions, fork for the special cases, read it back, save it.',
+      chain: [['Message', 'n-message'], ['Lookup', 'n-lookup'], ['Ask', 'n-ask'], ['Condition', 'n-condition'], ['Ask', 'n-ask'], ['Summary', 'n-summary'], ['Submit', 'n-submit'], ['Email', 'n-email'], ['End', 'n-end']] },
+    { title: 'Change something I already have', text: 'Prove who you are, find the record, fix fields, check old → new, save without squashing anyone.',
+      chain: [['Ask', 'n-ask'], ['Verify', 'n-verify'], ['Find record', 'n-find'], ['Change fields', 'n-change'], ['Summary', 'n-summary'], ['Save changes', 'n-save'], ['End', 'n-end']] },
+    { title: 'Let the robot help', text: 'A menu sends tricky requests to the robot. It fills the boxes, and you still read it back before saving.',
+      chain: [['Menu', 'n-menu'], ['Set values', 'n-set'], ['Agent', 'n-agent'], ['Summary', 'n-summary'], ['Submit', 'n-submit'], ['End', 'n-end']] }
+  ];
+  var rc = document.getElementById('recipes');
+  RECIPES.forEach(function (r) {
+    var box = el('div', 'recipe'); box.appendChild(el('h3', null, r.title)); box.appendChild(el('p', null, r.text));
+    var ch = el('div', 'chain');
+    r.chain.forEach(function (s, i) { if (i) ch.appendChild(el('em', null, '→')); var sp = el('span', null, s[0]); sp.style.setProperty('--c', 'var(--' + s[1] + ')'); ch.appendChild(sp); });
+    box.appendChild(ch); rc.appendChild(box);
+  });
+
+  // ---------- quiz (Chapter 8)
+  var QUIZ = [
+    ['The helper asks "Cone or cup?" and shows two buttons. Which stone is that?', ['Menu', 'Email', 'End'], 0,
+     'Right! A Menu shows buttons, and each one can lead to its own path.', 'Not quite. Buttons to choose from come from a Menu stone.'],
+    ['You type 7 scoops but only 1 to 3 are allowed. Who says no?', ['The chat window', 'The brain', 'Nobody'], 1,
+     'Yes! The brain checks every answer, so nobody can sneak past by poking at the web page.', 'Not quite. The chat window only shows things. The brain does the checking.'],
+    ['The helper needs today\'s weather from another computer. Which stone phones it?', ['Repeat', 'Summary', 'REST call'], 2,
+     'Yes! A REST call phones an approved computer and copies parts of its answer into boxes.', 'Not quite. Phoning another computer on the internet is the REST call stone.'],
+    ['The robot stone wants your phone number. What does the robot actually see?', ['Your real number', 'A sticker like [PII_1]', 'Nothing at all'], 1,
+     'Yes! Secrets travel as stickers. The brain swaps the real number back in only where it is really needed.', 'Not quite. The robot sees a sticker like [PII_1], never the real secret.'],
+    ['You want the form to say "requested by" the signed-in person, without asking. Which stone?', ['Ask', 'Set values', 'Summary'], 1,
+     'Yes! Set values writes quietly. "from": "app_user" copies the signed-in person, and nobody can fake it.', 'Not quite. Writing without asking is the Set values stone.'],
+    ['You found a record and the person fixed two fields. What comes before Save changes?', ['A Summary in "changes" mode', 'A Menu', 'Another Find record'], 0,
+     'Yes! The Summary shows old → new, so the person checks before anything is saved.', 'Not quite. Show old → new with a Summary in "changes" mode first.']
+  ];
+  var quiz = document.getElementById('quiz'), scoreEl = document.getElementById('score'), answered = {}, right = 0;
+  QUIZ.forEach(function (q, qi) {
+    var box = document.createElement('div'); box.className = 'q';
+    var p = document.createElement('p'); p.style.fontWeight = '700'; p.textContent = (qi + 1) + '. ' + q[0]; box.appendChild(p);
+    var opts = document.createElement('div'); opts.className = 'opts';
+    var fb = document.createElement('div'); fb.className = 'fb'; fb.setAttribute('aria-live', 'polite');
+    q[1].forEach(function (o, oi) {
+      var b = document.createElement('button'); b.type = 'button'; b.textContent = o;
+      b.onclick = function () {
+        if (answered[qi]) return;
+        answered[qi] = true;
+        var ok = oi === q[2]; if (ok) right++;
+        b.classList.add(ok ? 'right' : 'wrong');
+        if (!ok) opts.children[q[2]].classList.add('right');
+        fb.textContent = ok ? q[3] : q[4];
+        fb.style.color = ok ? 'var(--good)' : 'var(--bad)';
+        var n = Object.keys(answered).length;
+        scoreEl.textContent = n === QUIZ.length ? 'You got ' + right + ' out of ' + QUIZ.length + '. ' + (right === QUIZ.length ? 'You know FlowChat!' : 'Walk the ice cream map once more and try again.') : '';
+      };
+      opts.appendChild(b);
+    });
+    box.appendChild(opts); box.appendChild(fb); quiz.appendChild(box);
+  });
+})();
+</script>
+</body>
+</html>
