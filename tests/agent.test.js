@@ -1,0 +1,183 @@
+// Run: node tests/agent.test.js
+// The Agent node, driven by a scripted mock model (no real LLM): dynamic questions, tools, skills,
+// write tools behind a confirmation, finish -> fields -> Summary/Submit, handoff, failures, JSON mode.
+const assert = require('assert');
+const FC = require('../widget/flowchat-engine.js');
+
+let passed = 0;
+async function test(name, fn) {
+  try { await fn(); passed++; console.log('  ok  ' + name); }
+  catch (e) { console.error('  FAIL ' + name + '\n       ' + (e.stack || e.message)); process.exitCode = 1; }
+}
+const texts = (t) => t.messages.map((m) => m.text || '').join(' | ');
+const call = (name, args, id) => ({ id: id || name + '_' + Math.random().toString(36).slice(2, 7), type: 'function',
+                                    function: { name, arguments: JSON.stringify(args) } });
+// A provider that replays a script. Each step is an assistant message, or fn(req) -> message.
+function scripted(steps, seen) {
+  let i = 0;
+  return (req) => {
+    if (seen) seen.push(JSON.parse(JSON.stringify(req)));
+    const s = steps[i++];
+    if (!s) throw new Error('script exhausted');
+    return typeof s === 'function' ? s(req) : s;
+  };
+}
+const lastTool = (req) => JSON.parse([...req.messages].reverse().find((m) => m.role === 'tool').content);
+
+const flow = (agent) => ({
+  flowId: 'leave', start: 'agent',
+  nodes: [
+    Object.assign({ id: 'agent', type: 'agent', provider: 'llm', goal: 'Help {{app_user}} apply for leave.',
+      inputs: ['context.emp_id'], tools: ['get_balance', 'book_leave'], skills: ['policy'],
+      outputs: [{ name: 'leave_type', label: 'Leave type', kind: 'choice', options: ['annual', 'sick'] },
+                { name: 'days', label: 'Days', kind: 'number', min: 1 }],
+      exits: [{ name: 'payslip', description: 'payslip questions', next: 'payslip' }],
+      next: 'review', onError: 'manual' }, agent || {}),
+    { id: 'review', type: 'summary', text: 'Check:', next: 'submit' },
+    { id: 'submit', type: 'submit', connector: 'save', onSuccess: 'done' },
+    { id: 'payslip', type: 'end', text: 'Payslips are on the HR portal.' },
+    { id: 'manual', type: 'end', text: 'Please use the leave form.' },
+    { id: 'done', type: 'end', text: 'Submitted.' }
+  ]
+});
+function engine(steps, extra, seen) {
+  const log = { calls: [], saved: null };
+  const eng = FC.createEngine(Object.assign({
+    flows: [flow(extra && extra.agent)], appUser: 'JSMITH',
+    aiProviders: { llm: scripted(steps, seen) },
+    aiTools: {
+      get_balance: { description: 'Leave balance of an employee', type: 'connector', target: 'balance',
+                     parameters: { type: 'object', properties: { emp_id: { type: 'string' } }, required: ['emp_id'] } },
+      book_leave: { description: 'Book the leave', type: 'connector', target: 'book', write: true,
+                    parameters: { type: 'object', properties: { days: { type: 'number' } } } }
+    },
+    aiSkills: { policy: { name: 'Leave policy', description: 'Rules for leave', content: 'Annual leave needs 2 weeks notice.' } },
+    connectors: {
+      balance: (p) => { log.calls.push(p); return { annual: 12, sick: 5 }; },
+      book: (p) => { log.calls.push(p); return { ok: true, ref: 'LV-1' }; },
+      save: (p) => { log.saved = p.slots; return { ok: true, message: 'Saved.' }; }
+    }
+  }, extra && extra.opts));
+  return { eng, log };
+}
+
+(async () => {
+  console.log('agent node');
+  await test('asks dynamic questions, uses a tool and a skill, finishes into fields, then Summary and Submit run', async () => {
+    const seen = [];
+    const { eng, log } = engine([
+      { content: null, tool_calls: [call('load_skill', { id: 'policy' }), call('get_balance', { emp_id: 'E1' })] },
+      (req) => { assert.deepStrictEqual(lastTool(req), { annual: 12, sick: 5 });
+                 return { content: 'You have 12 annual days.', tool_calls: [call('ask_user', { question: 'Which type?', field: 'leave_type' })] }; },
+      (req) => { assert.deepStrictEqual(lastTool(req), { answer: 'annual' });
+                 return { tool_calls: [call('ask_user', { question: 'How many days?', field: 'days' })] }; },
+      { tool_calls: [call('finish', { fields: { leave_type: 'annual' }, message: 'Thanks, all set.' })] }
+    ], null, seen);
+    let t = await eng.start('leave', { emp_id: 'E1' });
+    assert.match(texts(t), /You have 12 annual days\. \| Which type\?/);
+    assert.strictEqual(t.await.input.kind, 'choice');
+    assert.strictEqual(t.await.input.display, 'buttons');
+    assert.strictEqual(t.await.slot, 'leave_type');
+    assert.strictEqual(log.calls[0].tool, 'get_balance');
+    assert.strictEqual(log.calls[0].appUser, 'JSMITH');
+    const sys = seen[0].messages[0].content;
+    assert.match(sys, /Help JSMITH apply for leave/);
+    assert.match(sys, /"context.emp_id":"E1"/);
+    assert.ok(seen[0].tools.some((x) => x.function.name === 'handoff'));
+    t = await eng.input(t.sessionId, { value: 'annual' });
+    t = await eng.input(t.sessionId, { value: 'ten' });                       // checked by the engine, not the model
+    assert.strictEqual(t.messages[0].type, 'error');
+    t = await eng.input(t.sessionId, { value: '3' });
+    assert.match(texts(t), /Thanks, all set\. \| Check:/);
+    const sum = t.messages.find((m) => m.type === 'summary');
+    assert.deepStrictEqual(sum.items.map((i) => [i.label, i.display]), [['Leave type', 'annual'], ['Days', '3']]);
+    t = await eng.input(t.sessionId, { value: 'confirm' });
+    assert.deepStrictEqual(log.saved, { leave_type: 'annual', days: 3 });
+    assert.strictEqual(t.status, 'completed');
+  });
+  await test('a write tool waits for the user to confirm; Cancel tells the model it was declined', async () => {
+    const { eng, log } = engine([
+      { tool_calls: [call('book_leave', { days: 2 }, 'b1')] },
+      (req) => { assert.deepStrictEqual(lastTool(req), { ok: true, ref: 'LV-1' }); return { tool_calls: [call('book_leave', { days: 4 }, 'b2')] }; },
+      (req) => { assert.strictEqual(lastTool(req).cancelled, true); return { tool_calls: [call('finish', { fields: { leave_type: 'sick', days: 2 } })] }; }
+    ]);
+    let t = await eng.start('leave', {});
+    assert.match(texts(t), /Please confirm: Book the leave\ndays: 2/);
+    assert.deepStrictEqual(t.await.input.options.map((o) => o.value), ['confirm', 'cancel']);
+    assert.strictEqual(log.calls.length, 0);                                  // nothing written before Confirm
+    t = await eng.input(t.sessionId, { value: 'confirm' });
+    assert.strictEqual(log.calls.length, 1);
+    assert.deepStrictEqual(log.calls[0].args, { days: 2 });
+    t = await eng.input(t.sessionId, { value: 'cancel' });
+    assert.strictEqual(log.calls.length, 1);
+    assert.strictEqual(t.await.nodeId, 'review');
+  });
+  await test('finish with a missing or invalid field goes back to the model to fix', async () => {
+    const { eng } = engine([
+      { tool_calls: [call('finish', { fields: { leave_type: 'holiday', days: 0 } })] },
+      (req) => { assert.match(lastTool(req).error, /leave_type: .*days: /); return { tool_calls: [call('finish', { fields: { leave_type: 'sick', days: 1 } })] }; }
+    ]);
+    const t = await eng.start('leave', {});
+    assert.strictEqual(t.await.nodeId, 'review');
+    assert.strictEqual(eng.getState(t.sessionId).slots.days, 1);
+  });
+  await test('handoff follows the exit; give_up and provider errors go to onError', async () => {
+    let r = engine([{ tool_calls: [call('handoff', { exit: 'payslip' })] }]);
+    let t = await r.eng.start('leave', {});
+    assert.match(texts(t), /Payslips are on the HR portal/);
+    r = engine([{ tool_calls: [call('give_up', { reason: 'no data' })] }]);
+    t = await r.eng.start('leave', {});
+    assert.match(texts(t), /Sorry, I couldn't complete this\. \| Please use the leave form\./);
+    r = engine([() => { throw new Error('HTTP 503'); }]);
+    t = await r.eng.start('leave', {});
+    assert.match(texts(t), /Please use the leave form/);
+  });
+  await test('a plain reply waits for free text; limits stop runaway loops', async () => {
+    let r = engine([{ content: 'Which dates do you have in mind?' },
+                    (req) => { assert.strictEqual(req.messages[req.messages.length - 1].content, 'next week'); return { tool_calls: [call('finish', { fields: { leave_type: 'annual', days: 5 } })] }; }]);
+    let t = await r.eng.start('leave', {});
+    assert.strictEqual(t.await.slot, '#agent');
+    t = await r.eng.input(t.sessionId, { value: 'next week' });
+    assert.strictEqual(t.await.nodeId, 'review');
+    const loop = Array.from({ length: 10 }, () => ({ tool_calls: [call('get_balance', { emp_id: 'E1' })] }));
+    r = engine(loop, { agent: { limits: { maxSteps: 6, maxCallsPerTurn: 3 } } });
+    t = await r.eng.start('leave', {});
+    assert.match(texts(t), /still working on it/);
+    assert.deepStrictEqual(t.await.input.options.map((o) => o.value), ['continue']);
+    t = await r.eng.input(t.sessionId, { value: 'continue' });
+    assert.match(texts(t), /Please use the leave form/);                     // step limit -> onError
+  });
+  await test('Edit of an agent field asks for it directly and does not rerun the agent', async () => {
+    const { eng } = engine([{ tool_calls: [call('finish', { fields: { leave_type: 'annual', days: 2 } })] }]);
+    let t = await eng.start('leave', {});
+    t = await eng.input(t.sessionId, { command: 'edit', slot: 'days' });
+    assert.match(texts(t), /What should Days be\?/);
+    assert.strictEqual(t.await.input.kind, 'number');
+    t = await eng.input(t.sessionId, { value: '4' });
+    assert.strictEqual(t.await.nodeId, 'review');                            // replay skipped the finished agent
+    assert.strictEqual(eng.getState(t.sessionId).slots.days, 4);
+  });
+  await test('JSON tool mode for models without native tool calling', async () => {
+    const seen = [];
+    const steps = [
+      { content: '```json\n{"tool": "ask_user", "args": {"question": "How many days?", "field": "days"}}\n```' },
+      (req) => { assert.match(req.messages[req.messages.length - 1].content, /^Result of ask_user: \{"answer":2\}/);
+                 return { content: '{"tool": "finish", "args": {"fields": {"leave_type": "sick", "days": 2}}}' }; }
+    ];
+    const { eng } = engine([], { opts: { aiProviders: { llm: { toolMode: 'json', call: scripted(steps, seen) } } } });
+    let t = await eng.start('leave', {});
+    assert.strictEqual(seen[0].tools, undefined);
+    assert.match(seen[0].messages[0].content, /Reply with exactly one JSON object/);
+    t = await eng.input(t.sessionId, { value: '2' });
+    assert.strictEqual(t.await.nodeId, 'review');
+  });
+  await test('tools the node does not list are refused', async () => {
+    const { eng, log } = engine([
+      { tool_calls: [call('save', {})] },
+      (req) => { assert.match(lastTool(req).error, /Unknown tool/); return { tool_calls: [call('finish', { fields: { leave_type: 'sick', days: 1 } })] }; }
+    ], { agent: { tools: [] } });
+    await eng.start('leave', {});
+    assert.strictEqual(log.saved, null);
+  });
+  console.log(passed + ' passed');
+})();

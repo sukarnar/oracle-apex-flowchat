@@ -49,6 +49,14 @@
           { id: 'lookup_customer', type: 'PLSQL', description: 'Prefills name for known customers' },
           { id: 'send_code', type: 'PLSQL', description: 'Verify step: delivers a one-time code (demo writes to FC_DEMO_OUTBOX)' }
         ],
+        // 15_ai_tables.sql: example registries (FC_AI_PROVIDERS, FC_AI_TOOLS, FC_AI_SKILLS)
+        ai: {
+          providers: [{ id: 'corp_gpt_oss', model: 'openai/gpt-oss-120b', toolMode: 'native', description: 'GPT OSS 120B (internal vLLM)' },
+                      { id: 'corp_gemma', model: 'gemma-4-31b', toolMode: 'json', description: 'Gemma 4 31B (JSON tool mode)' }],
+          tools: [{ id: 'get_leave_balance', type: 'connector', target: 'leave_balance', description: 'Leave balance (days) of an employee by type', write: false },
+                  { id: 'book_leave', type: 'connector', target: 'book_leave', description: 'Books leave for the signed-in user', write: true }],
+          skills: [{ id: 'leave_policy', name: 'Leave policy', description: 'Rules for annual and sick leave' }]
+        },
         // 12_lov_demo.sql (FC_LOVS); options come from demo/demo-lovs.js
         lovs: [
           { id: 'branches', type: 'SQL', description: 'Demo: branches in one country (parameter: country)', params: ['country'],
@@ -96,7 +104,7 @@
 
   var PORTS = ['next', 'else', 'onNotFound', 'onSuccess', 'onError', 'found', 'notFound', 'tooMany', 'cancelled',
                'done', 'noChanges', 'saved', 'conflict', 'forbidden', 'error', 'verified', 'failed', 'none', 'partial'];
-  var TYPES = ['message', 'ask', 'condition', 'lookup', 'summary', 'submit', 'end', 'verify', 'findRecord', 'changeFields', 'saveChanges', 'repeat', 'bulkUpdate', 'set', 'menu', 'email'];
+  var TYPES = ['message', 'ask', 'condition', 'lookup', 'summary', 'submit', 'end', 'verify', 'findRecord', 'changeFields', 'saveChanges', 'repeat', 'bulkUpdate', 'set', 'menu', 'email', 'agent'];
   function validationErrors(def) {
     var errs = [], ids = {};
     if (!/^[a-z0-9_]{1,100}$/.test(def.flowId || '')) errs.push('flowId must be lowercase letters, digits and _');
@@ -111,6 +119,7 @@
     def.nodes.forEach(function (n) {
       PORTS.forEach(function (p) { if (n[p] && !ids[n[p]]) errs.push(n.id + '.' + p + ' points to missing node "' + n[p] + '"'); });
       (n.branches || []).forEach(function (b, i) { if (b.next && !ids[b.next]) errs.push(n.id + '.branch' + (i + 1) + ' points to missing node "' + b.next + '"'); });
+      if (n.type === 'agent') (n.exits || []).forEach(function (e, i) { if (e.next && !ids[e.next]) errs.push(n.id + '.exit' + (i + 1) + ' points to missing node "' + e.next + '"'); });
       if (n.type === 'menu') (n.options || []).forEach(function (o, i) { if (o.next && !ids[o.next]) errs.push(n.id + '.option' + (i + 1) + ' points to missing node "' + o.next + '"'); });
     });
     return errs.join('; ');
@@ -185,6 +194,7 @@
     },
     sampleRows: function (db, p) { return clone(db.rows[p.id] || []).slice(0, p.limit || 20); },
     listConnectors: function (db) { return clone(db.connectors); },
+    listAi: function (db) { return clone(db.ai || { providers: [], tools: [], skills: [] }); },
     listLovs: function (db) { return clone(db.lovs || []); },
     lovOptions: function (db, p) {
       var l = (db.lovs || []).find(function (x) { return x.id === p.id; });

@@ -48,7 +48,8 @@
         { "$ref": "#/$defs/verify" },
         { "$ref": "#/$defs/findRecord" }, { "$ref": "#/$defs/changeFields" }, { "$ref": "#/$defs/saveChanges" },
         { "$ref": "#/$defs/repeat" }, { "$ref": "#/$defs/bulkUpdate" }, { "$ref": "#/$defs/set" }, { "$ref": "#/$defs/menu" },
-        { "$ref": "#/$defs/email" }
+        { "$ref": "#/$defs/email" },
+        { "$ref": "#/$defs/agent" }
       ]
     },
 
@@ -69,6 +70,42 @@
             "next": { "$ref": "#/$defs/id" } } } }
       },
       "required": ["options"]
+    },
+
+    "agent": {
+      "description": "A model-driven step that works toward a goal: asks the user questions (rendered and checked by FlowChat), calls registered tools and skills, then fills its output fields (next), hands off to an exit, or fails (onError). The loop runs in FC_ENGINE; providers, tools and skills live in FC_AI_PROVIDERS, FC_AI_TOOLS and FC_AI_SKILLS.",
+      "properties": {
+        "type": { "const": "agent" },
+        "provider": { "type": "string", "description": "FC_AI_PROVIDERS id (JS engine: options.aiProviders key)" },
+        "goal": { "type": "string", "description": "The task; may use {{placeholders}}" },
+        "instructions": { "type": "string" },
+        "intro": { "type": "string", "description": "Said when the agent starts" },
+        "inputs": { "type": "array", "items": { "type": "string" }, "description": "Slots, alias.field or context.<name> values the model may see (PII is hidden unless sendPii)" },
+        "sendPii": { "type": "boolean", "default": false },
+        "tools": { "type": "array", "items": { "type": "string" }, "description": "FC_AI_TOOLS ids the agent may call; write tools ask the user to confirm first" },
+        "skills": { "type": "array", "items": { "type": "string" }, "description": "FC_AI_SKILLS ids the agent may load" },
+        "outputs": { "type": "array", "items": { "type": "object", "required": ["name"], "properties": {
+          "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,99}$", "description": "The slot it fills" },
+          "label": { "type": "string" }, "description": { "type": "string", "description": "Hint for the model" },
+          "kind": { "enum": ["text", "number", "date", "email", "yesno", "choice"], "default": "text" },
+          "required": { "type": "boolean", "default": true },
+          "options": { "type": "array", "items": { "type": ["string", "object"] } },
+          "min": { "type": "number" }, "max": { "type": "number" },
+          "minDate": { "type": "string" }, "maxDate": { "type": "string" },
+          "minLength": { "type": "integer" }, "maxLength": { "type": "integer" } } } },
+        "exits": { "type": "array", "items": { "type": "object", "required": ["name", "next"], "properties": {
+          "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,49}$" }, "description": { "type": "string" },
+          "next": { "$ref": "#/$defs/id" } } } },
+        "limits": { "type": "object", "properties": {
+          "maxSteps": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+          "maxQuestions": { "type": "integer", "minimum": 0, "maximum": 50, "default": 10 },
+          "maxCallsPerTurn": { "type": "integer", "minimum": 1, "maximum": 20, "default": 4 } } },
+        "errorMessage": { "type": "string" },
+        "continueText": { "type": "string" },
+        "next": { "$ref": "#/$defs/id" },
+        "onError": { "$ref": "#/$defs/id" }
+      },
+      "required": ["provider", "goal"]
     },
 
     "email": {

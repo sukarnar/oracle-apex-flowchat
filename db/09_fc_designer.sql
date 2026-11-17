@@ -120,7 +120,7 @@ create or replace package body fc_designer as
     l_ports  constant sys.odcivarchar2list := sys.odcivarchar2list(
                'next', 'else', 'onNotFound', 'onSuccess', 'onError', 'found', 'notFound', 'tooMany', 'cancelled',
                'done', 'noChanges', 'saved', 'conflict', 'forbidden', 'error', 'verified', 'failed', 'none', 'partial');
-    l_types  constant varchar2(200) := ',message,ask,condition,lookup,summary,submit,end,verify,findRecord,changeFields,saveChanges,repeat,bulkUpdate,set,menu,email,';
+    l_types  constant varchar2(200) := ',message,ask,condition,lookup,summary,submit,end,verify,findRecord,changeFields,saveChanges,repeat,bulkUpdate,set,menu,email,agent,';
     procedure err (p in varchar2) is
     begin
       if length(l_errs) > 3500 then return; end if;
@@ -152,6 +152,12 @@ create or replace package body fc_designer as
         l_br := l_n.get_array('branches');
         for b in 0 .. l_br.get_size - 1 loop
           check_target(jstr(l_n, 'id') || '.branch' || (b + 1), jstr(treat(l_br.get(b) as json_object_t), 'next'));
+        end loop;
+      end if;
+      if jstr(l_n, 'type') = 'agent' and l_n.has('exits') and l_n.get('exits').is_array then
+        l_br := l_n.get_array('exits');
+        for b in 0 .. l_br.get_size - 1 loop
+          check_target(jstr(l_n, 'id') || '.exit' || (b + 1), jstr(treat(l_br.get(b) as json_object_t), 'next'));
         end loop;
       end if;
       if jstr(l_n, 'type') = 'menu' and l_n.has('options') and l_n.get('options').is_array then
@@ -479,6 +485,45 @@ create or replace package body fc_designer as
     return ok(l_arr);
   end list_connectors;
 
+  -- Agent registries: providers (no URLs or credentials), tools and skills (no content).
+  function list_ai return clob is
+    l_res json_object_t := json_object_t();
+    l_arr json_array_t;
+    l_o   json_object_t;
+  begin
+    l_arr := json_array_t();
+    for p in (select provider_id, model, tool_mode, description from fc_ai_providers where enabled = 'Y' order by provider_id) loop
+      l_o := json_object_t();
+      l_o.put('id', p.provider_id);
+      l_o.put('model', p.model);
+      l_o.put('toolMode', p.tool_mode);
+      l_o.put('description', p.description);
+      l_arr.append(l_o);
+    end loop;
+    l_res.put('providers', l_arr);
+    l_arr := json_array_t();
+    for t in (select tool_id, tool_type, target, description, is_write from fc_ai_tools where enabled = 'Y' order by tool_id) loop
+      l_o := json_object_t();
+      l_o.put('id', t.tool_id);
+      l_o.put('type', lower(t.tool_type));
+      l_o.put('target', t.target);
+      l_o.put('description', t.description);
+      l_o.put('write', t.is_write = 'Y');
+      l_arr.append(l_o);
+    end loop;
+    l_res.put('tools', l_arr);
+    l_arr := json_array_t();
+    for k in (select skill_id, name, description from fc_ai_skills where enabled = 'Y' order by skill_id) loop
+      l_o := json_object_t();
+      l_o.put('id', k.skill_id);
+      l_o.put('name', k.name);
+      l_o.put('description', k.description);
+      l_arr.append(l_o);
+    end loop;
+    l_res.put('skills', l_arr);
+    return ok(l_res);
+  end list_ai;
+
   -- Lookup lists, with the parameters each SQL list binds (:NAME other than :APP_USER / :FC_VERIFIED).
   function list_lovs return clob is
     l_arr   json_array_t := json_array_t();
@@ -545,6 +590,7 @@ create or replace package body fc_designer as
       when 'describeTable'  then return describe_table(l_in);
       when 'sampleRows'     then return sample_rows(l_in);
       when 'listConnectors' then return list_connectors;
+      when 'listAi'         then return list_ai;
       when 'listLovs'       then return list_lovs;
       when 'lovOptions'     then return lov_options(l_in);
       else raise_application_error(-20055, 'Unknown designer action "' || p_action || '".');

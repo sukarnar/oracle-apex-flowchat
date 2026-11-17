@@ -17,6 +17,7 @@ widget/     flowchat.js              <flow-chat> Web Component + transports + ad
 db/         install.sql              first-time install: runs 01..07, 09..12 in order (08 ORDS is optional)
             upgrade_phase_d.sql      upgrades an existing install with Phase D: Verify step, lookup lists (keeps your data)
             upgrade_phase_e.sql      upgrades with Phase E: versions, resume, debug, PII masking, Repeat, Bulk update, files
+            upgrade_phase_f.sql      upgrades with Phase F: Agent node (FC_AI_PROVIDERS, FC_AI_TOOLS, FC_AI_SKILLS)
             reinstall_packages.sql   re-creates FC_DATA, FC_ENGINE, FC_DESIGNER only (upgrades, compile fixes)
             01_tables.sql            FC_FLOWS, FC_FLOW_VERSIONS, FC_CONNECTORS, FC_SESSIONS, FC_EVENTS, FC_FILES
             02_data_sources.sql      FC_DATA_SOURCES (+ fields) registry tables
@@ -33,6 +34,7 @@ db/         install.sql              first-time install: runs 01..07, 09..12 in 
             12_lov_demo.sql          FC_DEMO_BRANCHES and the lookup lists "countries" and "branches"
             13_seed_loan_flow.sql    generated: publishes loan_application with the country and branch lists
             14_seed_expense_flow.sql FC_DEMO_EXPENSES.submit_claim connector + publishes expense_claim
+            15_ai_tables.sql         FC_AI_PROVIDERS, FC_AI_TOOLS, FC_AI_SKILLS (Agent node registries)
 demo/       index.html               create demo (runs in the browser using the JS engine)
             update.html              search and update demo, with a live table and a conflict button
             verify.html              public-page demo: one-time code first, with an in-page outbox
@@ -48,6 +50,7 @@ tests/      engine.test.js           node tests/engine.test.js
             set.test.js              node tests/set.test.js (Set values node, context variables)
             menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
             email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
+            agent.test.js            node tests/agent.test.js (Agent node, scripted model: questions, tools, confirm, finish, handoff, limits, JSON mode)
             apex-embed-test.html     designer inside a page-wide form, like APEX
             apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
             fake-apex-backend.js     emulates the FC_DESIGNER Ajax protocol in the browser (testing only)
@@ -619,6 +622,140 @@ addLabel, doneLabel`) or `confirm` (`confirmLabel, cancelLabel, danger`); an `as
 `{"command": "add"}`, `{"command": "remove", "index": 0}`, `{"command": "confirm"}`, `{"command": "cancel"}`
 and `{"file": {"name", "mimeType", "data"}}`.
 
+## 8. Agent node (AI)
+
+An **Agent** step works toward a goal with a language model. It asks the user questions, calls the
+tools and skills you allow, and then fills fields, hands off to another step, or gives up. The loop
+runs inside FC_ENGINE, so APEX session security, row filters, `app_user` and logging all apply.
+
+```json
+{ "id": "leave_agent", "type": "agent", "provider": "corp_gpt_oss",
+  "goal": "Help {{app_user}} apply for leave: check their balance and the policy, then collect the leave type and days.",
+  "intro": "Let me help you with your leave request.",
+  "inputs": ["context.emp_id"], "tools": ["get_leave_balance", "book_leave"], "skills": ["leave_policy"],
+  "outputs": [ { "name": "leave_type", "label": "Leave type", "kind": "choice", "options": ["annual", "sick"] },
+               { "name": "start_date", "label": "First day", "kind": "date" },
+               { "name": "days", "label": "Days", "kind": "number", "min": 0.5, "max": 30 } ],
+  "exits": [ { "name": "payslip", "description": "the user asks about payslips", "next": "payslip_menu" } ],
+  "limits": { "maxSteps": 20, "maxQuestions": 10, "maxCallsPerTurn": 4 },
+  "next": "review", "onError": "manual_form" }
+```
+
+**How it talks and finishes.**
+- **Questions:** the model asks with `ask_user`. FlowChat renders the question (text, number, date,
+  email, yes/no, or choice pills) and checks the answer with the same parsing and limits as an Ask
+  node. A plain reply from the model is shown, and the user's free-text answer goes back to it.
+- **`finish`:** each output is checked like an answer (type, options, min/max). A bad value goes back
+  to the model to fix. Valid outputs become ordinary fields: they're shown in the Summary, can be
+  edited there (Edit asks for that one field directly; the agent isn't run again), and are sent
+  to Submit.
+- **Other endings:** `handoff` follows an exit. `give_up`, a model error or a limit goes to
+  `onError`; without it the conversation ends as failed.
+
+**The two ways of writing data:**
+- **Agent gathers, flow commits** (recommended): connect `next` to a Summary and a Submit node.
+- **Agent writes:** give it a tool with `IS_WRITE = 'Y'`. FlowChat shows a confirmation card
+  (Confirm / Cancel) before the tool runs, and the model can't skip it. Set `NEEDS_CONFIRM = 'N'`
+  only for harmless writes.
+
+### Set up a model provider (APEX 23.2: direct REST, no APEX_AI)
+
+1. **Serve the model** on an OpenAI-style endpoint (`/v1/chat/completions`), for example vLLM or
+   Ollama. Turn on tool calling (in vLLM, `--enable-auto-tool-choice` with the tool-call parser
+   for that model family).
+2. **Allow the host** (as ADMIN):
+   ```sql
+   begin
+     dbms_network_acl_admin.append_host_ace(host => 'llm.corp.local', lower_port => 443, upper_port => 443,
+       ace => xs$ace_type(privilege_list => xs$name_list('http'), principal_name => 'APEX_230200',
+                          principal_type => xs_acl.ptype_db));
+   end;
+   /
+   ```
+3. **Certificates:** put the corporate root CA (and, for mutual TLS, the client certificate) in an
+   auto-login Oracle wallet. Set the provider's `WALLET_PATH` (e.g. `file:/u01/wallets/llm`), or
+   leave it null to use the APEX instance wallet.
+4. **API key:** create an APEX **Web Credential** (Workspace Utilities > Web Credentials):
+   - type *HTTP Header*, name `Authorization`, secret `Bearer <key>`;
+   - *Valid for URLs* set to the base URL.
+
+   Put its static id in `CREDENTIAL_ID`. The key never appears in a flow or in FlowChat tables.
+5. **Register the provider:**
+   ```sql
+   insert into fc_ai_providers (provider_id, base_url, model, credential_id, wallet_path, tool_mode, description)
+   values ('corp_gpt_oss', 'https://llm.corp.local/v1', 'openai/gpt-oss-120b', 'LLM_API_KEY', null, 'native',
+           'GPT OSS 120B');
+   ```
+   - Other columns: `TEMPERATURE` (0.2), `MAX_TOKENS` (1024), `TIMEOUT_SECS` (120), and
+     `EXTRA_HEADERS` (JSON, e.g. a gateway's tenant header).
+   - **`TOOL_MODE = 'json'`** is for a model whose tool calling is unreliable on your server. The
+     engine then asks for one JSON object per reply and parses it itself.
+
+**Which model:** start with GPT OSS 120B or Llama 3.3 70B in `native` mode. Gemma 4 26B/31B work
+well for small toolsets (5–8 tools); if their tool calls misbehave on your server, register them with
+`TOOL_MODE = 'json'`.
+
+### Tools and skills
+
+```sql
+insert into fc_ai_tools (tool_id, tool_type, target, description, parameters)
+values ('get_leave_balance', 'CONNECTOR', 'leave_balance', 'Leave balance (days) of an employee by type',
+        '{"type":"object","properties":{"emp_id":{"type":"string"}},"required":["emp_id"]}');
+insert into fc_ai_tools (tool_id, tool_type, target, description, parameters, is_write, confirm_text)
+values ('book_leave', 'CONNECTOR', 'book_leave', 'Book leave for the signed-in user',
+        '{"type":"object","properties":{"leave_type":{"type":"string"},"start_date":{"type":"string"},"days":{"type":"number"}}}',
+        'Y', 'Book {{days}} days of {{leave_type}} leave from {{start_date}}?');
+insert into fc_ai_skills (skill_id, name, description, content)
+values ('leave_policy', 'Leave policy', 'Rules for annual and sick leave', 'Annual leave needs two weeks notice ...');
+```
+
+**Tool types:**
+- **CONNECTOR** gets the usual connector payload (`slots`, `context`, `appUser` from the APEX
+  session) plus `tool` and `args`.
+- **LOV** returns the options of an FC_LOVS list; `args` are its parameters.
+- **SEARCH** searches an FC_DATA source. Its row filter applies; `args` are `{field: value}` or
+  `{"criteria": [...]}`, and at most `MAX_ROWS` rows (up to 50) come back.
+
+A tool runs only if the node lists it, and its result reaches the model cut to 8,000 characters.
+**Skills** load in stages: the prompt carries only each skill's name and description, and the
+model calls `load_skill` for the full text.
+
+### Guardrails
+
+- **What the model sees:** the goal, the instructions, the `inputs` you tick, `app_user` and
+  today's date. PII values (`"pii"` answers and `piiSlots`) are sent as `(hidden)` unless
+  `sendPii` is true. The system prompt tells the model that user and tool text is data, not
+  instructions. Even so, what it can do is limited by the tools you register, not by the prompt.
+- **What the model can't do:** it never writes SQL or creates nodes that persist. Questions it
+  asks exist only for that conversation, and their answers are checked by FlowChat.
+- **Limits:**
+  - `maxSteps` caps model calls in total (default 20).
+  - `maxQuestions` caps questions to the user (default 10).
+  - `maxCallsPerTurn` caps model calls per request (default 4); after that the user sees a
+    **Continue** button, so a request never runs past APEX's time limits.
+- **Logging:** with debug on, each model call, tool call, handoff and failure is logged (event
+  `agent`, `agentDone`, `agentFailed`) with PII masked. The conversation itself is kept in the
+  session state.
+- **Replays:** when an Edit replays the flow, a finished agent isn't run again.
+
+### Design and test
+
+- **In the designer:** the **Agent** palette item edits the provider (picked from FC_AI_PROVIDERS),
+  the goal, the fields, the values it sees, tools, skills, exits and limits. The checklist flags
+  unknown providers, tools and skills.
+- **Testing:** the Test tab never calls a real model. Each agent replays an editable **script**
+  (`[{"tool": "ask_user", "args": {...}}, {"tool": "finish", "args": {"fields": {...}}}]`), and
+  each tool returns a JSON mock, so tests behave the same every run. Test against the real model
+  on an APEX page.
+- **JavaScript engine:** pass `aiProviders`, `aiTools` and `aiSkills` to `createEngine`.
+  `FlowChatEngine.openAIProvider({baseUrl, model, apiKey, fetchOptions})` builds a provider for
+  Node.js; pass a certificate through `fetchOptions` (an undici Agent with `ca`, `cert` and `key`).
+
+**Install:**
+- On an existing install, run `@upgrade_phase_f.sql`. It creates the three tables and recompiles
+  the packages.
+- On a new instance, `install.sql` includes them.
+
 ## Turn protocol
 
 The server and the widget exchange exactly one JSON shape. Any backend that produces it works with the widget.
@@ -635,10 +772,13 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 75 unit tests (`tests/engine.test.js`,
+- The JavaScript engine and widget are tested: 83 unit tests (`tests/engine.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
-  `tests/email.test.js`), plus manual end-to-end runs of the demos.
+  `tests/email.test.js`, `tests/agent.test.js`), plus manual end-to-end runs of the demos.
+- **The Agent node's PL/SQL (the `ag_*` routines in `FC_ENGINE`, `15_ai_tables.sql`, `list_ai` in
+  `FC_DESIGNER`) has not been compiled or run against a real model yet.** It mirrors the tested
+  JavaScript engine.
 - **The Email node's PL/SQL (`run_email` in `FC_ENGINE`) has not been compiled or sent a real email
   yet.** It mirrors the tested JavaScript engine.
 - **The Phase E PL/SQL (`FC_ENGINE`, `01_tables.sql`, `upgrade_phase_e.sql`, `14_seed_expense_flow.sql`)

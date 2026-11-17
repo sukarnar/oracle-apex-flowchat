@@ -130,6 +130,8 @@
                  make: (id) => ({ id, type: 'summary', text: "Here's what I have. Please check:", confirmLabel: 'Confirm & submit' }) },
     submit:    { label: 'Submit',    color: '#16a34a', desc: 'Re-validate everything and save via a connector.',
                  make: (id) => ({ id, type: 'submit', connector: '' }) },
+    agent:     { label: 'Agent',     color: '#0f766e', desc: 'An AI agent works toward a goal: asks questions, uses tools and skills, then fills fields or hands off.',
+                 make: (id) => ({ id, type: 'agent', provider: '', goal: '', outputs: [] }) },
     email:     { label: 'Email',     color: '#ea580c', desc: 'Send an email built from the answers (APEX_MAIL, or a connector).',
                  make: (id) => ({ id, type: 'email', to: '', from: '', subject: '', body: '' }) },
     end:       { label: 'End',       color: '#475569', desc: 'Finish the conversation.',
@@ -324,6 +326,9 @@
       case 'lookup': return [{ key: 'next', label: 'next' }, { key: 'onNotFound', label: 'not found', optional: true }];
       case 'submit': return [{ key: 'onSuccess', label: 'success' }, { key: 'onError', label: 'error', optional: true }];
       case 'email': return [{ key: 'next', label: 'sent' }, { key: 'onError', label: 'error', optional: true }];
+      case 'agent': return [{ key: 'next', label: 'finished' }]
+        .concat((n.exits || []).map((e, i) => ({ key: 'exit:' + i, label: e.name || 'exit ' + (i + 1) })))
+        .concat([{ key: 'onError', label: 'error', optional: true }]);
       case 'verify': return [{ key: 'verified', label: 'verified' }, { key: 'failed', label: 'failed', optional: true }];
       case 'findRecord': return [{ key: 'found', label: 'found' }, { key: 'notFound', label: 'not found' },
         { key: 'tooMany', label: 'too many', optional: true }, { key: 'cancelled', label: 'none of these', optional: true }];
@@ -345,9 +350,15 @@
   function getPort(n, key) {
     if (key.indexOf('branch:') === 0) { const b = (n.branches || [])[+key.slice(7)]; return b && b.next; }
     if (key.indexOf('option:') === 0) { const o = (n.options || [])[+key.slice(7)]; return o && o.next; }
+    if (key.indexOf('exit:') === 0) { const e = (n.exits || [])[+key.slice(5)]; return e && e.next; }
     return n[key];
   }
   function setPort(n, key, target) {
+    if (key.indexOf('exit:') === 0) {
+      const e = (n.exits || [])[+key.slice(5)];
+      if (e) { if (target) e.next = target; else delete e.next; }
+      return;
+    }
     if (key.indexOf('option:') === 0) {
       const o = (n.options || [])[+key.slice(7)];
       if (o) { if (target) o.next = target; else delete o.next; }
@@ -409,7 +420,7 @@
   }
   function knownSlots() {
     const s = askSlots();
-    menuSlots().concat(setSlots(), contextNames()).forEach((k) => { if (s.indexOf(k) < 0) s.push(k); });
+    menuSlots().concat(agentSlots(), setSlots(), contextNames()).forEach((k) => { if (s.indexOf(k) < 0) s.push(k); });
     contextNames().forEach((k) => { if (s.indexOf('context.' + k) < 0) s.push('context.' + k); });
     repeatNodes().forEach((n) => { [n.slot, n.slot + '.count'].forEach((k) => { if (s.indexOf(k) < 0) s.push(k); }); });
     Object.keys(S.flow.bindings || {}).forEach((k) => { if (s.indexOf(k) < 0) s.push(k); });
@@ -523,6 +534,11 @@
       ['text', 'prompt', 'to', 'cc', 'bcc', 'replyTo', 'from', 'subject', 'body', 'message', 'errorMessage']
         .forEach((k) => { if (typeof n[k] === 'string') n[k] = n[k].replace(re, '{{' + newSlot + '}}'); });
       if (n.type === 'email' && n.attachments) n.attachments = n.attachments.map((s) => (s === oldSlot ? newSlot : s));
+      if (n.type === 'agent') {
+        (n.outputs || []).forEach((o) => { if (o.name === oldSlot) o.name = newSlot; });
+        if (n.inputs) n.inputs = n.inputs.map((s) => (s === oldSlot ? newSlot : s));
+        ['goal', 'instructions', 'intro', 'errorMessage'].forEach((k) => { if (typeof n[k] === 'string') n[k] = n[k].replace(re, '{{' + newSlot + '}}'); });
+      }
       (n.branches || []).forEach((b) => fixCond(b.when));
       if (n.type === 'summary' && n.fields) n.fields = n.fields.map((s) => (s === oldSlot ? newSlot : s));
       (n.criteria || []).forEach((c) => { if (c.slot === oldSlot) c.slot = newSlot; });
@@ -855,6 +871,35 @@
         case 'lookup': case 'submit':
           if (!n.connector) add('error', TYPES[n.type].label + ' has no connector.', n.id);
           break;
+        case 'agent': {
+          if (!n.provider) add('error', 'Agent has no model provider.', n.id);
+          else if (BACKEND && S.ai && !S.ai.providers.some((p) => p.id === n.provider)) add('error', 'Provider "' + n.provider + '" is not in FC_AI_PROVIDERS (or not enabled).', n.id);
+          if (!String(n.goal || '').trim()) add('error', 'Agent has no task (goal).', n.id);
+          placeholders(n.goal, n.id); placeholders(n.instructions, n.id); placeholders(n.intro, n.id);
+          const seenOut = {};
+          (n.outputs || []).forEach((o, i) => {
+            if (!o.name) { add('error', 'Field ' + (i + 1) + ' has no name.', n.id); return; }
+            if (o.name === BUILTIN_USER) add('error', '"' + BUILTIN_USER + '" is set by the server and can\'t be changed.', n.id);
+            else if (!/^[a-z][a-z0-9_]{0,99}$/.test(o.name)) add('error', 'Field name "' + o.name + '" must be lowercase letters, digits and _.', n.id);
+            if (seenOut[o.name]) add('error', 'Two fields are named "' + o.name + '".', n.id);
+            seenOut[o.name] = true;
+            if (o.kind === 'choice' && !(o.options || []).length) add('error', 'Choice field "' + o.name + '" has no options.', n.id);
+          });
+          if (!(n.outputs || []).length && !(n.exits || []).length) add('warning', 'The agent fills no fields and has no exits; it can only finish without results.', n.id);
+          const seenEx = {};
+          (n.exits || []).forEach((e, i) => {
+            if (!e.name || !/^[a-z][a-z0-9_]{0,49}$/.test(e.name)) add('error', 'Exit ' + (i + 1) + ' needs a name of lowercase letters, digits and _.', n.id);
+            else if (seenEx[e.name]) add('error', 'Two exits are named "' + e.name + '".', n.id);
+            seenEx[e.name] = true;
+            if (!e.next) add('warning', 'Exit "' + (e.name || i + 1) + '" goes nowhere.', n.id);
+          });
+          (n.inputs || []).forEach((k) => { if (slots.indexOf(k) < 0) add('warning', 'The agent sees "' + k + '", which the flow never sets.', n.id); });
+          if (BACKEND && S.ai) {
+            (n.tools || []).forEach((t) => { if (!S.ai.tools.some((x) => x.id === t)) add('error', 'Tool "' + t + '" is not in FC_AI_TOOLS (or not enabled).', n.id); });
+            (n.skills || []).forEach((t) => { if (!S.ai.skills.some((x) => x.id === t)) add('error', 'Skill "' + t + '" is not in FC_AI_SKILLS (or not enabled).', n.id); });
+          }
+          break;
+        }
         case 'email': {
           if (!String(n.to || '').trim()) add('error', 'Email has no recipient (To).', n.id);
           if (!String(n.subject || '').trim()) add('error', 'Email has no subject.', n.id);
@@ -1077,7 +1122,7 @@
   // ======================================================================== canvas
   let canvas, world, nodesEl, edgeLayer;
 
-  function nodeWidth(n) { return Math.max(NODE_W, ports(n).length * (n.type === 'menu' ? 132 : 96)); }
+  function nodeWidth(n) { return Math.max(NODE_W, ports(n).length * (n.type === 'menu' || n.type === 'agent' ? 120 : 96)); }
 
   function nodeSummary(n) {
     switch (n.type) {
@@ -1085,6 +1130,7 @@
       case 'condition': return (n.branches || []).length ? null : 'No branches yet';
       case 'menu': return (n.options || []).length ? (n.prompt || '') : 'No options yet';
       case 'lookup': case 'submit': return n.connector ? 'Calls ' + n.connector : '';
+      case 'agent': return n.goal ? (n.provider ? '[' + n.provider + '] ' : '') + n.goal : 'No task yet';
       case 'email': return n.to ? 'To ' + n.to + (n.subject ? ': ' + n.subject : '') : 'No recipient yet';
       case 'verify': return n.slot ? 'Send a code to ' + n.slot + (n.connector ? ' via ' + n.connector : '') : '';
       case 'findRecord': return n.source ? (n.requireVerified ? '\uD83D\uDD12 ' : '') + 'Search ' + n.source + (n.as ? ' → ' + n.as : '') : '';
@@ -1456,9 +1502,9 @@
     );
     const editors = { message: textEditor, end: textEditor, ask: askEditor, condition: condEditor, lookup: connEditor, submit: connEditor,
                       summary: summaryEditor, verify: verifyEditor, findRecord: findEditor, changeFields: changeEditor, saveChanges: saveEditor,
-                      repeat: repeatEditor, bulkUpdate: bulkEditor, set: setEditor, menu: menuEditor, email: emailEditor };
+                      repeat: repeatEditor, bulkUpdate: bulkEditor, set: setEditor, menu: menuEditor, email: emailEditor, agent: agentEditor };
     body.append(editors[n.type](n));
-    if (n.type !== 'condition' && n.type !== 'menu' && n.type !== 'end') {
+    if (n.type !== 'condition' && n.type !== 'menu' && n.type !== 'agent' && n.type !== 'end') {
       body.append(h('h4', { class: 'sub', text: 'Connections' }));
       const bulkTitles = { done: 'After updating, go to', cancelled: 'If the user cancels, go to' };
       ports(n).forEach((p) => body.append(F(n.type === 'summary' ? 'After confirm, go to'
@@ -2163,6 +2209,131 @@
     return wrap;
   }
 
+  // ---- agent
+  const AGENT_KINDS = [['text', 'Text'], ['number', 'Number'], ['date', 'Date'], ['email', 'Email'], ['yesno', 'Yes / no'], ['choice', 'Choice']];
+  function aiCat() { return S.ai || { providers: [], tools: [], skills: [] }; }
+  function agentSlots() {
+    const out = [];
+    S.flow.nodes.forEach((n) => { if (n.type === 'agent') (n.outputs || []).forEach((o) => { if (o && o.name && out.indexOf(o.name) < 0) out.push(o.name); }); });
+    return out;
+  }
+  function idList(label, all, chosen, onToggle, hint) {
+    const box = h('div', { class: 'card' }, h('div', { class: 'card-h', text: label }));
+    const ids = all.map((x) => x.id);
+    chosen.forEach((id) => { if (ids.indexOf(id) < 0) all = all.concat([{ id, description: BACKEND ? '(not in the database registry)' : '(mocked in Test)', missing: true }]); });
+    if (!all.length) box.append(h('p', { class: 'hint', text: hint }));
+    all.forEach((x) => box.append(checkbox(x.id + (x.description ? ' — ' + x.description : '') + (x.write ? ' (writes; asks the user to confirm)' : ''),
+      chosen.indexOf(x.id) >= 0, (c) => onToggle(x.id, c))));
+    const add = h('input', { class: 'in mono', placeholder: 'add by id, then Enter' });
+    add.addEventListener('keydown', (e) => { if (e.key === 'Enter' && add.value.trim()) { e.preventDefault(); onToggle(add.value.trim(), true); } });
+    box.append(add);
+    return box;
+  }
+  function agentEditor(n) {
+    const wrap = h('div');
+    const cat = aiCat();
+    const provOpts = [['', 'provider…']].concat(cat.providers.map((p) => [p.id, p.id + (p.model ? ' (' + p.model + ')' : '')]));
+    if (n.provider && !cat.providers.some((p) => p.id === n.provider)) provOpts.push([n.provider, n.provider + (BACKEND ? ' (not in FC_AI_PROVIDERS)' : '')]);
+    wrap.append(F('Model provider', sel(provOpts, n.provider || '', (v) => mutate(() => setOrDelete(n, 'provider', v), { panel: true }), { mono: true }),
+      'Registered in FC_AI_PROVIDERS (base URL, model, API key credential, wallet). The flow stores only this id.'));
+    const goal = bound(() => n.goal, (v) => setOrDelete(n, 'goal', v), { key: n.id + '.goal', multiline: true, rows: 4,
+      placeholder: 'Help {{app_user}} apply for leave: check their balance, collect the dates and leave type.' });
+    wrap.append(F('Task (goal)', goal), slotChips(goal));
+    const ins = bound(() => n.instructions, (v) => setOrDelete(n, 'instructions', v), { key: n.id + '.instr', multiline: true, rows: 3,
+      placeholder: 'Optional rules: tone, what to check first, what never to do.' });
+    wrap.append(F('Instructions (optional)', ins));
+    wrap.append(F('Opening message (optional)', bound(() => n.intro, (v) => setOrDelete(n, 'intro', v), { key: n.id + '.intro', placeholder: 'Let me help you with that.' })));
+
+    // outputs
+    wrap.append(h('h4', { class: 'sub', text: 'Fields the agent fills' }));
+    wrap.append(h('p', { class: 'hint', text: 'The agent ends by calling finish with these. Each is checked like an answer and saved as a field, so a Summary and Submit can follow (the agent gathers, the flow commits).' }));
+    const outs = n.outputs = n.outputs || [];
+    outs.forEach((o, i) => {
+      const kp = n.id + '.out' + i;
+      const card = h('div', { class: 'card' });
+      card.append(h('div', { class: 'card-h' }, h('span', { class: 'grow mono', text: o.name || 'field ' + (i + 1) }),
+        h('button', { class: 'x', text: '×', title: 'Remove', onclick: () => mutate(() => outs.splice(i, 1), { panel: true }) })));
+      const nameIn = h('input', { class: 'in mono', value: o.name || '', placeholder: 'leave_type' });
+      nameIn.addEventListener('change', () => mutate(() => { o.name = nameIn.value.trim(); }, { panel: true }));
+      card.append(h('div', { class: 'grid2' }, F('Field', nameIn),
+        F('Label', bound(() => o.label, (v) => setOrDelete(o, 'label', v), { key: kp + '.l', placeholder: 'Leave type' }))));
+      card.append(h('div', { class: 'grid2' },
+        F('Type', sel(AGENT_KINDS, o.kind || 'text', (v) => mutate(() => { o.kind = v; if (v !== 'choice') delete o.options; if (v !== 'number') { delete o.min; delete o.max; } }, { panel: true }))),
+        F('', checkbox('Required', o.required !== false, (c) => mutate(() => { if (c) delete o.required; else o.required = false; })))));
+      if (o.kind === 'choice') {
+        card.append(F('Options', bound(() => (o.options || []).map((x) => (typeof x === 'object' ? x.value : x)).join(', '),
+          (v) => { o.options = v.split(',').map((x) => x.trim()).filter(Boolean); }, { key: kp + '.o', placeholder: 'annual, sick, unpaid', onChange: true }),
+          'Comma separated. The agent must pick one of these.'));
+      }
+      if (o.kind === 'number') {
+        card.append(h('div', { class: 'grid2' },
+          F('Minimum', bound(() => o.min, (v) => setOrDelete(o, 'min', v === '' ? '' : Number(v)), { key: kp + '.min', type: 'number' })),
+          F('Maximum', bound(() => o.max, (v) => setOrDelete(o, 'max', v === '' ? '' : Number(v)), { key: kp + '.max', type: 'number' }))));
+      }
+      card.append(F('Hint for the model (optional)', bound(() => o.description, (v) => setOrDelete(o, 'description', v), { key: kp + '.d', placeholder: 'First day of leave' })));
+      wrap.append(card);
+    });
+    wrap.append(h('button', { class: 'lnk', text: '+ Add field', onclick: () => mutate(() => {
+      outs.push({ name: uniqueSlot('field'), label: 'New field', kind: 'text' });
+    }, { panel: true }) }));
+
+    // inputs
+    const known = knownSlots().filter((k) => k !== BUILTIN_USER && agentSlots().indexOf(k) < 0);
+    const inputs = n.inputs || [];
+    const inBox = h('div', { class: 'card' }, h('div', { class: 'card-h', text: 'Values the agent can see' }));
+    if (!known.length) inBox.append(h('p', { class: 'hint', text: 'No answers or context values yet. {{app_user}} and today\'s date are always shared.' }));
+    known.forEach((k) => inBox.append(checkbox(k, inputs.indexOf(k) >= 0, (c) => mutate(() => {
+      const cur = (n.inputs || []).filter((x) => x !== k);
+      if (c) cur.push(k);
+      if (cur.length) n.inputs = cur; else delete n.inputs;
+    }))));
+    inBox.append(checkbox('Send PII values to the model (otherwise they are replaced by "(hidden)")', !!n.sendPii,
+      (c) => mutate(() => { if (c) n.sendPii = true; else delete n.sendPii; })));
+    wrap.append(inBox);
+
+    // tools and skills
+    const toggle = (key) => (id, c) => mutate(() => {
+      const cur = (n[key] || []).filter((x) => x !== id);
+      if (c) cur.push(id);
+      if (cur.length) n[key] = cur; else delete n[key];
+    }, { panel: true });
+    wrap.append(idList('Tools it may use', cat.tools.slice(), n.tools || [], toggle('tools'),
+      BACKEND ? 'No tools in FC_AI_TOOLS yet.' : 'Tools come from FC_AI_TOOLS when the designer runs inside APEX. Add ids here to test them with mocks.'));
+    wrap.append(idList('Skills it may load', cat.skills.map((x) => ({ id: x.id, description: x.description || x.name })), n.skills || [], toggle('skills'),
+      BACKEND ? 'No skills in FC_AI_SKILLS yet.' : 'Skills come from FC_AI_SKILLS when the designer runs inside APEX.'));
+    wrap.append(h('p', { class: 'hint', text: 'Built in: ask_user (a question rendered and checked by FlowChat), finish, give_up, and handoff/load_skill when exits/skills are set.' }));
+
+    // connections
+    wrap.append(h('h4', { class: 'sub', text: 'Connections' }));
+    wrap.append(F('When finished, go to', targetSelect(n, 'next'), 'Usually a Summary, then Submit.'));
+    const exits = n.exits = n.exits || [];
+    exits.forEach((e, i) => {
+      const card = h('div', { class: 'card' });
+      card.append(h('div', { class: 'card-h' }, h('span', { class: 'grow', text: 'Exit ' + (i + 1) }),
+        h('button', { class: 'x', text: '×', title: 'Remove', onclick: () => mutate(() => exits.splice(i, 1), { panel: true }) })));
+      const nm = h('input', { class: 'in mono', value: e.name || '', placeholder: 'payslip' });
+      nm.addEventListener('change', () => mutate(() => { e.name = nm.value.trim(); }, { panel: true }));
+      card.append(h('div', { class: 'grid2' }, F('Name', nm),
+        F('When to use it', bound(() => e.description, (v) => setOrDelete(e, 'description', v), { key: n.id + '.x' + i, placeholder: 'payslip questions' }))));
+      card.append(F('Go to', targetSelect(n, 'exit:' + i)));
+      wrap.append(card);
+    });
+    wrap.append(h('button', { class: 'lnk', text: '+ Add exit (hand off to another step)', onclick: () => mutate(() => {
+      exits.push({ name: 'exit_' + (exits.length + 1) });
+    }, { panel: true }) }));
+    wrap.append(F('On error, go to', targetSelect(n, 'onError'), 'Used when the model fails, gives up or hits a limit. Without it the conversation ends as failed.'));
+    wrap.append(F('Error message', bound(() => n.errorMessage, (v) => setOrDelete(n, 'errorMessage', v), { key: n.id + '.err', placeholder: "Sorry, I couldn't complete this." })));
+
+    // limits
+    const lim = n.limits || {};
+    const limIn = (key, ph) => bound(() => lim[key], (v) => { n.limits = n.limits || {}; setOrDelete(n.limits, key, v === '' ? '' : Number(v)); if (!Object.keys(n.limits).length) delete n.limits; },
+      { key: n.id + '.lim' + key, type: 'number', placeholder: ph });
+    wrap.append(h('h4', { class: 'sub', text: 'Limits' }));
+    wrap.append(h('div', { class: 'grid2' }, F('Model calls in total', limIn('maxSteps', '20')), F('Questions to the user', limIn('maxQuestions', '10'))));
+    wrap.append(F('Model calls per turn', limIn('maxCallsPerTurn', '4'), 'Then the user sees a Continue button, so one request never runs too long.'));
+    return wrap;
+  }
+
   function menuEditor(n) {
     const wrap = h('div');
     const list = n.options = n.options || [];
@@ -2596,6 +2767,49 @@
     sender: [['Sent', { ok: true }], ['Sending fails', { ok: false, message: "Sorry, I couldn't send the code." }]],
     mailer: [['Sent', { ok: true }], ['Sending fails', { ok: false, message: "Sorry, I couldn't send the email." }]]
   };
+  // Agent test doubles: the Test tab never calls a real model. Each agent replays a script of steps,
+  // {"tool": name, "args": {...}} or {"reply": "text"}; its tools return the JSON mocks below.
+  const agentNodes = () => S.flow.nodes.filter((n) => n.type === 'agent');
+  function agentToolIds() {
+    const out = [];
+    agentNodes().forEach((n) => (n.tools || []).forEach((t) => { if (out.indexOf(t) < 0) out.push(t); }));
+    return out;
+  }
+  function defaultScript(n) {
+    const steps = (n.outputs || []).slice(0, 3).map((o) => ({ tool: 'ask_user', args: { question: (o.label || o.name) + '?', field: o.name } }));
+    steps.push({ tool: 'finish', args: { fields: {}, message: 'All set (test script).' } });
+    return JSON.stringify(steps, null, 2);
+  }
+  const scriptFor = (n) => (S.mocks['agent:' + n.id] !== undefined ? S.mocks['agent:' + n.id] : defaultScript(n));
+  const toolMockFor = (id) => (S.mocks['tool:' + id] !== undefined ? S.mocks['tool:' + id] : JSON.stringify({ ok: true }, null, 2));
+  function testAi() {
+    const providers = {}, tools = {}, skills = {}, cursor = {};
+    agentNodes().forEach((n) => {
+      if (!n.provider) return;
+      providers[n.provider] = (req) => {
+        const node = agentNodes().find((x) => x.id === req.nodeId);
+        let steps;
+        try { steps = JSON.parse(scriptFor(node)); } catch (e) { throw new Error('The test script for agent "' + req.nodeId + '" is not valid JSON.'); }
+        if (req.messages.length <= 2) cursor[req.nodeId] = 0;               // the agent started afresh
+        const st = steps[cursor[req.nodeId] = (cursor[req.nodeId] || 0)];
+        cursor[req.nodeId]++;
+        if (!st) return { content: null, tool_calls: [{ id: 'end', type: 'function', function: { name: 'give_up', arguments: '{"reason":"the test script ended"}' } }] };
+        if (st.tool) return { content: st.say || null, tool_calls: [{ id: 'c' + cursor[req.nodeId], type: 'function', function: { name: st.tool, arguments: JSON.stringify(st.args || {}) } }] };
+        return { content: String(st.reply || '') };
+      };
+    });
+    agentToolIds().forEach((id) => {
+      const reg = (aiCat().tools || []).find((t) => t.id === id) || {};
+      tools[id] = { description: reg.description || id, type: 'connector', target: 'tool:' + id,
+                    write: reg.id ? !!reg.write : S.mocks['toolw:' + id] === '1' };
+    });
+    agentNodes().forEach((n) => (n.skills || []).forEach((id) => {
+      const reg = (aiCat().skills || []).find((x) => x.id === id) || {};
+      skills[id] = { name: reg.name || id, description: reg.description || id, content: '(In the database this is the FC_AI_SKILLS text.)' };
+    }));
+    return { providers, tools, skills };
+  }
+
   const mockFor = (id, role) => (S.mocks[id] !== undefined ? S.mocks[id] : JSON.stringify(ROLE_PRESETS[role][0][1], null, 2));
 
   let testSources = {};
@@ -2607,7 +2821,33 @@
     const ids = Object.keys(uses);
     const srcs = sourceUses();
     const lvs = Object.keys(lovUses());
-    if (!ids.length && !srcs.length && !lvs.length) { box.append(h('p', { class: 'hint', text: 'This flow calls no connectors, data sources or lookup lists.' })); return; }
+    const agents = agentNodes(), tids = agentToolIds();
+    if (!ids.length && !srcs.length && !lvs.length && !agents.length) { box.append(h('p', { class: 'hint', text: 'This flow calls no connectors, data sources or lookup lists.' })); return; }
+    const jsonArea = (get, key, rows, isArr) => {
+      const ta = h('textarea', { class: 'in mono', rows, spellcheck: 'false' });
+      ta.value = get();
+      const check = () => { let ok = true; try { const v = JSON.parse(ta.value); ok = !isArr || Array.isArray(v); } catch (e) { ok = false; } ta.classList.toggle('bad', !ok); };
+      ta.addEventListener('input', () => { S.mocks[key] = ta.value; check(); save(); });
+      check();
+      return ta;
+    };
+    agents.forEach((n) => {
+      box.append(h('div', { class: 'card mock' },
+        h('div', { class: 'card-h' }, h('span', { class: 'mono grow', text: n.id }), h('span', { class: 'chip', text: 'agent script' })),
+        h('p', { class: 'hint', text: 'Test replays these steps instead of calling ' + (n.provider || 'the model') +
+          ': {"tool": "ask_user" | "finish" | "handoff" | "give_up" | "load_skill" | a tool id, "args": {...}} or {"reply": "text"}. In APEX the real model runs.' }),
+        h('div', { class: 'rowx' }, h('button', { class: 'btn', text: 'Reset to default', onclick: () => { delete S.mocks['agent:' + n.id]; save(); renderMocks(); } })),
+        jsonArea(() => scriptFor(n), 'agent:' + n.id, 8, true)));
+    });
+    tids.forEach((id) => {
+      const reg = (aiCat().tools || []).find((t) => t.id === id);
+      box.append(h('div', { class: 'card mock' },
+        h('div', { class: 'card-h' }, h('span', { class: 'mono grow', text: id }), h('span', { class: 'chip', text: 'agent tool' })),
+        reg ? h('p', { class: 'hint', text: reg.write ? 'Writes data (FC_AI_TOOLS): the user confirms before it runs.' : 'Read only (FC_AI_TOOLS).' })
+            : checkbox('Writes data (the user confirms before it runs)', S.mocks['toolw:' + id] === '1',
+                       (c) => { if (c) S.mocks['toolw:' + id] = '1'; else delete S.mocks['toolw:' + id]; save(); }),
+        jsonArea(() => toolMockFor(id), 'tool:' + id, 3, false)));
+    });
     lvs.forEach((id) => {
       const card = h('div', { class: 'card mock' },
         h('div', { class: 'card-h' }, h('span', { class: 'mono grow', text: id }), h('span', { class: 'chip', text: 'lookup list' })));
@@ -2783,11 +3023,18 @@
         return res;
       };
     });
+    agentToolIds().forEach((id) => {
+      connectors['tool:' + id] = () => {
+        try { return JSON.parse(toolMockFor(id)); } catch (e) { throw new Error('The test mock for tool "' + id + '" is not valid JSON.'); }
+      };
+    });
+    const ai = testAi();
     // {{app_user}}: the designer's own APEX user when it runs inside APEX, else a stand-in.
     const appUser = (window.apex && apex.env && apex.env.APP_USER) || 'TEST_USER';
     testDebug = [];
     testEngine = FlowChatEngine.createEngine({ flows: [flow], connectors, dataSources: buildTestSources(), lovs: buildTestLovs(), appUser,
       sendEmail: (m) => { showTestEmail(m); return { ok: true }; },
+      aiProviders: ai.providers, aiTools: ai.tools, aiSkills: ai.skills,
       onDebug: flow.debug ? (e) => { testDebug.push(e); } : null });
     const chat = $('simChat');
     chat.setAttribute('flow', flow.flowId || 'draft');
@@ -2967,6 +3214,8 @@
         if (!localEdited) cat[id] = Object.assign(clone(dbDef), { sampleRows: (local && local.sampleRows) || [] });
       });
       S.dbConnectors = res[1] || [];
+      // Older FC_DESIGNER packages have no listAi: then agent providers and tools aren't checked.
+      try { S.ai = (await BACKEND.call('listAi')) || null; } catch (e) { S.ai = null; }
       // Older FC_DESIGNER packages have no listLovs: then lookup lists simply aren't checked.
       try { S.dbLovs = (await BACKEND.call('listLovs')) || []; lovError = null; } catch (e) { S.dbLovs = null; lovError = e.message; }
       lovReloadAt = Date.now();
