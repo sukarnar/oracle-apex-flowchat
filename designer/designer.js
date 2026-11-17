@@ -276,15 +276,18 @@
 
   // ======================================================================== back end (APEX)
   // <div id="fcd-root" data-backend="apex" data-process="FC_DESIGNER"> talks to db/09_fc_designer.sql
-  // through one page-level Ajax Callback. Without data-backend the designer works on files only.
+  // through one page-level Ajax Callback. The region plugin sets data-ajax-identifier instead, and the
+  // calls go to the plugin's own AJAX function. Without data-backend the designer works on files only.
   const BACKEND = (function () {
     if (ROOT.dataset.backend !== 'apex') return null;
     const proc = ROOT.dataset.process || 'FC_DESIGNER';
+    const ajaxId = ROOT.dataset.ajaxIdentifier;
     return {
       call(action, payload) {
         if (!window.apex || !apex.server) return Promise.reject(new Error('The APEX JavaScript API is not on this page.'));
         return new Promise((resolve, reject) => {
-          apex.server.process(proc, { x01: action, p_clob_01: JSON.stringify(payload || {}) }, { dataType: 'text' })
+          const data = { x01: action, p_clob_01: JSON.stringify(payload || {}) };
+          (ajaxId ? apex.server.plugin(ajaxId, data, { dataType: 'text' }) : apex.server.process(proc, data, { dataType: 'text' }))
             .done((txt) => {
               let j;
               try { j = typeof txt === 'string' ? JSON.parse(txt) : txt; } catch (e) { reject(new Error('The server returned something that is not JSON.')); return; }
@@ -3790,12 +3793,12 @@
       // Coming back from SQL Workshop (or any other tab): pick up lists added to FC_LOVS meanwhile.
       window.addEventListener('focus', () => { if (S.dbLovs && Date.now() - lovReloadAt > 5000) reloadLovs(); });
       if (!restored) openDialog();
-    } else if (window.apex && window.apex.server) {
+    } else if (window.apex && window.apex.server && ROOT.dataset.backend !== 'files') {
       // On an APEX page but database mode is off: say why Save draft / Publish are missing.
       console.info('[FlowChat Designer] ' + VERSION + ': database mode is off. Add data-backend="apex" to <div id="fcd-root">.');
       toast('Database mode is off: add data-backend="apex" to the designer region’s div to save and publish here.', 9000);
     }
-    console.info('[FlowChat Designer] ' + VERSION + (BACKEND ? ', database mode (process ' + (ROOT.dataset.process || 'FC_DESIGNER') + ')' : ', file mode'));
+    console.info('[FlowChat Designer] ' + VERSION + (BACKEND ? ', database mode (' + (ROOT.dataset.ajaxIdentifier ? 'region plugin' : 'process ' + (ROOT.dataset.process || 'FC_DESIGNER')) + ')' : ', file mode'));
     window.addEventListener('resize', () => drawEdges());
   }
 

@@ -12,6 +12,7 @@ flows/      loan_application.json    sample "create" flow (collect answers, subm
             expense_claim.json       Phase E sample: line items (Repeat), a file answer, a PII answer, debug logging
             flow.schema.json         JSON Schema for flow definitions
 designer/   index.html               visual flow designer (no dependencies)
+apex/       region_type_plugin_com_flowchat_designer.sql  APEX region plugin "FlowChat Designer" (import in App Builder)
 widget/     flowchat.js              <flow-chat> Web Component + transports + adapters (no dependencies)
             flowchat-engine.js       reference engine in JS (demo, simulator, Node backends)
 db/         install.sql              first-time install: runs 01..07, 09..12 in order (08 ORDS is optional)
@@ -54,8 +55,10 @@ tests/      engine.test.js           node tests/engine.test.js
             agent.test.js            node tests/agent.test.js (Agent node, scripted model: questions, tools, confirm, finish, handoff, limits, JSON mode, pick_record, files, PII placeholders, set_field)
             apex-embed-test.html     designer inside a page-wide form, like APEX
             apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
+            apex-plugin-test.html    the designer as the region plugin renders it (plugin AJAX callback, fake back end)
             fake-apex-backend.js     emulates the FC_DESIGNER Ajax protocol in the browser (testing only)
 tools/      build-seed.js            flow JSON -> SQL publish script
+            build-apex-plugin.js     rebuilds apex/region_type_plugin_com_flowchat_designer.sql from the source files
 ```
 
 ## 1. Try the demos (no database needed)
@@ -114,6 +117,39 @@ With the same server running, open <http://localhost:8765/designer/>.
 Node positions are stored as `ui: {x, y}` on each node. Both engines ignore them.
 
 ### Hosting the designer on an APEX page
+
+**With the region plugin (recommended).** `apex/region_type_plugin_com_flowchat_designer.sql` is a
+region plugin export for APEX 23.2 and later. The designer, the engine, the chat widget and the sample
+flows are all inside it as plugin files, so nothing else needs uploading.
+
+1. Install the database objects first (`FC_DESIGNER` from `db/09_fc_designer.sql` must be in the
+   application's parsing schema).
+2. **App Builder > your application > Shared Components > Plug-ins > Import**, choose the file and
+   install it. Importing it again replaces the plugin (same internal name `COM.FLOWCHAT.DESIGNER`).
+3. On a page, add a region of type **FlowChat Designer** (template *Blank with Attributes* works best).
+   Its attributes:
+   - **Mode:** *Database* (default) opens, saves and publishes flows in the database. It uses the
+     region's own AJAX callback, so the page needs no `FC_DESIGNER` process. *Files* works on JSON
+     files only, like the standalone designer.
+   - **Height:** a CSS length (default `calc(100vh - 140px)`).
+   - **Theme:** Automatic, Light or Dark.
+4. **Protect the page or the region with an authorization scheme.** Anyone who can open it can
+   publish flows and change data source definitions.
+
+Use one designer region per page. After changing `designer.js`, the engine, the widget or a sample
+flow, run `node tools/build-apex-plugin.js` and import the new file. Installing from a script instead
+of the UI also works; set the target first:
+```sql
+begin
+  apex_application_install.set_workspace('MY_WORKSPACE');
+  apex_application_install.set_application_id(100);
+  apex_application_install.set_schema('MY_SCHEMA');
+end;
+/
+@apex/region_type_plugin_com_flowchat_designer.sql
+```
+
+**Without the plugin** (a Static Content region and a page process):
 
 1. **Static Application Files:** upload `widget/flowchat-engine.js`, `widget/flowchat.js`,
    `designer/designer.js` and `designer/designer.css`. Optionally upload `flows/loan_application.json`
@@ -826,8 +862,11 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 - **Re-upload changed files:** after updating `designer.js` or `designer.css` in APEX, re-upload
   them. APEX versions static file URLs, so browsers pick up the change. On a plain web server,
   force-reload to avoid a cached copy.
-- Not done yet: LLM extraction from free text, and a packaged APEX region plugin. The Static Content
-  region approach above is the stand-in for the plugin. Repeat items can't contain file answers yet;
+- **The designer region plugin has not been imported into a real APEX instance yet.** Its PL/SQL and
+  the export format follow APEX 23.2; the designer side (`apex.server.plugin`) is tested in
+  `tests/apex-plugin-test.html`. If the import fails, the manual setup above works the same way.
+- Not done yet: LLM extraction from free text, and a region plugin for the chat widget itself (the
+  Static Content region with `<flow-chat>` is still the way to add it). Repeat items can't contain file answers yet;
   use a separate Ask step for the file.
 - When an edit replays the flow, lookups are not re-run. For example, if you change the email,
   the customer lookup keeps its earlier result.

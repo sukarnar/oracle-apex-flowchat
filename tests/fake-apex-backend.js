@@ -261,11 +261,23 @@
         }, LATENCY);
       });
       return d;
+    },
+    // The region plugin's AJAX callback (apex/region_type_plugin_com_flowchat_designer.sql): it hands
+    // every call to fc_designer.ajax, like the page process.
+    plugin: function (ajaxId, data) {
+      FakeApex.pluginCalls = (FakeApex.pluginCalls || 0) + 1;
+      if (ajaxId !== FakeApex.pluginAjaxId) {
+        var d = deferred();
+        setTimeout(function () { d._done.forEach(function (fn) { fn(JSON.stringify({ error: 'Unknown AJAX identifier.' })); }); }, LATENCY);
+        return d;
+      }
+      return window.apex.server.process('FC_DESIGNER', data);
     }
   };
 
   window.FakeApex = {
     log: [],
+    pluginAjaxId: 'PLUGIN_AJAX_ID_FOR_TESTS',
     get db() { return load(); },
     reset: function () { localStorage.removeItem(KEY); seedPromise = null; return ready(); },
     // Like an INSERT into FC_LOVS from SQL Workshop while the designer is open.
