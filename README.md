@@ -13,6 +13,7 @@ flows/      loan_application.json    sample "create" flow (collect answers, subm
             flow.schema.json         JSON Schema for flow definitions
 designer/   index.html               visual flow designer (no dependencies)
 apex/       region_type_plugin_com_flowchat_designer.sql  APEX region plugin "FlowChat Designer" (import in App Builder)
+            region_type_plugin_com_flowchat_chat.sql      APEX region plugin "FlowChat Chat": the chat widget on a page
 widget/     flowchat.js              <flow-chat> Web Component + transports + adapters (no dependencies)
             flowchat-engine.js       reference engine in JS (demo, simulator, Node backends)
 db/         install.sql              first-time install: runs 01..07, 09..12 in order (08 ORDS is optional)
@@ -56,9 +57,10 @@ tests/      engine.test.js           node tests/engine.test.js
             apex-embed-test.html     designer inside a page-wide form, like APEX
             apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
             apex-plugin-test.html    the designer as the region plugin renders it (plugin AJAX callback, fake back end)
+            apex-chat-plugin-test.html  the chat as the FlowChat Chat plugin renders it (plugin AJAX callback, fake page items)
             fake-apex-backend.js     emulates the FC_DESIGNER Ajax protocol in the browser (testing only)
 tools/      build-seed.js            flow JSON -> SQL publish script
-            build-apex-plugin.js     rebuilds apex/region_type_plugin_com_flowchat_designer.sql from the source files
+            build-apex-plugin.js     rebuilds both apex/ plugin exports from the source files
 ```
 
 ## 1. Try the demos (no database needed)
@@ -137,7 +139,7 @@ flows are all inside it as plugin files, so nothing else needs uploading.
    publish flows and change data source definitions.
 
 Use one designer region per page. After changing `designer.js`, the engine, the widget or a sample
-flow, run `node tools/build-apex-plugin.js` and import the new file. Installing from a script instead
+flow, run `node tools/build-apex-plugin.js` (it rebuilds both plugins) and import the new file. Installing from a script instead
 of the UI also works; set the target first:
 ```sql
 begin
@@ -237,6 +239,36 @@ node tools/build-seed.js flows/my_flow.json > my_flow.sql
 Run `my_flow.sql`. Each run creates a new version. Sessions that have already started keep the version they started on.
 
 ## 3. Add it to an APEX page
+
+### With the region plugin (recommended)
+
+`apex/region_type_plugin_com_flowchat_chat.sql` is a region plugin for APEX 23.2 and later, with
+`flowchat.js` inside it.
+
+1. **Import it:** App Builder > your application > Shared Components > Plug-ins > Import. Importing it
+   again replaces it (internal name `COM.FLOWCHAT.CHAT`).
+2. **The form:** a normal APEX form region with items whose names match `bindings.*.apex` in the flow
+   (`P10_EMAIL`, `P10_AMOUNT`, ...). Give date items the format mask `YYYY-MM-DD`.
+3. **The chat:** add a region of type **FlowChat Chat** (e.g. in the right column) and set:
+
+   | Attribute | |
+   |---|---|
+   | **Flow** | the flow id, e.g. `loan_application` (required) |
+   | **Version** | pins a published version; empty = the latest published |
+   | **Heading**, **Subheading** | header text (translatable) |
+   | **Context** | page values read at start: `customer_id:P10_CUSTOMER_ID,dept:P10_DEPT` |
+   | **When Finished** | Nothing (the flow's Submit node saved it), Submit Page (with **Submit Request**, default `FC_COMPLETE`), or Reload Page |
+   | **Keep Conversation** | across reloads: No, Browser Tab (sessionStorage) or Browser (localStorage) |
+   | **Theme** | Automatic, Light or Dark |
+   | **Start Automatically** | off: start it from JavaScript with `document.getElementById('<static id>_chat').start()` |
+   | **Height** | a CSS length, default `560px` |
+
+No `FC_START` / `FC_INPUT` processes are needed: the region has its own AJAX callback, and it is
+stricter than the processes. It starts only the flow (and version) set on the region, whatever the
+browser sends, and continues only conversations of that flow. The chat element's id is the region's
+static id plus `_chat` (`R<region id>_chat` without a static id). Several chat regions can be on one page.
+
+### Without the plugin (a Static Content region and two processes)
 
 1. **Static file:** upload `widget/flowchat.js` under Shared Components > Static Application Files.
 2. **Page > JavaScript > File URLs:** `#APP_FILES#flowchat.js` (the PL/SQL engine runs the flow, so `flowchat-engine.js` isn't needed in APEX).
@@ -865,8 +897,10 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 - **The designer region plugin has not been imported into a real APEX instance yet.** Its PL/SQL and
   the export format follow APEX 23.2; the designer side (`apex.server.plugin`) is tested in
   `tests/apex-plugin-test.html`. If the import fails, the manual setup above works the same way.
-- Not done yet: LLM extraction from free text, and a region plugin for the chat widget itself (the
-  Static Content region with `<flow-chat>` is still the way to add it). Repeat items can't contain file answers yet;
+- **The FlowChat Chat region plugin has not been imported into a real APEX instance yet** either.
+  The widget side (`apex.server.plugin`, region-locked flow) is tested in `tests/apex-chat-plugin-test.html`.
+  If the import fails, the Static Content region with `<flow-chat>` works the same way.
+- Not done yet: LLM extraction from free text. Repeat items can't contain file answers yet;
   use a separate Ask step for the file.
 - When an edit replays the flow, lookups are not re-run. For example, if you change the email,
   the customer lookup keeps its earlier result.

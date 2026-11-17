@@ -10,6 +10,8 @@
  * Attributes
  *   flow          flow id (required)
  *   transport     apex | rest | local            (default rest; "local" requires configure())
+ *   ajax-identifier  with transport apex: call the FlowChat Chat region plugin's AJAX callback
+ *                 (set by the plugin) instead of the FC_START / FC_INPUT processes
  *   endpoint      base URL for rest transport     (e.g. /ords/myws/flowchat)
  *   adapter       apex | dom | none              (default: apex if window.apex exists, else dom)
  *   form          CSS selector scoping the dom adapter (default document)
@@ -64,9 +66,11 @@
   };
   RestTransport.prototype.input = function (sid, payload) { return this._post('/sessions/' + encodeURIComponent(sid) + '/input', payload); };
 
-  function ApexTransport(startProcess, inputProcess) {
+  // With ajaxId (the region plugin) both calls go to the plugin's AJAX callback, x04 = start | input.
+  function ApexTransport(startProcess, inputProcess, ajaxId) {
     this.startProcess = startProcess || 'FC_START';
     this.inputProcess = inputProcess || 'FC_INPUT';
+    this.ajaxId = ajaxId || null;
   }
   // x02 is limited to 32K, so a large JSON (a file answer) goes in p_clob_01 instead.
   ApexTransport.prototype._call = function (proc, x01, json, x03) {
@@ -74,9 +78,14 @@
     var data = { x01: x01 };
     if (json.length > 8000) data.p_clob_01 = json; else data.x02 = json;
     if (x03) data.x03 = String(x03);
+    var self = this;
     return new Promise(function (resolve, reject) {
-      apex.server.process(proc, data, { dataType: 'text' })
-        .done(function (d) { try { resolve(checkTurn(d)); } catch (e) { reject(e); } })
+      var req;
+      if (self.ajaxId) {
+        data.x04 = proc === self.startProcess ? 'start' : 'input';
+        req = apex.server.plugin(self.ajaxId, data, { dataType: 'text' });
+      } else req = apex.server.process(proc, data, { dataType: 'text' });
+      req.done(function (d) { try { resolve(checkTurn(d)); } catch (e) { reject(e); } })
         .fail(function (xhr, status, err) { reject(new Error(err || status || 'AJAX error')); });
     });
   };
@@ -316,7 +325,8 @@
       if (this._opts.transport) return this._opts.transport;
       if (this._transportObj) return this._transportObj;
       var t = (this.getAttribute('transport') || 'rest').toLowerCase();
-      if (t === 'apex') this._transportObj = new ApexTransport(this.getAttribute('start-process'), this.getAttribute('input-process'));
+      if (t === 'apex') this._transportObj = new ApexTransport(this.getAttribute('start-process'), this.getAttribute('input-process'),
+                                                         this.getAttribute('ajax-identifier'));
       else if (t === 'rest') this._transportObj = new RestTransport(this.getAttribute('endpoint') || '/flowchat');
       else throw new Error('transport="' + t + '" needs el.configure({ transport })');
       return this._transportObj;

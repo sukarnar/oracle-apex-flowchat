@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat Plugin Test</title>
+<!--
+  The chat widget as the FlowChat Chat region plugin renders it (apex/region_type_plugin_com_flowchat_chat.sql):
+  transport "apex" with an ajax-identifier, so every call goes through apex.server.plugin.
+  The fake apex.server.plugin below plays the plugin's AJAX function with the JS engine:
+    x04 = start  starts the region's flow (the flow id the browser sends is ignored)
+    x04 = input  continues a conversation, only one of the region's flow
+  and a fake apex.item writes into the form, like page items. Like APEX, the page is one <form>.
+  Console: FakeChat.log (every AJAX call), FakeChat.forgedStart() / FakeChat.forgedInput().
+-->
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; background: #e9ecef; }
+  .t-Header { background: #1f3a5f; color: #fff; padding: 10px 20px; font-weight: 600; }
+  .t-Header small { font-weight: 400; opacity: .8; }
+  .cols { display: grid; grid-template-columns: 1fr 380px; gap: 16px; padding: 16px; }
+  .t-Region { background: #fff; border: 1px solid #ccc; padding: 14px; }
+  label { display: block; font-size: 13px; margin: 8px 0 2px; color: #444; }
+  input { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; }
+  #status { padding: 6px 20px; font-size: 13px; }
+  #status.bad { background: #fdecea; color: #b42318; } #status.ok { background: #e7f6ee; color: #067647; }
+  @media (max-width: 760px) { .cols { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<form id="wwvFlowForm" action="" method="get" novalidate>
+  <input type="hidden" name="submitted" value="yes">
+  <div class="t-Header">Fake APEX app <small>page 10 with a FlowChat Chat region (simulated)</small></div>
+  <div id="status"></div>
+  <div class="cols">
+    <div class="t-Region">
+      <label for="P10_APPLICANT_NAME">Name</label><input id="P10_APPLICANT_NAME">
+      <label for="P10_EMAIL">Email</label><input id="P10_EMAIL">
+      <label for="P10_CUSTOMER_ID">Customer id</label><input id="P10_CUSTOMER_ID" value="C-1001">
+      <label for="P10_AMOUNT">Amount</label><input id="P10_AMOUNT">
+      <label for="P10_PURPOSE">Purpose</label><input id="P10_PURPOSE">
+    </div>
+    <div class="t-Region" id="loan_chat">
+      <!-- exactly what the plugin's render function writes (static id loan_chat) -->
+      <flow-chat id="loan_chat_chat" flow="loan_application" transport="apex" adapter="apex"
+                 ajax-identifier="CHAT_PLUGIN_AJAX_ID" heading="Loan assistant" subheading="Answers fill the form"
+                 context="customer_id:P10_CUSTOMER_ID" style="--fc-height: 560px"></flow-chat>
+    </div>
+  </div>
+</form>
+<script>
+  (function () {
+    var s = document.getElementById('status');
+    var submitted = new URLSearchParams(location.search).has('submitted');
+    s.className = submitted ? 'bad' : 'ok';
+    s.textContent = submitted ? 'FAIL: the page form was submitted (page reloaded).' : 'OK: no page submit so far.';
+  })();
+</script>
+<script src="../widget/flowchat-engine.js"></script>
+<script src="../demo/demo-connectors.js"></script>
+<script src="../demo/demo-lovs.js"></script>
+<script>
+  // The region's attributes, as the plugin's AJAX function reads them.
+  var REGION = { ajaxId: 'CHAT_PLUGIN_AJAX_ID', flow: 'loan_application', version: null };
+  var enginePromise = fetch('../flows/loan_application.json').then(function (r) { return r.json(); }).then(function (flow) {
+    return FlowChatEngine.createEngine({ flows: [flow], connectors: FlowChatDemoConnectors, lovs: FlowChatDemoLovs });
+  });
+  var sessionFlow = {};   // like FC_SESSIONS.flow_id
+
+  function deferred() {
+    var d = { _done: [], _fail: [] };
+    d.done = function (fn) { d._done.push(fn); return d; };
+    d.fail = function (fn) { d._fail.push(fn); return d; };
+    d.resolve = function (v) { setTimeout(function () { d._done.forEach(function (fn) { fn(v); }); }, 60); };
+    return d;
+  }
+  // The plugin's ajax function.
+  function pluginAjax(data) {
+    return enginePromise.then(function (eng) {
+      if (data.x04 === 'start') {
+        return eng.start(REGION.flow, JSON.parse(data.x02 || '{}')).then(function (t) { sessionFlow[t.sessionId] = REGION.flow; return t; });
+      }
+      if (sessionFlow[data.x01] !== REGION.flow) return { error: 'This conversation does not belong to this chat region. Please start again.' };
+      return eng.input(data.x01, JSON.parse(data.p_clob_01 || data.x02 || '{}'));
+    }).catch(function (e) { return { error: e.message }; });
+  }
+
+  window.FakeChat = {
+    log: [],
+    forgedStart: function () { return apex.server.plugin(REGION.ajaxId, { x04: 'start', x01: 'some_other_flow', x02: '{}' }); },
+    forgedInput: function () { return apex.server.plugin(REGION.ajaxId, { x04: 'input', x01: 'not-a-session', x02: '{"value":"x"}' }); }
+  };
+  window.apex = {
+    server: {
+      process: function (name) { throw new Error('The plugin region must not call apex.server.process (' + name + ').'); },
+      plugin: function (ajaxId, data) {
+        var d = deferred();
+        FakeChat.log.push({ ajaxId: ajaxId, x04: data.x04, x01: data.x01 });
+        if (ajaxId !== REGION.ajaxId) { d.resolve(JSON.stringify({ error: 'Unknown AJAX identifier.' })); return d; }
+        pluginAjax(data).then(function (t) { d.resolve(JSON.stringify(t)); });
+        return d;
+      }
+    },
+    item: function (name) {
+      var el = document.getElementById(name);
+      return { node: el, getValue: function () { return el ? el.value : ''; }, setValue: function (v) { if (el) el.value = v === null || v === undefined ? '' : v; } };
+    }
+  };
+</script>
+<script src="../widget/flowchat.js"></script>
+</body>
+</html>
