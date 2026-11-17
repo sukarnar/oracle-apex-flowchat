@@ -50,11 +50,13 @@ begin
       max_rows       number         default 10,
       title_template    varchar2(4000),
       subtitle_template varchar2(4000),
+      request        clob,
       enabled        varchar2(1)    default 'Y' not null,
       constraint fc_ai_tools_pk primary key (tool_id),
       constraint fc_ai_tools_id_ck check (regexp_like(tool_id, '^[a-z][a-z0-9_]{0,63}$')),
-      constraint fc_ai_tools_type_ck check (tool_type in ('CONNECTOR', 'LOV', 'SEARCH')),
+      constraint fc_ai_tools_type_ck check (tool_type in ('CONNECTOR', 'LOV', 'SEARCH', 'REST')),
       constraint fc_ai_tools_par_ck check (parameters is json),
+      constraint fc_ai_tools_req_ck check (request is json),
       constraint fc_ai_tools_w_ck check (is_write in ('Y', 'N') and needs_confirm in ('Y', 'N') and enabled in ('Y', 'N'))
     )]');
   ddl('FC_AI_SKILLS', q'[
@@ -87,6 +89,31 @@ begin
 end;
 /
 
+-- REST tools (TOOL_TYPE = 'REST', REQUEST): added to installs made before them
+declare
+  l_n pls_integer;
+begin
+  select count(*) into l_n from user_tab_columns where table_name = 'FC_AI_TOOLS' and column_name = 'REQUEST';
+  if l_n = 0 then
+    execute immediate 'alter table fc_ai_tools add (request clob constraint fc_ai_tools_req_ck check (request is json))';
+    dbms_output.put_line('FC_AI_TOOLS.REQUEST added');
+  end if;
+  select count(*) into l_n from user_constraints
+   where table_name = 'FC_AI_TOOLS' and constraint_name = 'FC_AI_TOOLS_TYPE_CK'
+     and search_condition_vc like '%REST%';
+  if l_n = 0 then
+    begin
+      execute immediate 'alter table fc_ai_tools drop constraint fc_ai_tools_type_ck';
+    exception when others then
+      if sqlcode <> -2443 then raise; end if;   -- ORA-02443: constraint does not exist
+    end;
+    execute immediate q'[alter table fc_ai_tools add constraint fc_ai_tools_type_ck
+                           check (tool_type in ('CONNECTOR', 'LOV', 'SEARCH', 'REST'))]';
+    dbms_output.put_line('FC_AI_TOOLS.TOOL_TYPE allows REST');
+  end if;
+end;
+/
+
 comment on column fc_ai_tools.title_template is 'SEARCH tools: the title of each card pick_record shows, e.g. {{last_name}}, {{first_name}} (default: the first three values)';
 comment on column fc_ai_tools.subtitle_template is 'SEARCH tools: the card subtitle, e.g. {{department}}';
 comment on column fc_ai_providers.base_url is 'Up to and including /v1, e.g. https://llm.corp.local/v1 (the engine adds /chat/completions)';
@@ -94,7 +121,8 @@ comment on column fc_ai_providers.credential_id is 'Static id of an APEX Web Cre
 comment on column fc_ai_providers.wallet_path is 'Oracle wallet with the corporate CA (and a client certificate for mTLS), e.g. file:/u01/wallets/llm; auto-login (cwallet.sso). Null = the APEX instance wallet';
 comment on column fc_ai_providers.tool_mode is 'native = the API''s tool calling; json = the engine asks for one JSON object per reply (for models whose tool calling is unreliable)';
 comment on column fc_ai_tools.parameters is 'JSON schema of the arguments, e.g. {"type":"object","properties":{"emp_id":{"type":"string"}},"required":["emp_id"]}';
-comment on column fc_ai_tools.target is 'CONNECTOR: FC_CONNECTORS id (receives the usual payload plus "tool" and "args"); LOV: FC_LOVS id (args = its parameters); SEARCH: FC_DATA_SOURCES id (row filter applies)';
+comment on column fc_ai_tools.target is 'CONNECTOR: FC_CONNECTORS id (receives the usual payload plus "tool" and "args"); LOV: FC_LOVS id (args = its parameters); SEARCH: FC_DATA_SOURCES id (row filter applies); REST: FC_REST_ENDPOINTS id';
+comment on column fc_ai_tools.request is 'REST tools: {"method", "path", "query", "headers", "body", "map"} with {{arg}} placeholders from the model''s arguments; a method other than GET always asks the user to confirm';
 
 -- Example (edit, then run once):
 --

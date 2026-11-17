@@ -13,6 +13,8 @@ prompt == Lookup list registry (FC_LOVS)
 @@02c_lovs.sql
 prompt == Agent registries (FC_AI_PROVIDERS, FC_AI_TOOLS, FC_AI_SKILLS)
 @@15_ai_tables.sql
+prompt == REST endpoint registry (FC_REST_ENDPOINTS)
+@@17_rest_endpoints.sql
 prompt == FC_DATA (search / get / update)
 @@02b_fc_data.sql
 show errors package body fc_data

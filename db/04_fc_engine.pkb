@@ -40,6 +40,7 @@ create or replace package body fc_engine as
   function menu_spec (c in out nocopy t_ctx, p_node in json_object_t) return json_object_t;        -- forward
   function ag_out_spec (p_node in json_object_t, p_name in varchar2) return json_object_t;         -- forward
   function ag_get (c in out nocopy t_ctx, p_id in varchar2) return json_object_t;                  -- forward
+  function ag_err (p_text in varchar2) return json_object_t;                                       -- forward
 
   ------------------------------------------------------------------------------
   -- scalar helpers
@@ -1393,6 +1394,390 @@ create or replace package body fc_engine as
   end run_email;
 
   ------------------------------------------------------------------------------
+  -- REST call node: calls an endpoint registered in FC_REST_ENDPOINTS (base URL, Web Credential,
+  -- allowed methods). A flow names only the endpoint, a relative path, query, headers, a body
+  -- template and a response mapping, so it never holds a host name or a secret.
+  ------------------------------------------------------------------------------
+  -- A value inside a URL: everything but letters, digits, - _ ~ is escaped (also "." and "/", so a
+  -- value can never add path segments such as "..").
+  function rest_url_part (p in varchar2) return varchar2 is
+  begin
+    if p is null then return null; end if;
+    return replace(replace(replace(replace(replace(replace(
+             utl_url.escape(p, true, 'AL32UTF8'),
+             '.', '%2E'), '!', '%21'), '*', '%2A'), '''', '%27'), '(', '%28'), ')', '%29');
+  end rest_url_part;
+
+  function rest_fill_path (p_text in varchar2, p_v in json_object_t) return varchar2 is
+    l_res varchar2(32767) := p_text;
+    l_key varchar2(200);
+  begin
+    for i in 1 .. 50 loop
+      l_key := regexp_substr(l_res, '\{\{\s*([A-Za-z0-9_.]+)\s*\}\}', 1, 1, null, 1);
+      exit when l_key is null;
+      l_res := regexp_replace(l_res, '\{\{\s*' || replace(l_key, '.', '\.') || '\s*\}\}',
+                              rest_url_part(text_of(p_v, l_key)));
+    end loop;
+    return l_res;
+  end rest_fill_path;
+
+  -- The body template: "{{slot}}" alone keeps the value's type (number, list, object); any other
+  -- string is text with placeholders filled in.
+  function rest_tpl (p_t in json_element_t, p_v in json_object_t) return json_element_t is
+    l_s    varchar2(32767);
+    l_key  varchar2(200);
+    l_el   json_element_t;
+    l_o    json_object_t;
+    l_in   json_object_t;
+    l_a    json_array_t;
+    l_ia   json_array_t;
+    l_keys json_key_list;
+  begin
+    if p_t is null then return null; end if;
+    if p_t.is_string then
+      l_s := el_str(p_t);
+      l_key := regexp_substr(l_s, '^\{\{\s*([A-Za-z0-9_.]+)\s*\}\}$', 1, 1, null, 1);
+      if l_key is not null then
+        if p_v.has(l_key) then l_el := p_v.get(l_key); end if;
+        if l_el is null or l_el.is_null or (l_el.is_string and el_str(l_el) is null) then
+          return json_element_t.parse('null');
+        end if;
+        return json_element_t.parse(l_el.to_clob);
+      end if;
+      l_a := json_array_t();
+      l_a.append(interpolate(l_s, p_v));
+      return l_a.get(0);
+    elsif p_t.is_object then
+      l_in := treat(p_t as json_object_t);
+      l_o := json_object_t();
+      l_keys := l_in.get_keys;
+      if l_keys is not null then
+        for i in 1 .. l_keys.count loop
+          l_o.put(l_keys(i), rest_tpl(l_in.get(l_keys(i)), p_v));
+        end loop;
+      end if;
+      return l_o;
+    elsif p_t.is_array then
+      l_ia := treat(p_t as json_array_t);
+      l_a := json_array_t();
+      for i in 0 .. l_ia.get_size - 1 loop
+        l_a.append(rest_tpl(l_ia.get(i), p_v));
+      end loop;
+      return l_a;
+    end if;
+    return p_t;
+  end rest_tpl;
+
+  -- "$.a.b[0].c", "a.b.0.c" or "$" (the whole response). Null when the path is not there.
+  function rest_get (p_root in json_element_t, p_path in varchar2) return json_element_t is
+    l_p   varchar2(4000) := regexp_replace(trim(nvl(p_path, '$')), '^\$\.?', '');
+    l_cur json_element_t := p_root;
+    l_tok varchar2(4000);
+    l_o   json_object_t;
+    l_a   json_array_t;
+    l_i   pls_integer := 1;
+  begin
+    loop
+      l_tok := regexp_substr(l_p, '[^].[]+|\[[0-9]+\]', 1, l_i);
+      exit when l_tok is null;
+      l_i := l_i + 1;
+      l_tok := regexp_replace(l_tok, '^\[([0-9]+)\]$', '\1');
+      if l_cur is null then return null; end if;
+      if l_cur.is_object then
+        l_o := treat(l_cur as json_object_t);
+        if not l_o.has(l_tok) then return null; end if;
+        l_cur := l_o.get(l_tok);
+      elsif l_cur.is_array and regexp_like(l_tok, '^[0-9]+$') then
+        l_a := treat(l_cur as json_array_t);
+        if to_number(l_tok) >= l_a.get_size then return null; end if;
+        l_cur := l_a.get(to_number(l_tok));
+      else
+        return null;
+      end if;
+    end loop;
+    return l_cur;
+  end rest_get;
+
+  -- One call of a request spec {method, path, query, skipEmptyQuery, headers, body} to endpoint
+  -- p_ep_id, with placeholders filled from p_v. p_root = the answer parsed as JSON (null if it isn't).
+  procedure rest_call (c in out nocopy t_ctx, p_spec in json_object_t, p_ep_id in varchar2, p_v in json_object_t,
+                       p_method out varchar2, p_path out varchar2, p_status out number,
+                       p_root out json_element_t, p_problem out varchar2, p_ms out number) is
+    l_tpl     varchar2(4000) := str(p_spec, 'path');
+    l_q       json_object_t  := obj(p_spec, 'query');
+    l_qs      varchar2(32767);
+    l_qv      varchar2(32767);
+    l_hdr     json_object_t  := obj(p_spec, 'headers');
+    l_ephdr   json_object_t;
+    l_keys    json_key_list;
+    l_ep      fc_rest_endpoints%rowtype;
+    l_body    clob;
+    l_resp    clob;
+    l_n       pls_integer;
+    l_t0      timestamp      := systimestamp;
+    l_d       interval day to second;
+  begin
+    p_method := upper(nvl(str(p_spec, 'method'), 'GET'));
+    if p_method not in ('GET', 'POST', 'PUT', 'PATCH', 'DELETE') then
+      p_problem := 'method ' || p_method || ' is not supported';
+    elsif p_ep_id is null then
+      p_problem := 'no endpoint';
+    elsif l_tpl is not null and not regexp_like(l_tpl, '^[/?]') then
+      p_problem := 'the path must start with / or ?';
+    elsif regexp_like(l_tpl, '^//|://|\\') then
+      p_problem := 'the path must be relative to the endpoint';
+    end if;
+
+    if p_problem is null then
+      begin
+        select * into l_ep from fc_rest_endpoints where endpoint_id = p_ep_id and enabled = 'Y';
+      exception when no_data_found then
+        p_problem := 'unknown or disabled REST endpoint "' || p_ep_id || '"';
+      end;
+    end if;
+    if p_problem is null
+       and instr(',' || upper(replace(l_ep.allowed_methods, ' ')) || ',', ',' || p_method || ',') = 0 then
+      p_problem := 'endpoint "' || p_ep_id || '" does not allow ' || p_method;
+    end if;
+
+    if p_problem is null then
+      p_path := rest_fill_path(l_tpl, p_v);
+      if l_q is not null then
+        l_keys := l_q.get_keys;
+        if l_keys is not null then
+          for i in 1 .. l_keys.count loop
+            l_qv := interpolate(str(l_q, l_keys(i)), p_v);
+            if l_qv is not null or not get_bool(p_spec, 'skipEmptyQuery') then
+              l_qs := l_qs || case when l_qs is not null then '&' end
+                      || rest_url_part(l_keys(i)) || '=' || rest_url_part(l_qv);
+            end if;
+          end loop;
+        end if;
+      end if;
+      if l_qs is not null then
+        p_path := p_path || case when instr(p_path, '?') > 0 then '&' else '?' end || l_qs;
+      end if;
+
+      apex_web_service.g_request_headers.delete;
+      apex_web_service.g_request_headers(1).name  := 'Accept';
+      apex_web_service.g_request_headers(1).value := 'application/json';
+      if l_ep.extra_headers is not null then
+        l_ephdr := json_object_t.parse(l_ep.extra_headers);
+        l_keys  := l_ephdr.get_keys;
+        if l_keys is not null then
+          for i in 1 .. l_keys.count loop
+            l_n := apex_web_service.g_request_headers.count + 1;
+            apex_web_service.g_request_headers(l_n).name  := l_keys(i);
+            apex_web_service.g_request_headers(l_n).value := str(l_ephdr, l_keys(i));
+          end loop;
+        end if;
+      end if;
+      if l_hdr is not null then
+        l_keys := l_hdr.get_keys;
+        if l_keys is not null then
+          for i in 1 .. l_keys.count loop
+            if regexp_like(l_keys(i), '^(authorization|cookie|host|content-length|transfer-encoding|connection|proxy-.*|x-forwarded-.*)$', 'i')
+               or not regexp_like(l_keys(i), '^[A-Za-z0-9-]+$') then
+              p_problem := 'header "' || substr(l_keys(i), 1, 100) || '" can only be set on the endpoint';
+              exit;
+            end if;
+            -- the endpoint's own headers win
+            if l_ephdr is null or not l_ephdr.has(l_keys(i)) then
+              l_n := apex_web_service.g_request_headers.count + 1;
+              apex_web_service.g_request_headers(l_n).name  := l_keys(i);
+              apex_web_service.g_request_headers(l_n).value := one_line(interpolate(str(l_hdr, l_keys(i)), p_v));
+            end if;
+          end loop;
+        end if;
+      end if;
+    end if;
+
+    if p_problem is null then
+      if p_method <> 'GET' and p_spec.has('body') then
+        l_body := rest_tpl(p_spec.get('body'), p_v).to_clob;
+        l_n := apex_web_service.g_request_headers.count + 1;
+        apex_web_service.g_request_headers(l_n).name  := 'Content-Type';
+        apex_web_service.g_request_headers(l_n).value := 'application/json';
+      end if;
+      begin
+        l_resp := apex_web_service.make_rest_request(
+                    p_url                  => rtrim(l_ep.base_url, '/') || p_path,
+                    p_http_method          => p_method,
+                    p_body                 => l_body,
+                    p_credential_static_id => l_ep.credential_static_id,
+                    p_wallet_path          => l_ep.wallet_path,
+                    p_transfer_timeout     => nvl(l_ep.timeout_secs, 20));
+        p_status := apex_web_service.g_status_code;
+        if l_resp is not null and dbms_lob.getlength(l_resp) > nvl(l_ep.max_response_kb, 1024) * 1024 then
+          p_problem := 'the response is larger than ' || nvl(l_ep.max_response_kb, 1024) || ' KB';
+        elsif l_resp is not null and dbms_lob.getlength(l_resp) > 0 then
+          begin
+            p_root := json_element_t.parse(l_resp);
+          exception when others then
+            p_root := null;   -- not JSON: nothing to map
+          end;
+        end if;
+      exception when others then
+        p_problem := substr(sqlerrm, 1, 4000);
+        apex_debug.error('FlowChat REST call to %s failed: %s', p_ep_id, p_problem);
+      end;
+    end if;
+    l_d  := systimestamp - l_t0;
+    p_ms := round((extract(minute from l_d) * 60 + extract(second from l_d)) * 1000);
+  end rest_call;
+
+  -- Calls the endpoint and maps the response into slots. Returns the next node, or null after failed().
+  function run_rest (c in out nocopy t_ctx, p_node in json_object_t, p_quiet in boolean) return varchar2 is
+    l_id      varchar2(200)  := str(p_node, 'id');
+    l_map     json_object_t  := obj(p_node, 'map');
+    l_keys    json_key_list;
+    l_method  varchar2(10);
+    l_path    varchar2(32767);
+    l_status  number;
+    l_root    json_element_t;
+    l_problem varchar2(4000);
+    l_ms      number;
+    l_el      json_element_t;
+    l_outcome varchar2(10);
+    l_mapped  json_array_t   := json_array_t();
+    l_ev      json_object_t;
+  begin
+    rest_call(c, p_node, str(p_node, 'endpoint'), vals(c), l_method, l_path, l_status, l_root, l_problem, l_ms);
+    l_outcome := case when l_problem is not null then 'error'
+                      when l_status between 200 and 299 then 'ok'
+                      when l_status = 404 and str(p_node, 'onNotFound') is not null then 'notFound'
+                      else 'error' end;
+    if l_problem is null and l_outcome = 'error' then l_problem := 'HTTP ' || l_status; end if;
+
+    if l_outcome = 'ok' and l_map is not null then
+      l_keys := l_map.get_keys;
+      if l_keys is not null then
+        for i in 1 .. l_keys.count loop
+          if l_keys(i) <> 'app_user' then
+            l_el := rest_get(l_root, str(l_map, l_keys(i)));
+            if l_el is null then c.slots.put_null(l_keys(i)); else c.slots.put(l_keys(i), l_el); end if;
+            touch(c, l_keys(i));
+            l_mapped.append(l_keys(i));
+          end if;
+        end loop;
+      end if;
+    end if;
+    if str(p_node, 'statusSlot') is not null then
+      if l_status is null then c.slots.put_null(str(p_node, 'statusSlot'));
+      else c.slots.put(str(p_node, 'statusSlot'), l_status); end if;
+      touch(c, str(p_node, 'statusSlot'));
+    end if;
+
+    if dbg_enabled(c) then
+      l_ev := json_object_t();
+      l_ev.put('event', 'rest');
+      l_ev.put('node', l_id);
+      l_ev.put('endpoint', str(p_node, 'endpoint'));
+      l_ev.put('method', l_method);
+      l_ev.put('path', l_path);
+      if l_status is not null then l_ev.put('status', l_status); end if;
+      l_ev.put('ms', l_ms);
+      if l_mapped.get_size > 0 then l_ev.put('mapped', l_mapped); end if;
+      if l_outcome = 'error' then l_ev.put('error', l_problem); end if;
+      dbg(c, l_id, l_ev);
+    end if;
+
+    if l_outcome = 'notFound' then
+      if not p_quiet then add_msg(c, 'text', interpolate(str(p_node, 'notFoundMessage'), vals(c))); end if;
+      return str(p_node, 'onNotFound');
+    elsif l_outcome = 'error' then
+      add_msg(c, 'error', interpolate(nvl(str(p_node, 'errorMessage'),
+                                          'Sorry, I couldn''t get that information right now.'), vals(c)));
+      if str(p_node, 'onError') is null then return failed(c); end if;
+      return str(p_node, 'onError');
+    end if;
+    if not p_quiet then add_msg(c, 'text', interpolate(str(p_node, 'message'), vals(c))); end if;
+    return str(p_node, 'next');
+  end run_rest;
+
+  -- An agent's REST tool (FC_AI_TOOLS.TOOL_TYPE = 'REST'): TARGET is the endpoint, REQUEST the
+  -- {method, path, query, headers, body, map} template over the model's arguments (plus app_user).
+  -- The model gets {status, data} (data = the mapped values, or the whole answer cut to 6000
+  -- characters), {status: 404, found: false}, or {error}.
+  function rest_tool (c in out nocopy t_ctx, p_node in json_object_t, p_tool_id in varchar2, p_endpoint in varchar2,
+                      p_request in clob, p_args in json_object_t) return json_object_t is
+    l_spec    json_object_t;
+    l_v       json_object_t  := json_object_t.parse(p_args.to_clob);
+    l_keys    json_key_list;
+    l_map     json_object_t;
+    l_data    json_object_t;
+    l_el      json_element_t;
+    l_method  varchar2(10);
+    l_path    varchar2(32767);
+    l_status  number;
+    l_root    json_element_t;
+    l_problem varchar2(4000);
+    l_ms      number;
+    l_txt     clob;
+    l_r       json_object_t  := json_object_t();
+    l_ev      json_object_t;
+  begin
+    if p_request is null then l_spec := json_object_t(); else l_spec := json_object_t.parse(p_request); end if;
+    l_map := obj(l_spec, 'map');
+    -- object arguments are used as JSON text in placeholders
+    l_keys := l_v.get_keys;
+    if l_keys is not null then
+      for i in 1 .. l_keys.count loop
+        if l_v.get(l_keys(i)).is_object then l_v.put(l_keys(i), l_v.get(l_keys(i)).to_string); end if;
+      end loop;
+    end if;
+    l_v.put('app_user', coalesce(sys_context('APEX$SESSION', 'APP_USER'), user));
+    rest_call(c, l_spec, p_endpoint, l_v, l_method, l_path, l_status, l_root, l_problem, l_ms);
+
+    if dbg_enabled(c) then
+      l_ev := json_object_t();
+      l_ev.put('event', 'rest');
+      l_ev.put('node', str(p_node, 'id'));
+      l_ev.put('tool', p_tool_id);
+      l_ev.put('endpoint', p_endpoint);
+      l_ev.put('method', l_method);
+      l_ev.put('path', l_path);
+      if l_status is not null then l_ev.put('status', l_status); end if;
+      l_ev.put('ms', l_ms);
+      if l_problem is not null then l_ev.put('error', l_problem);
+      elsif not (l_status between 200 and 299 or l_status = 404) then l_ev.put('error', 'HTTP ' || l_status); end if;
+      dbg(c, str(p_node, 'id'), l_ev);
+    end if;
+
+    if l_problem is not null then return ag_err(l_problem); end if;
+    if l_status = 404 then
+      l_r.put('status', 404);
+      l_r.put('found', false);
+      return l_r;
+    end if;
+    if not l_status between 200 and 299 then return ag_err('HTTP ' || l_status); end if;
+    l_r.put('status', l_status);
+    if l_map is not null and key_count(l_map) > 0 then
+      l_data := json_object_t();
+      l_keys := l_map.get_keys;
+      for i in 1 .. l_keys.count loop
+        l_el := rest_get(l_root, str(l_map, l_keys(i)));
+        if l_el is null then l_data.put_null(l_keys(i)); else l_data.put(l_keys(i), l_el); end if;
+      end loop;
+      l_el := l_data;
+    else
+      l_el := l_root;
+    end if;
+    if l_el is null then
+      l_r.put_null('data');
+    else
+      l_txt := l_el.to_clob;
+      if dbms_lob.getlength(l_txt) > 6000 then
+        l_r.put('truncated', true);
+        l_r.put('data', dbms_lob.substr(l_txt, 6000, 1));
+      else
+        l_r.put('data', l_el);
+      end if;
+    end if;
+    return l_r;
+  end rest_tool;
+
+  ------------------------------------------------------------------------------
   -- agent: a model-driven loop (FC_AI_PROVIDERS, FC_AI_TOOLS, FC_AI_SKILLS). It talks to the
   -- user only through questions this engine renders and checks, and acts only through the
   -- tools its node lists. State per node in state.agent:
@@ -1792,7 +2177,11 @@ create or replace package body fc_engine as
     for i in 0 .. l_tools.get_size - 1 loop
       l_tid := substr(el_str(l_tools.get(i)), 1, 64);
       if not ag_has(json_array_t.parse(c_ai_builtins), l_tid) then
-        for t in (select description, parameters, is_write from fc_ai_tools where tool_id = l_tid and enabled = 'Y') loop
+        for t in (select description, parameters,
+                         case when is_write = 'Y'
+                                or (tool_type = 'REST' and upper(nvl(json_value(request, '$.method'), 'GET')) <> 'GET')
+                              then 'Y' else 'N' end is_write
+                    from fc_ai_tools where tool_id = l_tid and enabled = 'Y') loop
           if t.parameters is not null then l_par := json_object_t.parse(t.parameters);
           else l_par := json_object_t.parse('{"type":"object","properties":{}}'); end if;
           l_defs.append(ag_fn(l_tid, t.description || case when t.is_write = 'Y' then ' (changes data; the user is asked to confirm first)' end, l_par));
@@ -2116,6 +2505,8 @@ create or replace package body fc_engine as
       l_opts := fc_data.lov_options(p_t.target, p_args, obj(c.state, 'context'));
       for i in 0 .. least(l_opts.get_size, 100) - 1 loop l_cut.append(l_opts.get(i)); end loop;
       l_r.put('options', l_cut);
+    elsif p_t.tool_type = 'REST' then
+      l_r := rest_tool(c, p_node, p_t.tool_id, p_t.target, p_t.request, p_args);
     elsif p_t.tool_type = 'SEARCH' then
       if p_args.has('criteria') and p_args.get('criteria').is_array then
         l_crit := p_args.get_array('criteria');
@@ -2394,6 +2785,11 @@ create or replace package body fc_engine as
       return ag_err('Unknown tool "' || l_name || '"');
     end;
     l_args := ag_unpii(p_a, l_args);
+    -- A REST tool that isn't a GET always changes data, whatever IS_WRITE says.
+    if l_t.tool_type = 'REST' and l_t.request is not null
+       and upper(nvl(str(json_object_t.parse(l_t.request), 'method'), 'GET')) <> 'GET' then
+      l_t.is_write := 'Y';
+    end if;
     if l_t.is_write = 'Y' and l_t.needs_confirm = 'Y' and nvl(str(p_a, 'approved'), '~') <> str(p_call, 'id') then
       if l_t.confirm_text is not null then
         l_mv   := vals(c);
@@ -3325,7 +3721,7 @@ create or replace package body fc_engine as
         l_id := str(l_n, 'verified');
       elsif l_type = 'bulkUpdate' then
         l_id := str(l_n, 'done');
-      elsif l_type in ('message', 'lookup', 'set', 'email') then
+      elsif l_type in ('message', 'lookup', 'set', 'email', 'rest') then
         l_id := str(l_n, 'next');
       else
         exit;
@@ -3379,6 +3775,16 @@ create or replace package body fc_engine as
             c.state.put('current', l_id);
             l_id := ag_start(c, l_node, l_await);
             if l_await then return; end if;
+            if l_id is null and str(c.state, 'status') = 'failed' then return; end if;
+          end if;
+
+        when 'rest' then
+          -- Replaying an edit calls a GET again (answers it uses may have changed), quietly;
+          -- other methods never repeat.
+          if c.replay and upper(nvl(str(l_node, 'method'), 'GET')) <> 'GET' then
+            l_id := str(l_node, 'next');
+          else
+            l_id := run_rest(c, l_node, c.replay);
             if l_id is null and str(c.state, 'status') = 'failed' then return; end if;
           end if;
 

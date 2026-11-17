@@ -13,6 +13,7 @@ drop table fc_demo_branches purge;
 drop table fc_ai_providers purge;
 drop table fc_ai_tools purge;
 drop table fc_ai_skills purge;
+drop table fc_rest_endpoints purge;
 drop table fc_lovs purge;
 drop table fc_demo_customers purge;
 drop table fc_data_source_fields purge;

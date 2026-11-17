@@ -20,6 +20,7 @@ db/         install.sql              first-time install: runs 01..07, 09..12 in 
             upgrade_phase_d.sql      upgrades an existing install with Phase D: Verify step, lookup lists (keeps your data)
             upgrade_phase_e.sql      upgrades with Phase E: versions, resume, debug, PII masking, Repeat, Bulk update, files
             upgrade_phase_f.sql      upgrades with Phase F: Agent node (FC_AI_PROVIDERS, FC_AI_TOOLS, FC_AI_SKILLS)
+            upgrade_phase_g.sql      upgrades with the REST call node (FC_REST_ENDPOINTS)
             reinstall_packages.sql   re-creates FC_DATA, FC_ENGINE, FC_DESIGNER only (upgrades, compile fixes)
             01_tables.sql            FC_FLOWS, FC_FLOW_VERSIONS, FC_CONNECTORS, FC_SESSIONS, FC_EVENTS, FC_FILES
             02_data_sources.sql      FC_DATA_SOURCES (+ fields) registry tables
@@ -38,6 +39,7 @@ db/         install.sql              first-time install: runs 01..07, 09..12 in 
             14_seed_expense_flow.sql FC_DEMO_EXPENSES.submit_claim connector + publishes expense_claim
             15_ai_tables.sql         FC_AI_PROVIDERS, FC_AI_TOOLS, FC_AI_SKILLS (Agent node registries)
             16_seed_agent_demo.sql   Agent demo: FC_DEMO_LEAVE tables and connectors, 3 tools, a skill, flow leave_agent_demo
+            17_rest_endpoints.sql    FC_REST_ENDPOINTS (the APIs a REST call node may call)
 demo/       index.html               create demo (runs in the browser using the JS engine)
             update.html              search and update demo, with a live table and a conflict button
             verify.html              public-page demo: one-time code first, with an in-page outbox
@@ -53,7 +55,8 @@ tests/      engine.test.js           node tests/engine.test.js
             set.test.js              node tests/set.test.js (Set values node, context variables)
             menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
             email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
-            agent.test.js            node tests/agent.test.js (Agent node, scripted model: questions, tools, confirm, finish, handoff, limits, JSON mode, pick_record, files, PII placeholders, set_field)
+            rest.test.js             node tests/rest.test.js (REST call node: URL building, body template, mapping, routing, refusals, replay)
+            agent.test.js            node tests/agent.test.js (Agent node, scripted model: questions, tools, confirm, finish, handoff, limits, JSON mode, pick_record, files, PII placeholders, set_field, REST tools)
             apex-embed-test.html     designer inside a page-wide form, like APEX
             apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
             apex-plugin-test.html    the designer as the region plugin renders it (plugin AJAX callback, fake back end)
@@ -407,6 +410,60 @@ HR team",
   - **Edits:** an Edit that replays the flow doesn't send the email again.
   - **Spam:** a `to` filled from an answer lets anyone using the flow send that email to any address,
     so send to addresses typed by users only where that's fine (for example after a Verify step).
+- **REST call node:** calls a REST API and puts parts of its JSON answer into fields:
+  ```json
+  { "id": "get_rate", "type": "rest", "endpoint": "fx_rates", "method": "GET",
+    "path": "/rates/{{currency}}", "query": { "amount": "{{amount}}" },
+    "map": { "rate": "$.rate", "rate_date": "$.date", "first_bank": "$.sources[0].name" },
+    "statusSlot": "rate_status",
+    "message": "Today's rate is {{rate}}.", "notFoundMessage": "I don't know {{currency}}.",
+    "errorMessage": "The rate service isn't answering. Please try later.",
+    "next": "ask_amount", "onNotFound": "ask_currency", "onError": "manual_rate" }
+  ```
+  - **Endpoints are registered, not written in the flow.** `endpoint` is an id in
+    `FC_REST_ENDPOINTS`, which holds the base URL, the allowed methods (default `GET` only), an APEX
+    Web Credential for the key, headers sent on every call, the timeout and the largest response.
+    So a flow (or whoever can publish one) can't send data to a host you haven't registered, and no
+    key is ever in a flow:
+    ```sql
+    insert into fc_rest_endpoints (endpoint_id, base_url, allowed_methods, credential_static_id, description)
+    values ('fx_rates', 'https://api.example.com/v1', 'GET', 'FX_API_KEY', 'Exchange rates');
+    ```
+  - **The call:** `path` is added to the base URL and must start with `/` or `?`. Values in
+    `{{placeholders}}` in the path and `query` are URL-encoded, including `/` and `.`, so an answer
+    can't change the path. `headers` adds headers from templates; `Authorization`, `Cookie`, `Host`
+    and the like are refused (put them on the endpoint). `body` (not for GET) is a JSON template:
+    `"{{amount}}"` on its own keeps the answer's type (a number stays a number, a Repeat list stays a
+    list), and other strings are filled in as text.
+  - **The answer:** `map` puts values into fields by JSON path (`$.a.b`, `$.items[0].id`, or `$` for
+    all of it); a missing path clears the field. Mapped fields update bound page items like any
+    answer. `statusSlot` gets the HTTP status.
+  - **Routing:** 2xx goes to `next`. 404 goes to `onNotFound` when it's set. Any other status, a
+    timeout, a response that's too big, or a refused call shows `errorMessage` and goes to
+    `onError`; without `onError` the conversation ends as failed.
+  - **Edits:** when an Edit replays the flow, a GET runs again quietly with the new answers, and
+    other methods are not repeated.
+  - **Debug:** the debug log gets an event `rest` with the method, path, status, time and the mapped
+    field names, never the response body.
+  - **APEX:** FC_ENGINE calls `APEX_WEB_SERVICE.MAKE_REST_REQUEST` with the endpoint's Web Credential
+    and wallet. The database needs a network ACL for the host, and an https host needs a wallet (the
+    endpoint's `WALLET_PATH`, or the instance wallet in APEX), as for the Agent's model provider:
+    ```sql
+    begin
+      dbms_network_acl_admin.append_host_ace(
+        host => 'api.example.com',
+        ace  => xs$ace_type(privilege_list => xs$name_list('http'),
+                            principal_name => 'APEX_230200', principal_type => xs_acl.ptype_db));
+    end;
+    /
+    ```
+  - **JavaScript engine:** pass `createEngine({ restEndpoints: { fx_rates: { baseUrl, methods: ['GET'],
+    headers: { Authorization: 'Bearer ...' }, timeoutMs: 20000 } } })` (it uses `fetch`, or
+    `options.fetch`), or `rest: (req) => ({ status, body })` to make the call yourself. Keep keys on
+    the server: in the browser demo anyone can read them.
+  - **Designer:** the endpoint field lists `FC_REST_ENDPOINTS` (database mode) and checks the
+    method against it. The Test tab never calls the API: each REST call node answers with a mock
+    (`{"status": 200, "body": {...}}`, with buttons for 404, 500 and a timeout).
 - **Signed-in user:** `{{app_user}}` is built in and works in any message, prompt or condition
   (`{"slot": "app_user", "op": "=", "value": "ADMIN"}`) with no field or binding. In APEX, FC_ENGINE
   fills it from the APEX session (`APP_USER`), so the browser can't change it. A slot or context value
@@ -801,6 +858,24 @@ values ('leave_policy', 'Leave policy', 'Rules for annual and sick leave', 'Annu
           '{"type":"object","properties":{"last_name":{"type":"string"}}}',
           '{{last_name}}, {{first_name}}', '{{department}}');
   ```
+- **REST** calls an endpoint from `FC_REST_ENDPOINTS` (`TARGET`), with the same rules as the REST
+  call node: registered host, Web Credential, allowed methods, URL-encoded values, no
+  `Authorization` header from the request. `REQUEST` is the request template, and its
+  `{{placeholders}}` are the model's arguments (plus `{{app_user}}`, which the model can't change):
+  ```sql
+  insert into fc_ai_tools (tool_id, tool_type, target, description, parameters, request)
+  values ('public_holidays', 'REST', 'hr_api', 'Public holidays in a year and region',
+          '{"type":"object","properties":{"year":{"type":"string"},"region":{"type":"string"}},"required":["year"]}',
+          '{"method":"GET","path":"/holidays/{{year}}","query":{"region":"{{region}}"},
+            "map":{"dates":"$.items","count":"$.total"}}');
+  ```
+  The model gets `{"status": 200, "data": ...}`: the `map`ped values, or the whole JSON answer when
+  there's no `map` (cut to 6,000 characters, with `"truncated": true`). A 404 comes back as
+  `{"status": 404, "found": false}`, and anything else as `{"error": "..."}`, so the model can
+  explain or try again. **A REST tool whose method isn't GET always asks the user to confirm first**
+  (it counts as a write tool whatever `IS_WRITE` says; `NEEDS_CONFIRM = 'N'` still turns that off).
+  Its `body` template works like the node's: `"{{days}}"` alone keeps the argument's type. Calls
+  are in the debug log as event `rest` with the tool id, never with the answer.
 
 A tool runs only if the node lists it, and its result reaches the model cut to 8,000 characters.
 **Skills** load in stages: the prompt carries only each skill's name and description, and the
@@ -853,6 +928,9 @@ Samples in the designer). It uses a provider registered as `corp_llm`.
   exist, adds the Phase 2 columns `TITLE_TEMPLATE` and `SUBTITLE_TEMPLATE`) and recompiles the
   packages. Re-running it is safe.
 - On a new instance, `install.sql` includes them.
+- **REST call node and REST tools:** on an existing install run `@upgrade_phase_g.sql` (after
+  `upgrade_phase_f.sql`). It creates `FC_REST_ENDPOINTS`, adds `FC_AI_TOOLS.REQUEST` and the `REST`
+  tool type, and recompiles the packages. `install.sql` includes it.
 
 ## Turn protocol
 
@@ -870,10 +948,13 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 87 unit tests (`tests/engine.test.js`,
+- The JavaScript engine and widget are tested: 96 unit tests (`tests/engine.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
-  `tests/email.test.js`, `tests/agent.test.js`), plus manual end-to-end runs of the demos.
+  `tests/email.test.js`, `tests/agent.test.js`, `tests/rest.test.js`), plus manual end-to-end runs of the demos.
+- **The REST call node's and REST tools' PL/SQL (`run_rest`, `rest_call`, `rest_tool` and the other `rest_*` helpers in `FC_ENGINE`,
+  `17_rest_endpoints.sql`, `list_rest` in `FC_DESIGNER`) has not been compiled or called a real API
+  yet.** It mirrors the tested JavaScript engine.
 - **The Agent node's PL/SQL (the `ag_*` routines in `FC_ENGINE`, `15_ai_tables.sql`, `list_ai` in
   `FC_DESIGNER`) has not been compiled or run against a real model yet.** It mirrors the tested
   JavaScript engine.

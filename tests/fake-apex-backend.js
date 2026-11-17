@@ -195,6 +195,7 @@
     sampleRows: function (db, p) { return clone(db.rows[p.id] || []).slice(0, p.limit || 20); },
     listConnectors: function (db) { return clone(db.connectors); },
     listAi: function (db) { return clone(db.ai || { providers: [], tools: [], skills: [] }); },
+    listRest: function (db) { return clone(db.rest || [{ id: 'fx_rates', baseUrl: 'https://api.example.com/v1', methods: 'GET', credential: true, description: 'Exchange rates (demo)' }]); },
     listLovs: function (db) { return clone(db.lovs || []); },
     lovOptions: function (db, p) {
       var l = (db.lovs || []).find(function (x) { return x.id === p.id; });

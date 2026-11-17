@@ -259,5 +259,58 @@ function engine(steps, extra, seen) {
     assert.strictEqual(t.await.nodeId, 'review');
     assert.ok(!JSON.stringify(seen.map((r) => r.messages)).includes('0412 555 123'));
   });
+  await test('a REST tool: GET fills the request from the arguments and returns mapped data; a POST waits for Confirm', async () => {
+    const reqs = [];
+    const tools = {
+      holidays: { description: 'Public holidays in a year', type: 'rest', target: 'hr_api',
+                  request: { method: 'GET', path: '/holidays/{{year}}', query: { region: '{{region}}', user: '{{app_user}}' },
+                             map: { count: '$.items.length', first: '$.items[0].name' } },
+                  parameters: { type: 'object', properties: { year: { type: 'string' }, region: { type: 'string' } } } },
+      raw: { description: 'Raw', type: 'rest', target: 'hr_api', request: { path: '/raw' } },
+      file_leave: { description: 'File the leave in HR', type: 'rest', target: 'hr_api',
+                    request: { method: 'POST', path: '/leave', body: { days: '{{days}}', note: 'by {{app_user}}' }, map: { ref: '$.id' } } }
+    };
+    const rest = (req) => {
+      reqs.push(req);
+      if (req.path === '/raw') return { status: 200, body: JSON.stringify({ big: 'x'.repeat(9000) }) };
+      if (req.method === 'POST') return { status: 201, body: '{"id": "HR-9"}' };
+      if (req.path.indexOf('/holidays/1999') === 0) return { status: 404, body: '' };
+      return { status: 200, body: { items: [{ name: 'New Year' }, { name: 'Easter' }] } };
+    };
+    const { eng } = engine([
+      { tool_calls: [call('holidays', { year: '2026/../admin', region: 'NSW' })] },
+      (req) => { assert.deepStrictEqual(lastTool(req), { status: 200, data: { count: null, first: 'New Year' } });
+                 return { tool_calls: [call('holidays', { year: '1999', region: 'NSW' })] }; },
+      (req) => { assert.deepStrictEqual(lastTool(req), { status: 404, found: false });
+                 return { tool_calls: [call('raw', {})] }; },
+      (req) => { const r = lastTool(req); assert.strictEqual(r.truncated, true); assert.strictEqual(r.data.length, 6000);
+                 return { tool_calls: [call('file_leave', { days: 3 }, 'f1')] }; },
+      (req) => { assert.deepStrictEqual(lastTool(req), { status: 201, data: { ref: 'HR-9' } });
+                 return { tool_calls: [call('finish', { fields: { leave_type: 'annual', days: 3 } })] }; }
+    ], { agent: { tools: ['holidays', 'raw', 'file_leave'] }, opts: { aiTools: tools, rest } });
+    let t = await eng.start('leave', {});
+    assert.strictEqual(reqs[0].endpoint, 'hr_api');
+    assert.strictEqual(reqs[0].path, '/holidays/2026%2F%2E%2E%2Fadmin?region=NSW&user=JSMITH');
+    assert.strictEqual(reqs[0].tool, 'holidays');
+    assert.match(texts(t), /Please confirm: File the leave in HR\ndays: 3/);   // not a GET: confirmed first
+    assert.strictEqual(reqs.length, 3);
+    t = await eng.input(t.sessionId, { value: 'confirm' });
+    assert.deepStrictEqual(reqs[3].body, { days: 3, note: 'by JSMITH' });
+    assert.strictEqual(t.await.nodeId, 'review');
+  });
+  await test('a REST tool error reaches the model as {error}, and the endpoint registry still applies', async () => {
+    const tools = { del: { description: 'Delete', type: 'rest', target: 'hr_api', confirm: false, request: { method: 'DELETE', path: '/x' } },
+                    bad: { description: 'Bad', type: 'rest', target: 'hr_api', request: { path: 'https://evil.example.com/' } } };
+    const { eng } = engine([
+      { tool_calls: [call('del', {})] },
+      (req) => { assert.deepStrictEqual(lastTool(req), { error: 'endpoint "hr_api" does not allow DELETE' });
+                 return { tool_calls: [call('bad', {})] }; },
+      (req) => { assert.deepStrictEqual(lastTool(req), { error: 'the path must start with / or ?' });
+                 return { tool_calls: [call('give_up', { reason: 'done testing' })] }; }
+    ], { agent: { tools: ['del', 'bad'] }, opts: { aiTools: tools, restEndpoints: { hr_api: { baseUrl: 'https://hr.example.com', methods: ['GET'] } },
+                                                    fetch: () => { throw new Error('must not be called'); } } });
+    const t = await eng.start('leave', {});
+    assert.match(texts(t), /Please use the leave form/);
+  });
   console.log(passed + ' passed');
 })();

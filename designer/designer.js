@@ -135,6 +135,8 @@
                  make: (id) => ({ id, type: 'agent', provider: '', goal: '', outputs: [] }) },
     email:     { label: 'Email',     color: '#ea580c', desc: 'Send an email built from the answers (APEX_MAIL, or a connector).',
                  make: (id) => ({ id, type: 'email', to: '', from: '', subject: '', body: '' }) },
+    rest:      { label: 'REST call', color: '#4f46e5', desc: 'Call a REST API registered in FC_REST_ENDPOINTS and put parts of its JSON answer into fields.',
+                 make: (id) => ({ id, type: 'rest', endpoint: '', method: 'GET', path: '/', map: {} }) },
     end:       { label: 'End',       color: '#475569', desc: 'Finish the conversation.',
                  make: (id) => ({ id, type: 'end', text: 'All done!' }) },
     repeat:    { label: 'Repeat',    color: '#0284c7', desc: 'Collect a list of items (line items, children, expenses), each with its own questions.',
@@ -330,6 +332,7 @@
       case 'lookup': return [{ key: 'next', label: 'next' }, { key: 'onNotFound', label: 'not found', optional: true }];
       case 'submit': return [{ key: 'onSuccess', label: 'success' }, { key: 'onError', label: 'error', optional: true }];
       case 'email': return [{ key: 'next', label: 'sent' }, { key: 'onError', label: 'error', optional: true }];
+      case 'rest': return [{ key: 'next', label: 'ok' }, { key: 'onNotFound', label: '404', optional: true }, { key: 'onError', label: 'error', optional: true }];
       case 'agent': return [{ key: 'next', label: 'finished' }]
         .concat((n.exits || []).map((e, i) => ({ key: 'exit:' + i, label: e.name || 'exit ' + (i + 1) })))
         .concat([{ key: 'onError', label: 'error', optional: true }]);
@@ -412,7 +415,11 @@
   }
   function setSlots() {
     const out = [];
-    S.flow.nodes.forEach((n) => { if (n.type === 'set') (n.assign || []).forEach((a) => { if (a.slot && out.indexOf(a.slot) < 0) out.push(a.slot); }); });
+    const push = (k) => { if (k && out.indexOf(k) < 0) out.push(k); };
+    S.flow.nodes.forEach((n) => {
+      if (n.type === 'set') (n.assign || []).forEach((a) => push(a.slot));
+      if (n.type === 'rest') { Object.keys(n.map || {}).forEach(push); push(n.statusSlot); }
+    });
     return out;
   }
   // Values a search criterion can use: answers, Set values, context values, other records' fields
@@ -538,6 +545,13 @@
       ['text', 'prompt', 'to', 'cc', 'bcc', 'replyTo', 'from', 'subject', 'body', 'message', 'errorMessage']
         .forEach((k) => { if (typeof n[k] === 'string') n[k] = n[k].replace(re, '{{' + newSlot + '}}'); });
       if (n.type === 'email' && n.attachments) n.attachments = n.attachments.map((s) => (s === oldSlot ? newSlot : s));
+      if (n.type === 'rest') {
+        if (n.map && oldSlot in n.map && !(newSlot in n.map)) { n.map[newSlot] = n.map[oldSlot]; delete n.map[oldSlot]; }
+        if (n.statusSlot === oldSlot) n.statusSlot = newSlot;
+        ['path', 'notFoundMessage'].forEach((k) => { if (typeof n[k] === 'string') n[k] = n[k].replace(re, '{{' + newSlot + '}}'); });
+        ['query', 'headers'].forEach((k) => Object.keys(n[k] || {}).forEach((q) => { n[k][q] = String(n[k][q]).replace(re, '{{' + newSlot + '}}'); }));
+        if (n.body !== undefined) n.body = JSON.parse(JSON.stringify(n.body).replace(re, '{{' + newSlot + '}}'));
+      }
       if (n.type === 'agent') {
         (n.outputs || []).forEach((o) => { if (o.name === oldSlot) o.name = newSlot; });
         if (n.inputs) n.inputs = n.inputs.map((s) => (s === oldSlot ? newSlot : s));
@@ -917,6 +931,32 @@
           (n.attachments || []).forEach((a) => { if (files.indexOf(a) < 0) add('error', 'Attachment "' + a + '" is not a file answer.', n.id); });
           break;
         }
+        case 'rest': {
+          const m = String(n.method || 'GET').toUpperCase();
+          if (!n.endpoint) add('error', 'REST call has no endpoint.', n.id);
+          else if (BACKEND && S.rest) {
+            const ep = S.rest.find((x) => x.id === n.endpoint);
+            if (!ep) add('error', 'Endpoint "' + n.endpoint + '" is not in FC_REST_ENDPOINTS (or not enabled).', n.id);
+            else if (String(ep.methods || 'GET').split(',').indexOf(m) < 0) add('error', 'Endpoint "' + n.endpoint + '" allows only ' + (ep.methods || 'GET') + ', not ' + m + '.', n.id);
+          }
+          if (n.path && !/^[\/?]/.test(n.path)) add('error', 'The path must start with / or ?.', n.id);
+          if (/^\/\/|:\/\/|\\/.test(n.path || '')) add('error', 'The path must be relative to the endpoint (no host).', n.id);
+          Object.keys(n.headers || {}).forEach((k) => {
+            if (REST_BLOCKED.test(k) || !/^[A-Za-z0-9-]+$/.test(k)) add('error', 'Header "' + k + '" can only be set on the endpoint (FC_REST_ENDPOINTS.EXTRA_HEADERS or its Web Credential).', n.id);
+          });
+          Object.keys(n.map || {}).forEach((k) => {
+            if (k === BUILTIN_USER) add('error', '"' + BUILTIN_USER + '" is set by the server and can\'t be changed.', n.id);
+            else if (!/^[a-z][a-z0-9_]{0,99}$/.test(k)) add('error', 'Field name "' + k + '" must be lowercase letters, digits and _.', n.id);
+          });
+          if (n.statusSlot && !/^[a-z][a-z0-9_]{0,99}$/.test(n.statusSlot)) add('error', 'Status field "' + n.statusSlot + '" must be lowercase letters, digits and _.', n.id);
+          if (m === 'GET' && n.body !== undefined) add('warning', 'A GET sends no body; the body template is ignored.', n.id);
+          if (m !== 'GET' && !Object.keys(n.map || {}).length && !n.message) add('warning', 'Nothing tells the user the call worked: add a message or map a field.', n.id);
+          if (m === 'GET' && !Object.keys(n.map || {}).length && !n.statusSlot) add('warning', 'The GET result is not used: map at least one field.', n.id);
+          ['path', 'message', 'errorMessage', 'notFoundMessage'].forEach((k) => placeholders(n[k], n.id));
+          ['query', 'headers'].forEach((k) => Object.keys(n[k] || {}).forEach((q) => placeholders(n[k][q], n.id)));
+          if (n.body !== undefined) placeholders(JSON.stringify(n.body), n.id);
+          break;
+        }
         case 'set': {
           if (!(n.assign || []).length) add('warning', 'Set values sets nothing.', n.id);
           (n.assign || []).forEach((a) => {
@@ -1136,6 +1176,8 @@
       case 'lookup': case 'submit': return n.connector ? 'Calls ' + n.connector : '';
       case 'agent': return n.goal ? (n.provider ? '[' + n.provider + '] ' : '') + n.goal : 'No task yet';
       case 'email': return n.to ? 'To ' + n.to + (n.subject ? ': ' + n.subject : '') : 'No recipient yet';
+      case 'rest': return n.endpoint ? (n.method || 'GET') + ' ' + n.endpoint + (n.path && n.path !== '/' ? ' ' + n.path : '') +
+        (Object.keys(n.map || {}).length ? ' → ' + Object.keys(n.map).join(', ') : '') : 'No endpoint yet';
       case 'verify': return n.slot ? 'Send a code to ' + n.slot + (n.connector ? ' via ' + n.connector : '') : '';
       case 'findRecord': return n.source ? (n.requireVerified ? '\uD83D\uDD12 ' : '') + 'Search ' + n.source + (n.as ? ' → ' + n.as : '') : '';
       case 'changeFields': return n.record ? 'Edit ' + (n.fields || []).length + ' field(s) of ' + n.record : '';
@@ -1506,7 +1548,7 @@
     );
     const editors = { message: textEditor, end: textEditor, ask: askEditor, condition: condEditor, lookup: connEditor, submit: connEditor,
                       summary: summaryEditor, verify: verifyEditor, findRecord: findEditor, changeFields: changeEditor, saveChanges: saveEditor,
-                      repeat: repeatEditor, bulkUpdate: bulkEditor, set: setEditor, menu: menuEditor, email: emailEditor, agent: agentEditor };
+                      repeat: repeatEditor, bulkUpdate: bulkEditor, set: setEditor, menu: menuEditor, email: emailEditor, rest: restEditor, agent: agentEditor };
     body.append(editors[n.type](n));
     if (n.type !== 'condition' && n.type !== 'menu' && n.type !== 'agent' && n.type !== 'end') {
       body.append(h('h4', { class: 'sub', text: 'Connections' }));
@@ -1514,8 +1556,10 @@
       ports(n).forEach((p) => body.append(F(n.type === 'summary' ? 'After confirm, go to'
         : n.type === 'repeat' ? 'When the list is done, go to'
         : n.type === 'bulkUpdate' && bulkTitles[p.key] ? bulkTitles[p.key] : PORT_TITLES[p.key], targetSelect(n, p.key),
-        p.key === 'onNotFound' ? 'Optional. Used when the connector returns found: false.' :
+        p.key === 'onNotFound' ? (n.type === 'rest' ? 'Optional. Used when the API answers 404 (not found); without it a 404 is an error.'
+          : 'Optional. Used when the connector returns found: false.') :
         p.key === 'onError' ? (n.type === 'email' ? 'Optional. Without it the flow shows the error and carries on to the next step.'
+          : n.type === 'rest' ? 'Optional. Used for any other status, a timeout or a refused call. Without it the conversation ends as failed.'
           : 'Optional. Without it a failed submit ends the conversation.') : PORT_HINTS[p.key] || null)));
     }
     const probs = analyze().list.filter((x) => x.nodeId === n.id);
@@ -2213,6 +2257,88 @@
     return wrap;
   }
 
+  // ---- REST call
+  const REST_BLOCKED = /^(authorization|cookie|host|content-length|transfer-encoding|connection|proxy-.*|x-forwarded-.*)$/i;
+  // name -> value rows over an object property (query, headers, response mapping)
+  function kvRows(n, prop, o) {
+    const box = h('div', { class: 'card' }, h('div', { class: 'card-h', text: o.title }));
+    if (o.hint) box.append(h('p', { class: 'hint', text: o.hint }));
+    const obj = n[prop] || {};
+    const keys = Object.keys(obj);
+    const put = (fn) => mutate(() => {
+      const cur = Object.assign({}, n[prop] || {});
+      fn(cur);
+      if (Object.keys(cur).length || o.keepEmpty) n[prop] = cur; else delete n[prop];
+    }, { panel: true });
+    keys.forEach((k, i) => {
+      const kIn = h('input', { class: 'in mono', value: k, placeholder: o.keyPh });
+      kIn.addEventListener('change', () => put((cur) => {
+        const nk = kIn.value.trim(), out = {};
+        Object.keys(cur).forEach((x) => { out[x === k ? nk : x] = cur[x]; });
+        Object.keys(cur).forEach((x) => delete cur[x]);
+        Object.keys(out).forEach((x) => { if (x) cur[x] = out[x]; });
+      }));
+      const vIn = bound(() => obj[k], (v) => { n[prop] = n[prop] || {}; n[prop][k] = v; }, { mono: true, key: n.id + '.' + prop + '.' + i, placeholder: o.valPh });
+      box.append(h('div', { class: 'grid2 kv' }, kIn, h('div', { class: 'rowx' }, vIn,
+        h('button', { class: 'btn', text: '×', title: 'Remove', onclick: () => put((cur) => { delete cur[k]; }) }))));
+    });
+    const add = h('button', { class: 'btn', text: o.addLabel, onclick: () => put((cur) => {
+      let k = o.newKey, i = 2;
+      while (k in cur) k = o.newKey + '_' + i++;
+      cur[k] = o.newVal;
+    }) });
+    box.append(h('div', { class: 'rowx' }, add));
+    return box;
+  }
+  function restEditor(n) {
+    const wrap = h('div');
+    const eps = S.rest || [];
+    const m = String(n.method || 'GET').toUpperCase();
+    const listId = 'fcd-restlist';
+    let dl = document.getElementById(listId);
+    if (!dl) { dl = h('datalist', { id: listId }); ROOT.append(dl); }
+    dl.textContent = '';
+    eps.forEach((e) => dl.append(h('option', { value: e.id, label: e.methods + ' ' + e.baseUrl + (e.description ? ' · ' + e.description : '') })));
+    const epIn = bound(() => n.endpoint, (v) => setOrDelete(n, 'endpoint', v.trim()), { mono: true, key: n.id + '.rep', placeholder: 'endpoint_id', onChange: true, panel: true });
+    epIn.setAttribute('list', listId);
+    const ep = eps.find((e) => e.id === n.endpoint);
+    wrap.append(F('Endpoint', epIn, ep ? ep.baseUrl + ' · allows ' + ep.methods + (ep.credential ? ' · uses a Web Credential' : '')
+      : 'Registered in FC_REST_ENDPOINTS (base URL, Web Credential, allowed methods). The flow never holds the host name or a key.'));
+    wrap.append(h('div', { class: 'grid2' },
+      F('Method', sel(['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], m, (v) => mutate(() => { n.method = v; if (v === 'GET') delete n.body; }, { panel: true }))),
+      F('Path', bound(() => n.path, (v) => setOrDelete(n, 'path', v.trim()), { mono: true, key: n.id + '.rpath', placeholder: '/customers/{{customer_id}}' }))));
+    wrap.append(h('p', { class: 'hint', text: 'Added to the endpoint\'s base URL. {{placeholders}} are URL-encoded, so an answer can\'t change the path.' }));
+    wrap.append(kvRows(n, 'query', { title: 'Query parameters', keyPh: 'name', valPh: '{{field}}', addLabel: '+ Parameter', newKey: 'param', newVal: '' }));
+    wrap.append(F(null, checkbox('Leave out empty query parameters', !!n.skipEmptyQuery, (c) => mutate(() => { if (c) n.skipEmptyQuery = true; else delete n.skipEmptyQuery; }))));
+    if (m !== 'GET') {
+      const ta = h('textarea', { class: 'in mono', rows: 6, spellcheck: 'false', placeholder: '{"amount": "{{amount}}", "note": "From {{name}}"}' });
+      ta.value = n.body === undefined ? '' : JSON.stringify(n.body, null, 2);
+      const check = () => {
+        let ok = true;
+        if (ta.value.trim()) { try { JSON.parse(ta.value); } catch (e) { ok = false; } }
+        ta.classList.toggle('bad', !ok);
+        return ok;
+      };
+      ta.addEventListener('input', () => { if (check()) mutate(() => { if (ta.value.trim()) n.body = JSON.parse(ta.value); else delete n.body; }, { key: n.id + '.rbody' }); });
+      check();
+      wrap.append(F('JSON body', ta, '"{{field}}" on its own keeps the answer\'s type (a number stays a number, a list stays a list); other text has its placeholders filled in.'), slotChips(ta));
+    }
+    wrap.append(kvRows(n, 'map', { title: 'Put into fields', keyPh: 'field', valPh: '$.data.name',
+      hint: 'Field ← JSON path in the answer: $.rate, $.items[0].id, or $ for the whole answer. The fields update bound form items.',
+      addLabel: '+ Field', newKey: 'field', newVal: '$.', keepEmpty: true }));
+    wrap.append(F('HTTP status into field (optional)', bound(() => n.statusSlot, (v) => setOrDelete(n, 'statusSlot', v.trim()), { mono: true, key: n.id + '.rstat', placeholder: 'http_status' })));
+    wrap.append(kvRows(n, 'headers', { title: 'Extra headers (optional)', keyPh: 'X-Header', valPh: '{{field}}', addLabel: '+ Header', newKey: 'X-Header', newVal: '',
+      hint: 'No secrets here: Authorization, Cookie and keys belong to the endpoint (its Web Credential or EXTRA_HEADERS).' }));
+    wrap.append(h('h4', { class: 'sub', text: 'Chat messages' }));
+    wrap.append(F('After the call (optional)', bound(() => n.message, (v) => setOrDelete(n, 'message', v), { key: n.id + '.rmsg', placeholder: 'Today\'s rate is {{rate}}.' })));
+    wrap.append(F('On 404 (optional)', bound(() => n.notFoundMessage, (v) => setOrDelete(n, 'notFoundMessage', v), { key: n.id + '.rnf', placeholder: 'I couldn\'t find that.' })));
+    wrap.append(F('If the call fails', bound(() => n.errorMessage, (v) => setOrDelete(n, 'errorMessage', v), { key: n.id + '.rerr', placeholder: 'Sorry, I couldn\'t get that information right now.' })));
+    wrap.append(h('div', { class: 'card' }, h('div', { class: 'hint', style: 'margin:0', text:
+      'When the user edits an earlier answer, a GET runs again (quietly) with the new values; other methods are never repeated. In Test, nothing is called: the mock answer is used.' }),
+      h('button', { class: 'lnk', text: 'Edit the test mock →', onclick: () => setTab('test') })));
+    return wrap;
+  }
+
   // ---- agent
   const AGENT_KINDS = [['text', 'Text'], ['number', 'Number'], ['date', 'Date'], ['email', 'Email'], ['yesno', 'Yes / no'], ['choice', 'Choice'],
                        ['file', 'File (the user uploads it)']];
@@ -2799,7 +2925,8 @@
   const scriptFor = (n) => (S.mocks['agent:' + n.id] !== undefined ? S.mocks['agent:' + n.id] : defaultScript(n));
   const toolReg = (id) => (aiCat().tools || []).find((t) => t.id === id) || {};
   const toolMockFor = (id) => (S.mocks['tool:' + id] !== undefined ? S.mocks['tool:' + id]
-    : JSON.stringify(toolReg(id).type === 'search' ? { rows: [{ id: 1, name: 'Example record' }, { id: 2, name: 'Another record' }] } : { ok: true }, null, 2));
+    : JSON.stringify(toolReg(id).type === 'search' ? { rows: [{ id: 1, name: 'Example record' }, { id: 2, name: 'Another record' }] }
+      : toolReg(id).type === 'rest' ? { status: 200, data: {} } : { ok: true }, null, 2));
   function testAi() {
     const providers = {}, tools = {}, skills = {}, cursor = {};
     agentNodes().forEach((n) => {
@@ -2830,6 +2957,29 @@
     return { providers, tools, skills };
   }
 
+  // REST call test doubles: Test never calls the API; each REST node answers with its mock.
+  const restNodes = () => S.flow.nodes.filter((n) => n.type === 'rest');
+  function defaultRestMock(n) {
+    const body = {};
+    Object.keys(n.map || {}).forEach((k) => {
+      const parts = String(n.map[k] || '$').replace(/^\$\.?/, '').split('.').filter(Boolean);
+      if (!parts.length || /\[/.test(n.map[k])) return;
+      let cur = body;
+      parts.forEach((p, i) => { if (i === parts.length - 1) cur[p] = 'test ' + k; else cur = cur[p] = (cur[p] && typeof cur[p] === 'object') ? cur[p] : {}; });
+    });
+    return JSON.stringify({ status: 200, body }, null, 2);
+  }
+  const restMockFor = (n) => (S.mocks['rest:' + n.id] !== undefined ? S.mocks['rest:' + n.id] : defaultRestMock(n));
+  function testRest(req) {
+    const n = restNodes().find((x) => x.id === req.nodeId);
+    let r;
+    try { r = JSON.parse(restMockFor(n)); } catch (e) { throw new Error('The test mock for REST call "' + req.nodeId + '" is not valid JSON.'); }
+    if (r && r.error) throw new Error(String(r.error));
+    toast('Test REST call (not sent): ' + req.method + ' ' + req.endpoint + req.path + (req.body !== undefined ? ' with ' + JSON.stringify(req.body).slice(0, 120) : '') +
+      ' → ' + (r.status || 200), 6000);
+    return { status: r.status || 200, body: r.body === undefined ? null : r.body };
+  }
+
   const mockFor = (id, role) => (S.mocks[id] !== undefined ? S.mocks[id] : JSON.stringify(ROLE_PRESETS[role][0][1], null, 2));
 
   let testSources = {};
@@ -2841,8 +2991,8 @@
     const ids = Object.keys(uses);
     const srcs = sourceUses();
     const lvs = Object.keys(lovUses());
-    const agents = agentNodes(), tids = agentToolIds();
-    if (!ids.length && !srcs.length && !lvs.length && !agents.length) { box.append(h('p', { class: 'hint', text: 'This flow calls no connectors, data sources or lookup lists.' })); return; }
+    const agents = agentNodes(), tids = agentToolIds(), rests = restNodes();
+    if (!ids.length && !srcs.length && !lvs.length && !agents.length && !rests.length) { box.append(h('p', { class: 'hint', text: 'This flow calls no connectors, data sources or lookup lists.' })); return; }
     const jsonArea = (get, key, rows, isArr) => {
       const ta = h('textarea', { class: 'in mono', rows, spellcheck: 'false' });
       ta.value = get();
@@ -2851,6 +3001,17 @@
       check();
       return ta;
     };
+    rests.forEach((n) => {
+      box.append(h('div', { class: 'card mock' },
+        h('div', { class: 'card-h' }, h('span', { class: 'mono grow', text: n.id }), h('span', { class: 'chip', text: 'REST ' + (n.method || 'GET') + ' ' + (n.endpoint || '?') })),
+        h('p', { class: 'hint', text: 'Test answers with this instead of calling the API: {"status": 200, "body": {...}}. Try 404, 500, or {"error": "timeout"}.' }),
+        h('div', { class: 'rowx' },
+          h('button', { class: 'btn', text: '200', onclick: () => { delete S.mocks['rest:' + n.id]; save(); renderMocks(); } }),
+          h('button', { class: 'btn', text: '404', onclick: () => { S.mocks['rest:' + n.id] = JSON.stringify({ status: 404, body: { message: 'Not found' } }, null, 2); save(); renderMocks(); } }),
+          h('button', { class: 'btn', text: '500', onclick: () => { S.mocks['rest:' + n.id] = JSON.stringify({ status: 500, body: { message: 'Server error' } }, null, 2); save(); renderMocks(); } }),
+          h('button', { class: 'btn', text: 'Timeout', onclick: () => { S.mocks['rest:' + n.id] = JSON.stringify({ error: 'no answer within 20 seconds' }, null, 2); save(); renderMocks(); } })),
+        jsonArea(() => restMockFor(n), 'rest:' + n.id, 6, false)));
+    });
     agents.forEach((n) => {
       box.append(h('div', { class: 'card mock' },
         h('div', { class: 'card-h' }, h('span', { class: 'mono grow', text: n.id }), h('span', { class: 'chip', text: 'agent script' })),
@@ -2862,7 +3023,7 @@
     tids.forEach((id) => {
       const reg = (aiCat().tools || []).find((t) => t.id === id);
       box.append(h('div', { class: 'card mock' },
-        h('div', { class: 'card-h' }, h('span', { class: 'mono grow', text: id }), h('span', { class: 'chip', text: 'agent tool' })),
+        h('div', { class: 'card-h' }, h('span', { class: 'mono grow', text: id }), h('span', { class: 'chip', text: toolReg(id).type === 'rest' ? 'REST tool ' + (toolReg(id).method || 'GET') + ' ' + toolReg(id).target : 'agent tool' })),
         reg ? h('p', { class: 'hint', text: reg.write ? 'Writes data (FC_AI_TOOLS): the user confirms before it runs.' : 'Read only (FC_AI_TOOLS).' })
             : checkbox('Writes data (the user confirms before it runs)', S.mocks['toolw:' + id] === '1',
                        (c) => { if (c) S.mocks['toolw:' + id] = '1'; else delete S.mocks['toolw:' + id]; save(); }),
@@ -3053,7 +3214,7 @@
     const appUser = (window.apex && apex.env && apex.env.APP_USER) || 'TEST_USER';
     testDebug = [];
     testEngine = FlowChatEngine.createEngine({ flows: [flow], connectors, dataSources: buildTestSources(), lovs: buildTestLovs(), appUser,
-      sendEmail: (m) => { showTestEmail(m); return { ok: true }; },
+      sendEmail: (m) => { showTestEmail(m); return { ok: true }; }, rest: testRest,
       aiProviders: ai.providers, aiTools: ai.tools, aiSkills: ai.skills,
       onDebug: flow.debug ? (e) => { testDebug.push(e); } : null });
     const chat = $('simChat');
@@ -3236,6 +3397,8 @@
       S.dbConnectors = res[1] || [];
       // Older FC_DESIGNER packages have no listAi: then agent providers and tools aren't checked.
       try { S.ai = (await BACKEND.call('listAi')) || null; } catch (e) { S.ai = null; }
+      // Older FC_DESIGNER packages have no listRest: then REST endpoints aren't checked.
+      try { S.rest = (await BACKEND.call('listRest')) || null; } catch (e) { S.rest = null; }
       // Older FC_DESIGNER packages have no listLovs: then lookup lists simply aren't checked.
       try { S.dbLovs = (await BACKEND.call('listLovs')) || []; lovError = null; } catch (e) { S.dbLovs = null; lovError = e.message; }
       lovReloadAt = Date.now();

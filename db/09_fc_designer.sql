@@ -502,14 +502,16 @@ create or replace package body fc_designer as
     end loop;
     l_res.put('providers', l_arr);
     l_arr := json_array_t();
-    for t in (select tool_id, tool_type, target, description, is_write, title_template, subtitle_template
+    for t in (select tool_id, tool_type, target, description, is_write, title_template, subtitle_template,
+                     case when tool_type = 'REST' then upper(nvl(json_value(request, '$.method'), 'GET')) end rest_method
                 from fc_ai_tools where enabled = 'Y' order by tool_id) loop
       l_o := json_object_t();
       l_o.put('id', t.tool_id);
       l_o.put('type', lower(t.tool_type));
       l_o.put('target', t.target);
       l_o.put('description', t.description);
-      l_o.put('write', t.is_write = 'Y');
+      l_o.put('write', t.is_write = 'Y' or nvl(t.rest_method, 'GET') <> 'GET');
+      if t.rest_method is not null then l_o.put('method', t.rest_method); end if;
       if t.title_template is not null then l_o.put('titleTemplate', t.title_template); end if;
       if t.subtitle_template is not null then l_o.put('subtitleTemplate', t.subtitle_template); end if;
       l_arr.append(l_o);
@@ -526,6 +528,24 @@ create or replace package body fc_designer as
     l_res.put('skills', l_arr);
     return ok(l_res);
   end list_ai;
+
+  -- REST endpoints a REST call node may name (no credentials or header values).
+  function list_rest return clob is
+    l_arr json_array_t := json_array_t();
+    l_o   json_object_t;
+  begin
+    for r in (select endpoint_id, base_url, allowed_methods, credential_static_id, description
+                from fc_rest_endpoints where enabled = 'Y' order by endpoint_id) loop
+      l_o := json_object_t();
+      l_o.put('id', r.endpoint_id);
+      l_o.put('baseUrl', r.base_url);
+      l_o.put('methods', upper(replace(r.allowed_methods, ' ')));
+      l_o.put('credential', r.credential_static_id is not null);
+      l_o.put('description', r.description);
+      l_arr.append(l_o);
+    end loop;
+    return ok(l_arr);
+  end list_rest;
 
   -- Lookup lists, with the parameters each SQL list binds (:NAME other than :APP_USER / :FC_VERIFIED).
   function list_lovs return clob is
@@ -594,6 +614,7 @@ create or replace package body fc_designer as
       when 'sampleRows'     then return sample_rows(l_in);
       when 'listConnectors' then return list_connectors;
       when 'listAi'         then return list_ai;
+      when 'listRest'       then return list_rest;
       when 'listLovs'       then return list_lovs;
       when 'lovOptions'     then return lov_options(l_in);
       else raise_application_error(-20055, 'Unknown designer action "' || p_action || '".');

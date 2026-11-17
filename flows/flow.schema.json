@@ -49,7 +49,8 @@
         { "$ref": "#/$defs/findRecord" }, { "$ref": "#/$defs/changeFields" }, { "$ref": "#/$defs/saveChanges" },
         { "$ref": "#/$defs/repeat" }, { "$ref": "#/$defs/bulkUpdate" }, { "$ref": "#/$defs/set" }, { "$ref": "#/$defs/menu" },
         { "$ref": "#/$defs/email" },
-        { "$ref": "#/$defs/agent" }
+        { "$ref": "#/$defs/agent" },
+        { "$ref": "#/$defs/rest" }
       ]
     },
 
@@ -129,6 +130,29 @@
         "onError": { "$ref": "#/$defs/id", "description": "Where to go when sending fails (default: next)" }
       },
       "required": ["to", "subject"]
+    },
+
+    "rest": {
+      "description": "Call a REST API registered in FC_REST_ENDPOINTS (JS engine: options.restEndpoints or options.rest) and put parts of its JSON answer into slots. 2xx -> next, 404 -> onNotFound (when set), anything else -> onError (without it the conversation fails). On an Edit replay a GET runs again quietly; other methods are not repeated.",
+      "properties": {
+        "type": {"const": "rest"},
+        "endpoint": {"type": "string", "description": "FC_REST_ENDPOINTS.ENDPOINT_ID: base URL, Web Credential and allowed methods live there"},
+        "method": {"enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "default": "GET"},
+        "path": {"type": "string", "pattern": "^([/?].*)?$", "description": "Relative to the endpoint's base URL; {{placeholders}} are URL-encoded"},
+        "query": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Query parameters: name -> template"},
+        "skipEmptyQuery": {"type": "boolean", "description": "Leave out query parameters whose value is empty"},
+        "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra headers (templates). Authorization, Cookie, Host and the like are refused: they belong to the endpoint"},
+        "body": {"description": "JSON body template (not for GET): a string \"{{slot}}\" alone keeps the value's type; other strings are filled in as text"},
+        "map": {"type": "object", "propertyNames": {"pattern": "^[a-z][a-z0-9_]{0,99}$"}, "additionalProperties": {"type": "string"}, "description": "slot -> JSON path in the answer ($.a.b[0].c, or $ for all of it)"},
+        "statusSlot": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,99}$", "description": "Slot that receives the HTTP status"},
+        "message": {"type": "string", "description": "Shown after a successful call"},
+        "notFoundMessage": {"type": "string", "description": "Shown on a 404 that goes to onNotFound"},
+        "errorMessage": {"type": "string", "description": "Shown when the call fails"},
+        "next": {"$ref": "#/$defs/id"},
+        "onNotFound": {"$ref": "#/$defs/id"},
+        "onError": {"$ref": "#/$defs/id"}
+      },
+      "required": ["endpoint"]
     },
 
     "set": {

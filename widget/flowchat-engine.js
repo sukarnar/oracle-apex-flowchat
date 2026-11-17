@@ -58,7 +58,8 @@
  * req = {messages, tools (OpenAI format, native mode only), toolMode, provider, nodeId, sessionId, flowId}
  * and fn returns the assistant message {content, tool_calls} (openAIProvider() builds one for an
  * OpenAI-style API). options.aiTools = { id: {description, parameters (JSON schema), type: 'connector' |
- * 'lov' | 'search', target, write, confirm, confirmText} }, options.aiSkills = { id: {name, description, content} }.
+ * 'lov' | 'search' | 'rest', target, write, confirm, confirmText, request} } (a rest tool's target is a REST endpoint and
+ * request its {method, path, query, headers, body, map} template over the model's arguments), options.aiSkills = { id: {name, description, content} }.
  * The agent talks to the user only through questions this engine renders and checks (ask_user), and
  * ends with finish (outputs -> slots -> next), handoff (an exit) or give_up (onError).
  *
@@ -66,6 +67,13 @@
  * answers and hands it to the node's connector, or to options.sendEmail(msg) -> {ok, message?} when the
  * node names no connector. Attachments are file answers ({slot, id, name, size, mimeType}); read their
  * content with engine.getFile(sessionId, id) (or from your own options.files store).
+ *
+ * REST call node: calls a registered endpoint. options.restEndpoints = { id: {baseUrl, methods: ['GET'],
+ * headers (secrets go here, never in a flow), timeoutMs, maxBytes} } is used with fetch() (or options.fetch);
+ * or pass options.rest(req) -> {status, body} to make the call yourself, where
+ * req = {endpoint, method, path (relative, values URL-encoded), headers, body, nodeId, sessionId, flowId, appUser}.
+ * The node maps the JSON response into slots ("map": {slot: "$.path"}); 2xx -> next, 404 -> onNotFound
+ * (when set), anything else -> onError (or the conversation fails).
  */
 (function (global) {
   'use strict';
@@ -386,6 +394,7 @@
     function registerConnector(name, fn) { connectors[name] = fn; }
     function registerDataSource(name, src) { dataSources[name] = src; }
     function registerLov(name, fn) { lovs[name] = fn; }
+    function registerRestEndpoint(name, ep) { restEndpoints[name] = ep; }
     function registerAi(kind, name, def) {
       if (kind === 'provider') aiProviders[name] = def;
       else if (kind === 'tool') aiTools[name] = def;
@@ -688,6 +697,160 @@
       return node.next;
     }
 
+    // ---- REST call: a registered endpoint (base URL, credentials and allowed methods stay on the server;
+    // a flow names only the endpoint, a path, query, headers, a body template and a response mapping).
+    var restEndpoints = Object.assign({}, options.restEndpoints);   // id -> {baseUrl, methods, headers, timeoutMs, maxBytes}
+    var REST_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+    var REST_BLOCKED_HEADERS = /^(authorization|cookie|host|content-length|transfer-encoding|connection|proxy-.*|x-forwarded-.*)$/i;
+    // A value inside a URL: everything but letters, digits, - _ ~ is escaped (also "." and "/", so a
+    // value can never add path segments such as "..").
+    function urlPart(v) {
+      return encodeURIComponent(textOf(v)).replace(/[!'()*.]/g, function (c) { return '%' + c.charCodeAt(0).toString(16).toUpperCase(); });
+    }
+    function restPath(node, v) {
+      var tpl = String(node.path || '');
+      if (tpl && !/^[\/?]/.test(tpl)) return { problem: 'the path must start with / or ?' };
+      if (/^\/\/|:\/\/|\\/.test(tpl)) return { problem: 'the path must be relative to the endpoint' };
+      var path = tpl.replace(/\{\{\s*([\w.]+)\s*\}\}/g, function (_, k) { return urlPart(v[k]); });
+      var q = [];
+      Object.keys(node.query || {}).forEach(function (k) {
+        var val = interpolate(node.query[k], v);
+        if (val !== '' || !node.skipEmptyQuery) q.push(encodeURIComponent(k) + '=' + urlPart(val));
+      });
+      if (q.length) path += (path.indexOf('?') >= 0 ? '&' : '?') + q.join('&');
+      return { path: path };
+    }
+    // The body template: "{{slot}}" alone keeps the value's type (number, list, object); any other
+    // string is text with placeholders filled in.
+    function restBody(t, v) {
+      if (typeof t === 'string') {
+        var m = /^\{\{\s*([\w.]+)\s*\}\}$/.exec(t);
+        if (m) return isFilled(v[m[1]]) ? clone(v[m[1]]) : null;
+        return interpolate(t, v);
+      }
+      if (Array.isArray(t)) return t.map(function (x) { return restBody(x, v); });
+      if (t && typeof t === 'object') {
+        var o = {};
+        Object.keys(t).forEach(function (k) { o[k] = restBody(t[k], v); });
+        return o;
+      }
+      return t;
+    }
+    // "$.a.b[0].c", "a.b.0.c" or "$" (the whole response).
+    function jsonPath(root, path) {
+      var p = String(path || '$').trim().replace(/^\$\.?/, ''), cur = root, m, re = /([^.\[\]]+)|\[(\d+)\]/g;
+      while ((m = re.exec(p))) {
+        // only own keys and array indexes (like the PL/SQL engine): never "length" or inherited properties
+        var key = m[1] !== undefined ? m[1] : m[2];
+        if (cur === null || cur === undefined || typeof cur !== 'object') return undefined;
+        if (Array.isArray(cur) ? !/^\d+$/.test(key) : !Object.prototype.hasOwnProperty.call(cur, key)) return undefined;
+        cur = cur[Array.isArray(cur) ? Number(key) : key];
+      }
+      return cur;
+    }
+    // The default transport: fetch() against options.restEndpoints.
+    async function defaultRest(req) {
+      var ep = restEndpoints[req.endpoint];
+      if (!ep || !ep.baseUrl) throw new Error('Unknown REST endpoint "' + req.endpoint + '"');
+      var fetchFn = options.fetch || (typeof fetch === 'function' ? fetch : null);
+      if (!fetchFn) throw new Error('No fetch() available for REST calls (pass options.fetch).');
+      var headers = Object.assign({ Accept: 'application/json' }, req.headers, ep.headers);   // the endpoint's own headers win
+      var init = { method: req.method, headers: headers };
+      if (req.body !== undefined && req.method !== 'GET') { init.body = JSON.stringify(req.body); headers['Content-Type'] = 'application/json'; }
+      var ac = typeof AbortController === 'function' ? new AbortController() : null, timer = null;
+      if (ac) { init.signal = ac.signal; timer = setTimeout(function () { ac.abort(); }, ep.timeoutMs || 20000); }
+      try {
+        var res = await fetchFn(String(ep.baseUrl).replace(/\/+$/, '') + req.path, init);
+        var text = await res.text();
+        if (text.length > (ep.maxBytes || 1048576)) throw new Error('the response is larger than ' + Math.round((ep.maxBytes || 1048576) / 1024) + ' KB');
+        return { status: res.status, body: text };
+      } catch (e) {
+        if (e && e.name === 'AbortError') throw new Error('no answer within ' + Math.round((ep.timeoutMs || 20000) / 1000) + ' seconds');
+        throw e;
+      } finally { if (timer) clearTimeout(timer); }
+    }
+    // One call of a request spec {endpoint, method, path, query, skipEmptyQuery, headers, body} with
+    // placeholders filled from v. Returns {method, path, status, body (parsed JSON or text), problem, ms}.
+    async function restCall(ctx, spec, v, nodeId, toolId) {
+      var method = String(spec.method || 'GET').toUpperCase(), problem = null, r = null, body, t0 = Date.now();
+      var rp = restPath(spec, v), headers = {};
+      if (REST_METHODS.indexOf(method) < 0) problem = 'method ' + method + ' is not supported';
+      else if (!spec.endpoint) problem = 'no endpoint';
+      else if (rp.problem) problem = rp.problem;
+      Object.keys(spec.headers || {}).forEach(function (k) {
+        if (REST_BLOCKED_HEADERS.test(k) || !/^[A-Za-z0-9-]+$/.test(k)) problem = problem || 'header "' + k + '" can only be set on the endpoint';
+        else headers[k] = oneLine(interpolate(spec.headers[k], v));
+      });
+      var ep = restEndpoints[spec.endpoint];
+      if (!problem && ep && ep.methods && ep.methods.map(function (x) { return String(x).toUpperCase(); }).indexOf(method) < 0) {
+        problem = 'endpoint "' + spec.endpoint + '" does not allow ' + method;
+      }
+      if (!problem) {
+        var req = { sessionId: ctx.sid, flowId: ctx.flow.flowId, nodeId: nodeId, tool: toolId, appUser: appUserOf(ctx),
+                    endpoint: spec.endpoint, method: method, path: rp.path, headers: headers,
+                    body: method === 'GET' || spec.body === undefined ? undefined : restBody(spec.body, v) };
+        try {
+          r = await Promise.resolve(typeof options.rest === 'function' ? options.rest(req) : defaultRest(req));
+          r = r || {};
+          body = r.body;
+          if (typeof body === 'string') { try { body = body.trim() ? JSON.parse(body) : null; } catch (e) { /* keep the text */ } }
+        } catch (e) { problem = (e && e.message) || String(e); }
+      }
+      return { method: method, path: rp.path, status: r ? Number(r.status) || 0 : 0, body: body, problem: problem, ms: Date.now() - t0 };
+    }
+    // Calls the endpoint and maps the response into slots. Returns the next node, or null after failed().
+    async function runRest(ctx, node, quiet) {
+      var c = await restCall(ctx, node, view(ctx), node.id), problem = c.problem, status = c.status;
+      var outcome = problem ? 'error' : status >= 200 && status < 300 ? 'ok' : status === 404 && node.onNotFound ? 'notFound' : 'error';
+      if (!problem && outcome === 'error') problem = 'HTTP ' + status;
+      var mapped = [];
+      if (outcome === 'ok') {
+        Object.keys(node.map || {}).forEach(function (slot) {
+          if (slot === 'app_user') return;
+          var val = jsonPath(c.body, node.map[slot]);
+          ctx.st.slots[slot] = val === undefined ? null : clone(val);
+          touch(ctx, slot); mapped.push(slot);
+        });
+      }
+      if (node.statusSlot) { ctx.st.slots[node.statusSlot] = status || null; touch(ctx, node.statusSlot); }
+      dbg(ctx, { event: 'rest', node: node.id, endpoint: node.endpoint, method: c.method, path: c.path, status: status || undefined,
+                 ms: c.ms, mapped: mapped.length ? mapped : undefined, error: outcome === 'error' ? problem : undefined });
+      if (outcome === 'notFound') {
+        if (node.notFoundMessage && !quiet) say(ctx, 'text', interpolate(node.notFoundMessage, view(ctx)));
+        return node.onNotFound;
+      }
+      if (outcome === 'error') {
+        say(ctx, 'error', interpolate(node.errorMessage || "Sorry, I couldn't get that information right now.", view(ctx)));
+        return node.onError || failed(ctx);
+      }
+      if (node.message && !quiet) say(ctx, 'text', interpolate(node.message, view(ctx)));
+      return node.next;
+    }
+    // An agent's REST tool: t = {type: 'rest', target: endpoint, request: {method, path, query, headers, body, map}}.
+    // Placeholders are the model's arguments (plus app_user). The model gets {status, data} (data = the mapped
+    // values, or the whole answer cut to 6000 characters), {status: 404, found: false}, or {error}.
+    var REST_TOOL_MAX = 6000;   // under the 8000-character cap on any tool result, so it stays valid JSON
+    function restToolWrites(t) { return String(((t && t.request) || {}).method || 'GET').toUpperCase() !== 'GET'; }
+    async function restTool(ctx, node, t, id, args) {
+      var spec = Object.assign({}, t.request || {}, { endpoint: t.target });
+      var v = Object.assign({}, args || {}, { app_user: appUserOf(ctx) });
+      Object.keys(v).forEach(function (k) { if (v[k] !== null && typeof v[k] === 'object' && !Array.isArray(v[k])) v[k] = JSON.stringify(v[k]); });
+      var c = await restCall(ctx, spec, v, node.id, id);
+      dbg(ctx, { event: 'rest', node: node.id, tool: id, endpoint: t.target, method: c.method, path: c.path, status: c.status || undefined,
+                 ms: c.ms, error: c.problem || (c.status >= 200 && c.status < 300 || c.status === 404 ? undefined : 'HTTP ' + c.status) });
+      if (c.problem) return { error: c.problem };
+      if (c.status === 404) return { status: 404, found: false };
+      if (c.status < 200 || c.status >= 300) return { error: 'HTTP ' + c.status };
+      var data = c.body, map = (t.request || {}).map;
+      if (map && Object.keys(map).length) {
+        data = {};
+        Object.keys(map).forEach(function (k) { var x = jsonPath(c.body, map[k]); data[k] = x === undefined ? null : x; });
+      }
+      var txt = JSON.stringify(data === undefined ? null : data);
+      if (txt.length > REST_TOOL_MAX) return { status: c.status, truncated: true, data: txt.slice(0, REST_TOOL_MAX) };
+      return { status: c.status, data: data === undefined ? null : data };
+    }
+
     // ---- agent: a model-driven loop. It talks to the user only through questions the engine renders
     // (answers are parsed and checked here, not by the model) and acts only through the tools the node lists.
     var aiProviders = Object.assign({}, options.aiProviders);   // id -> fn(req) | {call: fn(req), toolMode: 'native'|'json'}
@@ -822,7 +985,7 @@
       (node.tools || []).forEach(function (id) {
         var t = aiTools[id];
         if (!t || BUILTIN_TOOLS.indexOf(id) >= 0) return;
-        defs.push({ name: id, description: (t.description || id) + (t.write ? ' (changes data; the user is asked to confirm first)' : ''),
+        defs.push({ name: id, description: (t.description || id) + (t.write || (t.type === 'rest' && restToolWrites(t)) ? ' (changes data; the user is asked to confirm first)' : ''),
                     parameters: t.parameters || { type: 'object', properties: {} } });
       });
       return defs;
@@ -922,9 +1085,10 @@
       ctx.st.history.push(node.id);
       return next || null;
     }
-    // Runs a registered tool (connector, lookup list or data source search).
+    // Runs a registered tool (connector, lookup list, data source search or REST endpoint).
     async function agentRunTool(ctx, node, t, id, args) {
       try {
+        if (t.type === 'rest') return await restTool(ctx, node, t, id, args);
         if (t.type === 'lov') {
           var fn = lovs[t.target];
           if (!fn) throw new Error('Unknown lookup list "' + t.target + '"');
@@ -1041,7 +1205,8 @@
       var t = (node.tools || []).indexOf(call.name) >= 0 ? aiTools[call.name] : null;
       if (!t) return { result: { error: 'Unknown tool "' + call.name + '"' } };
       args = unPii(a, args);
-      if (t.write && t.confirm !== false && a.approved !== call.id) {
+      // A REST tool that isn't a GET always changes data, whatever its write flag says.
+      if ((t.write || (t.type === 'rest' && restToolWrites(t))) && t.confirm !== false && a.approved !== call.id) {
         var lines = Object.keys(args).map(function (k) { return k + ': ' + (typeof args[k] === 'object' ? JSON.stringify(args[k]) : args[k]); });
         var text = t.confirmText ? interpolate(t.confirmText, Object.assign({}, view(ctx), args))
           : 'Please confirm: ' + (t.description || call.name) + (lines.length ? '\n' + lines.join('\n') : '');
@@ -1384,7 +1549,7 @@
         else if (n.type === 'agent') { total++; var ag = (ctx.st.agent || {})[n.id]; if (!ag || !ag.done) break; done++; id = ag.next; }
         else if (n.type === 'verify') id = n.verified;
         else if (n.type === 'bulkUpdate') id = n.done;
-        else if (n.type === 'message' || n.type === 'lookup' || n.type === 'set' || n.type === 'email') id = n.next;
+        else if (n.type === 'message' || n.type === 'lookup' || n.type === 'set' || n.type === 'email' || n.type === 'rest') id = n.next;
         else break;
       }
       if (ctx.st.status === 'completed') done = total;
@@ -1887,6 +2052,15 @@
             if (ctx.replay) { id = node.next; break; }
             id = await runEmail(ctx, node);
             break;
+          case 'rest': {
+            // Replaying an edit calls a GET again (answers it uses may have changed), quietly; other methods never repeat.
+            var restMethod = String(node.method || 'GET').toUpperCase();
+            if (ctx.replay && restMethod !== 'GET') { id = node.next; break; }
+            nxt = await runRest(ctx, node, ctx.replay);
+            if (nxt === null && st.status === 'failed') return;
+            id = nxt;
+            break;
+          }
           case 'lookup':
             if (ctx.replay) { id = node.next; break; }
             r = await callConnector(ctx, node.connector, { nodeId: node.id });
@@ -2242,6 +2416,7 @@
       input: input,
       registerFlow: registerFlow,
       registerConnector: registerConnector,
+      registerRestEndpoint: registerRestEndpoint,
       registerDataSource: registerDataSource,
       registerLov: registerLov,
       registerAi: registerAi,
