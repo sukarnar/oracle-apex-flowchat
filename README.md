@@ -51,7 +51,7 @@ tests/      engine.test.js           node tests/engine.test.js
             set.test.js              node tests/set.test.js (Set values node, context variables)
             menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
             email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
-            agent.test.js            node tests/agent.test.js (Agent node, scripted model: questions, tools, confirm, finish, handoff, limits, JSON mode)
+            agent.test.js            node tests/agent.test.js (Agent node, scripted model: questions, tools, confirm, finish, handoff, limits, JSON mode, pick_record, files, PII placeholders, set_field)
             apex-embed-test.html     designer inside a page-wide form, like APEX
             apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
             fake-apex-backend.js     emulates the FC_DESIGNER Ajax protocol in the browser (testing only)
@@ -560,7 +560,8 @@ select event_id, node_id, json_value(payload, '$.event') event, payload
 
 - Mark a question **In logs: Redact it** (`"pii": true`) or **Show only the last 4 characters**
   (`"pii": "last4"`). The same setting exists on Change fields fields and Repeat item fields. Values set
-  by a lookup or page context go in the flow's **PII answers** (`"piiSlots": ["ssn"]`).
+  by a lookup or page context go in the flow's **PII answers** (`"piiSlots": ["ssn"]`); a page context
+  value is named `context.<name>` (`"piiSlots": ["context.emp_id"]`).
 - Every FC_EVENTS row (IN, OUT, DBG and the update audit) has those values replaced by `[redacted]`
   or `••••1234`, wherever they appear: the answer itself, the summary, messages that repeat it, record
   values. The input that sets a PII answer is logged as `[redacted]`.
@@ -646,6 +647,15 @@ runs inside FC_ENGINE, so APEX session security, row filters, `app_user` and log
 - **Questions:** the model asks with `ask_user`. FlowChat renders the question (text, number, date,
   email, yes/no, or choice pills) and checks the answer with the same parsing and limits as an Ask
   node. A plain reply from the model is shown, and the user's free-text answer goes back to it.
+- **Files:** `ask_user` with kind `file` (or a question for a `file` output) shows the upload
+  button. The file is stored like an Ask node's (FC_FILES), and the model gets only its id, name,
+  size and type. A `file` output is filled only by the user's upload, never by the model.
+- **Picking a record:** `pick_record` runs one of the node's SEARCH tools and shows the rows as
+  pick cards, with **None of these** at the end. The row values stay on the server; the model gets
+  the row the user picked (or `null`). Card text comes from the tool's `TITLE_TEMPLATE` and
+  `SUBTITLE_TEMPLATE` (e.g. `{{last_name}}, {{first_name}}`), else its first three values.
+- **`set_field`:** fills one output straight away (checked like an answer), so the APEX page item
+  updates while the conversation goes on. `finish` still ends the task.
 - **`finish`:** each output is checked like an answer (type, options, min/max). A bad value goes back
   to the model to fix. Valid outputs become ordinary fields: they're shown in the Summary, can be
   edited there (Edit asks for that one field directly; the agent isn't run again), and are sent
@@ -715,7 +725,14 @@ values ('leave_policy', 'Leave policy', 'Rules for annual and sick leave', 'Annu
   session) plus `tool` and `args`.
 - **LOV** returns the options of an FC_LOVS list; `args` are its parameters.
 - **SEARCH** searches an FC_DATA source. Its row filter applies; `args` are `{field: value}` or
-  `{"criteria": [...]}`, and at most `MAX_ROWS` rows (up to 50) come back.
+  `{"criteria": [...]}`, and at most `MAX_ROWS` rows (up to 50) come back. The model can also hand
+  a SEARCH tool to `pick_record` so the user picks the row:
+  ```sql
+  insert into fc_ai_tools (tool_id, tool_type, target, description, parameters, title_template, subtitle_template)
+  values ('find_employee', 'SEARCH', 'employees', 'Find employees by name',
+          '{"type":"object","properties":{"last_name":{"type":"string"}}}',
+          '{{last_name}}, {{first_name}}', '{{department}}');
+  ```
 
 A tool runs only if the node lists it, and its result reaches the model cut to 8,000 characters.
 **Skills** load in stages: the prompt carries only each skill's name and description, and the
@@ -724,9 +741,16 @@ model calls `load_skill` for the full text.
 ### Guardrails
 
 - **What the model sees:** the goal, the instructions, the `inputs` you tick, `app_user` and
-  today's date. PII values (`"pii"` answers and `piiSlots`) are sent as `(hidden)` unless
-  `sendPii` is true. The system prompt tells the model that user and tool text is data, not
+  today's date. The system prompt tells the model that user and tool text is data, not
   instructions. Even so, what it can do is limited by the tools you register, not by the prompt.
+- **PII placeholders** (unless `sendPii` is true): personal values reach the model as `[PII_1]`,
+  `[PII_2]` and so on. That covers `"pii"` answers, `piiSlots`, outputs marked `"pii"`, and answers to
+  `ask_user` questions the model marks `sensitive`. The same value always gets the same token, in
+  `inputs`, answers, tool results and the user's free text. When the model uses a token in tool
+  arguments, `finish`/`set_field` values or a message to the user, FlowChat puts the real value back
+  first, so tools and the user see real data while the model never does. Values shorter than three
+  characters, and values inside a longer free-text sentence that isn't itself a PII value, are not
+  replaced.
 - **What the model can't do:** it never writes SQL or creates nodes that persist. Questions it
   asks exist only for that conversation, and their answers are checked by FlowChat.
 - **Limits:**
@@ -746,7 +770,8 @@ model calls `load_skill` for the full text.
   unknown providers, tools and skills.
 - **Testing:** the Test tab never calls a real model. Each agent replays an editable **script**
   (`[{"tool": "ask_user", "args": {...}}, {"tool": "finish", "args": {"fields": {...}}}]`), and
-  each tool returns a JSON mock, so tests behave the same every run. Test against the real model
+  each tool returns a JSON mock, so tests behave the same every run. A SEARCH tool's mock returns
+  `{"rows": [...]}`, which `pick_record` shows as cards. Test against the real model
   on an APEX page.
 - **JavaScript engine:** pass `aiProviders`, `aiTools` and `aiSkills` to `createEngine`.
   `FlowChatEngine.openAIProvider({baseUrl, model, apiKey, fetchOptions})` builds a provider for
@@ -756,8 +781,9 @@ model calls `load_skill` for the full text.
 Samples in the designer). It uses a provider registered as `corp_llm`.
 
 **Install:**
-- On an existing install, run `@upgrade_phase_f.sql`. It creates the three tables and recompiles
-  the packages.
+- On an existing install, run `@upgrade_phase_f.sql`. It creates the three tables (or, if they
+  exist, adds the Phase 2 columns `TITLE_TEMPLATE` and `SUBTITLE_TEMPLATE`) and recompiles the
+  packages. Re-running it is safe.
 - On a new instance, `install.sql` includes them.
 
 ## Turn protocol
@@ -776,7 +802,7 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 83 unit tests (`tests/engine.test.js`,
+- The JavaScript engine and widget are tested: 87 unit tests (`tests/engine.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
   `tests/email.test.js`, `tests/agent.test.js`), plus manual end-to-end runs of the demos.

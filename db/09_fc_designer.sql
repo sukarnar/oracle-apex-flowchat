@@ -502,13 +502,16 @@ create or replace package body fc_designer as
     end loop;
     l_res.put('providers', l_arr);
     l_arr := json_array_t();
-    for t in (select tool_id, tool_type, target, description, is_write from fc_ai_tools where enabled = 'Y' order by tool_id) loop
+    for t in (select tool_id, tool_type, target, description, is_write, title_template, subtitle_template
+                from fc_ai_tools where enabled = 'Y' order by tool_id) loop
       l_o := json_object_t();
       l_o.put('id', t.tool_id);
       l_o.put('type', lower(t.tool_type));
       l_o.put('target', t.target);
       l_o.put('description', t.description);
       l_o.put('write', t.is_write = 'Y');
+      if t.title_template is not null then l_o.put('titleTemplate', t.title_template); end if;
+      if t.subtitle_template is not null then l_o.put('subtitleTemplate', t.subtitle_template); end if;
       l_arr.append(l_o);
     end loop;
     l_res.put('tools', l_arr);

@@ -432,9 +432,10 @@
         if (typeof v === 'object') { if (isFilled(v.name)) out.push({ v: String(v.name), mode: 'full' }); return; }
         out.push({ v: String(v), mode: mode === 'last4' ? 'last4' : 'full' });
       }
-      (ctx.flow.piiSlots || []).forEach(function (s) { add(st.slots[s], 'full'); });
+      (ctx.flow.piiSlots || []).forEach(function (s) { add(/^context\./.test(s) ? (st.context || {})[s.slice(8)] : st.slots[s], 'full'); });
       ctx.flow.nodes.forEach(function (n) {
         if (n.type === 'ask' && n.pii) add(st.slots[n.slot], n.pii);
+        if (n.type === 'agent') (n.outputs || []).forEach(function (o) { if (o && o.pii) add(st.slots[o.name], o.pii); });
         if (n.type === 'changeFields' && st.records[n.record]) {
           (n.fields || []).forEach(function (f) {
             if (!f.pii) return;
@@ -463,6 +464,7 @@
       var st = ctx.st, n = ctx.nodes[st.current];
       if (!n) return false;
       if (n.type === 'ask') return !!n.pii || (ctx.flow.piiSlots || []).indexOf(n.slot) >= 0;
+      if (n.type === 'agent') { var aw = ((st.agent || {})[n.id] || {}).waiting; return !!(aw && aw.pii); }
       if (n.type === 'changeFields' && st.editingField) { var f = fieldDef(n, st.editingField); return !!(f && f.pii); }
       if (n.type === 'repeat' && st.repeat[n.id]) { var rf = (n.fields || [])[st.repeat[n.id].field]; return !!(rf && rf.pii); }
       return false;
@@ -691,9 +693,9 @@
     var aiProviders = Object.assign({}, options.aiProviders);   // id -> fn(req) | {call: fn(req), toolMode: 'native'|'json'}
     var aiTools = Object.assign({}, options.aiTools);           // id -> {description, parameters, type, target, write, confirm, confirmText, maxRows}
     var aiSkills = Object.assign({}, options.aiSkills);         // id -> {name, description, content}
-    var AGENT_KINDS = ['text', 'number', 'date', 'email', 'yesno', 'choice'];
+    var AGENT_KINDS = ['text', 'number', 'date', 'email', 'yesno', 'choice', 'file'];
     var MAX_TOOL_RESULT = 8000;
-    var BUILTIN_TOOLS = ['ask_user', 'finish', 'handoff', 'give_up', 'load_skill'];
+    var BUILTIN_TOOLS = ['ask_user', 'finish', 'handoff', 'give_up', 'load_skill', 'pick_record', 'set_field'];
 
     function limInt(v, d, lo, hi) { var n = parseInt(v, 10); return isNaN(n) ? d : Math.min(hi, Math.max(lo, n)); }
     function agentLimits(node) {
@@ -704,7 +706,7 @@
     function outputSpec(o) {
       var kind = AGENT_KINDS.indexOf(o.kind) >= 0 ? o.kind : 'text';
       var spec = { kind: kind };
-      ['min', 'max', 'minDate', 'maxDate', 'minLength', 'maxLength', 'parseMessage'].forEach(function (k) { if (isFilled(o[k])) spec[k] = o[k]; });
+      ['min', 'max', 'minDate', 'maxDate', 'minLength', 'maxLength', 'parseMessage', 'accept', 'maxSizeKb'].forEach(function (k) { if (isFilled(o[k])) spec[k] = o[k]; });
       if (kind === 'choice') {
         spec.options = (o.options || []).map(function (x) { return typeof x === 'object' ? { value: String(x.value), label: x.label || String(x.value) } : { value: String(x), label: String(x) }; });
         if (spec.options.length <= 6) spec.display = 'buttons';
@@ -719,15 +721,72 @@
       if (spec.kind === 'date') return { type: 'string', description: d + ' (YYYY-MM-DD)' };
       return { type: 'string', description: d };
     }
+    // Tools whose rows pick_record can show as cards: data source searches (and, in JS, tools marked pick).
+    function pickTools(node) {
+      return (node.tools || []).filter(function (id) { var t = aiTools[id]; return !!t && (t.type === 'search' || !!t.pick); });
+    }
+    // Fields the model may fill itself (finish, set_field); a file output is filled only by the user's upload.
+    function valueOutputs(node) { return agentOutputs(node).filter(function (o) { return outputSpec(o).kind !== 'file'; }); }
+
+    // PII placeholders. Unless the node has sendPii, the model sees "[PII_1]" instead of a personal value.
+    // The engine swaps the real value back in tool arguments, fields and text shown to the user.
+    function piiToken(a, v) {
+      a.pii = a.pii || {};
+      var s = String(v), keys = Object.keys(a.pii);
+      for (var i = 0; i < keys.length; i++) if (a.pii[keys[i]] === s) return keys[i];
+      var tk = '[PII_' + (keys.length + 1) + ']';
+      a.pii[tk] = s;
+      return tk;
+    }
+    function unPiiText(a, s) {
+      if (!a.pii || s === null || s === undefined) return s;
+      s = String(s);
+      Object.keys(a.pii).forEach(function (tk) { s = s.split(tk).join(a.pii[tk]); });
+      return s;
+    }
+    function unPii(a, x) {
+      if (!a.pii || !Object.keys(a.pii).length || x === undefined || x === null) return x;
+      var s = JSON.stringify(x);
+      Object.keys(a.pii).forEach(function (tk) { s = s.split(tk).join(JSON.stringify(a.pii[tk]).slice(1, -1)); });
+      return JSON.parse(s);
+    }
+    function piiValues(ctx, a) {
+      var seen = {}, out = [];
+      piiPairs(ctx).map(function (p) { return p.v; }).concat(Object.keys(a.pii || {}).map(function (k) { return a.pii[k]; }))
+        .forEach(function (v) { if (String(v).length >= 3 && !seen[v]) { seen[v] = 1; out.push(String(v)); } });
+      return out.sort(function (x, y) { return y.length - x.length; });
+    }
+    // Personal values in data on its way to the model (tool results, the user's free text) become tokens.
+    function rePii(ctx, node, a, x) {
+      if (node.sendPii || x === undefined || x === null) return x;
+      var vals = piiValues(ctx, a);
+      if (!vals.length) return x;
+      if (typeof x === 'string') { vals.forEach(function (v) { if (x.indexOf(v) >= 0) x = x.split(v).join(piiToken(a, v)); }); return x; }
+      var s = JSON.stringify(x), q = s;
+      vals.forEach(function (v) { var e = JSON.stringify(v).slice(1, -1); if (s.indexOf(e) >= 0) s = s.split(e).join(piiToken(a, v)); });
+      try { return JSON.parse(s); } catch (e) {
+        // a value matched inside a number: replace whole string values only
+        vals.forEach(function (v) { var e = JSON.stringify(v); if (q.indexOf(e) >= 0) q = q.split(e).join(JSON.stringify(piiToken(a, v))); });
+        return JSON.parse(q);
+      }
+    }
+    function recordTitle(t, r) {
+      if (t.title) return interpolate(t.title, r);
+      return Object.keys(r || {}).map(function (k) { return r[k]; })
+        .filter(function (v) { return isFilled(v) && typeof v !== 'object'; }).slice(0, 3).join(' \u00b7 ');
+    }
+
     function agentToolDefs(node) {
-      var outs = agentOutputs(node), props = {}, req = [];
-      outs.forEach(function (o) { props[o.name] = outputJsonSchema(o); if (o.required !== false) req.push(o.name); });
+      var outs = agentOutputs(node), vouts = valueOutputs(node), props = {}, req = [], picks = pickTools(node);
+      vouts.forEach(function (o) { props[o.name] = outputJsonSchema(o); if (o.required !== false) req.push(o.name); });
       var defs = [
         { name: 'ask_user', description: 'Ask the user one question and wait for the answer. Use it only for information the user has to give.',
           parameters: { type: 'object', properties: {
             question: { type: 'string', description: 'The question, shown to the user' },
             kind: { type: 'string', enum: AGENT_KINDS, description: 'Answer type (default text)' },
             options: { type: 'array', items: { type: 'string' }, description: 'The choices, for kind "choice" (shown as buttons)' },
+            accept: { type: 'string', description: 'For kind "file": allowed types, e.g. ".pdf,image/*"' },
+            sensitive: { type: 'boolean', description: 'True when the answer is personal data (it is then shown to you as a placeholder)' },
             field: { type: 'string', enum: outs.length ? outs.map(function (o) { return o.name; }) : undefined, description: 'The output field this answer fills, if any' } },
             required: ['question'] } },
         { name: 'finish', description: 'Finish the task once every required field is known. Never guess a value.',
@@ -743,6 +802,19 @@
           parameters: { type: 'object', properties: { exit: { type: 'string', enum: node.exits.map(function (e) { return e.name; }) },
                                                       reason: { type: 'string' } }, required: ['exit'] } });
       }
+      if (picks.length) {
+        defs.push({ name: 'pick_record', description: 'Search with one of these tools and let the user pick one of the records found ' +
+            '(shown as cards). Returns the picked record, or null when the user picks none. Tools: ' + picks.join(', '),
+          parameters: { type: 'object', properties: {
+            tool: { type: 'string', enum: picks },
+            args: { type: 'object', description: 'The search arguments, as for the tool itself' },
+            question: { type: 'string', description: 'Shown above the cards' } }, required: ['tool'] } });
+      }
+      if (vouts.length) {
+        defs.push({ name: 'set_field', description: 'Fill one output field now (the form shows it straight away). finish still has to be called.',
+          parameters: { type: 'object', properties: { field: { type: 'string', enum: vouts.map(function (o) { return o.name; }) },
+                                                      value: { description: 'The value' } }, required: ['field', 'value'] } });
+      }
       if ((node.skills || []).length) {
         defs.push({ name: 'load_skill', description: 'Read the full instructions of a skill before doing the work it describes.',
           parameters: { type: 'object', properties: { id: { type: 'string', enum: node.skills } }, required: ['id'] } });
@@ -755,7 +827,7 @@
       });
       return defs;
     }
-    function agentSystem(ctx, node, mode) {
+    function agentSystem(ctx, node, mode, a) {
       var v = view(ctx), pii = piiPairs(ctx).map(function (x) { return x.v; }), lines = [];
       lines.push('You are an assistant inside a chat that helps a user complete a task in a business application.');
       lines.push('Task: ' + interpolate(node.goal || '', v));
@@ -768,11 +840,14 @@
       (node.inputs || []).forEach(function (k) {
         if (!isFilled(v[k])) return;
         var val = typeof v[k] === 'object' ? textOf(v[k]) : v[k];
-        known[k] = !node.sendPii && pii.indexOf(String(val)) >= 0 ? '(hidden)' : val;
+        known[k] = !node.sendPii && pii.indexOf(String(val)) >= 0 ? piiToken(a, val) : val;
       });
       known.app_user = v.app_user;
       known.today = resolveDate('today');
       lines.push('Known values: ' + JSON.stringify(known));
+      if (!node.sendPii) lines.push('Values like [PII_1] stand for personal data. Use them exactly as they are in tool arguments, ' +
+                                    'fields and messages: the application puts the real value back.');
+      if (pickTools(node).length) lines.push('To let the user choose one record, use pick_record instead of listing records in a question.');
       var outs = agentOutputs(node);
       if (outs.length) {
         lines.push('Output fields: ' + outs.map(function (o) {
@@ -881,21 +956,57 @@
           if (a.questions >= lim.questions) return { result: { error: 'No more questions allowed. Finish with what you have, or call give_up.' } };
           var out = outs.find(function (o) { return o.name === args.field; });
           var spec = out ? outputSpec(out) : { kind: AGENT_KINDS.indexOf(args.kind) >= 0 ? args.kind : 'text' };
+          if (!out && spec.kind === 'file' && isFilled(args.accept)) spec.accept = String(args.accept);
           if (!out && spec.kind === 'choice') {
             var opts = (Array.isArray(args.options) ? args.options : []).filter(isFilled).slice(0, 20).map(String);
             if (!opts.length) spec = { kind: 'text' };
             else { spec.options = opts.map(function (x) { return { value: x, label: x }; }); if (opts.length <= 6) spec.display = 'buttons'; }
           }
           a.questions++;
-          var q = String(args.question);
+          var q = unPiiText(a, String(args.question));
           say(ctx, 'text', q);
-          a.waiting = { type: 'ask', prompt: q, spec: spec, field: out ? out.name : null, label: out ? (out.label || out.name) : 'Answer' };
+          a.waiting = { type: 'ask', prompt: q, spec: spec, field: out ? out.name : null, label: out ? (out.label || out.name) : 'Answer',
+                        pii: !!(out ? out.pii : args.sensitive) };
           return { wait: true };
         }
+        case 'pick_record': {
+          var picks = pickTools(node);
+          var pt = picks.indexOf(args.tool) >= 0 ? aiTools[args.tool] : null;
+          if (!pt) return { result: { error: 'pick_record needs one of these tools: ' + (picks.join(', ') || '(none)') } };
+          if (a.questions >= lim.questions) return { result: { error: 'No more questions allowed. Finish with what you have, or call give_up.' } };
+          var pr = await agentRunTool(ctx, node, pt, args.tool, unPii(a, args.args && typeof args.args === 'object' ? args.args : {}));
+          if (pr && pr.error) return { result: pr };
+          var rows = (pr && Array.isArray(pr.rows) ? pr.rows : []).filter(function (r) { return r && typeof r === 'object'; }).slice(0, 20);
+          if (!rows.length) return { result: { rows: [], message: 'Nothing was found. Tell the user, or search again with other arguments.' } };
+          a.questions++;
+          var pq = unPiiText(a, String(args.question || 'Which one?'));
+          say(ctx, 'text', pq);
+          a.waiting = { type: 'pick', prompt: pq, noneLabel: 'None of these',
+                        items: rows.map(function (r, i) {
+                          return { token: randomId().slice(0, 12) + i, title: recordTitle(pt, r) || 'Record ' + (i + 1),
+                                   subtitle: pt.subtitle ? interpolate(pt.subtitle, r) : '', values: r };
+                        }) };
+          return { wait: true };
+        }
+        case 'set_field': {
+          var so = valueOutputs(node).find(function (o) { return o.name === args.field; });
+          if (!so) return { result: { error: 'Unknown field. Use one of: ' + valueOutputs(node).map(function (o) { return o.name; }).join(', ') } };
+          var sv = unPii(a, args.value);
+          if (!isFilled(sv)) return { result: { error: 'value is required' } };
+          var sp = parseValue(outputSpec(so), typeof sv === 'object' ? JSON.stringify(sv) : String(sv));
+          var se = sp.error || await validate(ctx, { input: outputSpec(so) }, sp.value);
+          if (se) return { result: { error: so.name + ': ' + se } };
+          ctx.st.slots[so.name] = sp.value; touch(ctx, so.name);
+          return { result: { ok: true } };
+        }
         case 'finish': {
-          var f = args.fields || {}, errs = [], vals = {};
+          var f = unPii(a, args.fields && typeof args.fields === 'object' ? args.fields : {}), errs = [], vals = {};
           outs.forEach(function (o) {
             var raw = f[o.name];
+            if (outputSpec(o).kind === 'file') {                     // only the user's upload fills a file field
+              if (!isFilled(ctx.st.slots[o.name]) && o.required !== false) errs.push(o.name + ' is required (ask the user to attach it with ask_user)');
+              return;
+            }
             if (!isFilled(raw)) {
               if (isFilled(ctx.st.slots[o.name])) return;          // already answered through ask_user
               if (o.required !== false) errs.push(o.name + ' is required');
@@ -910,7 +1021,7 @@
           }
           if (errs.length) return { result: { error: 'Not finished: ' + errs.join('; ') + '. Ask the user or look it up, then call finish again.' } };
           Object.keys(vals).forEach(function (k) { ctx.st.slots[k] = vals[k]; touch(ctx, k); });
-          if (isFilled(args.message)) say(ctx, 'text', String(args.message));
+          if (isFilled(args.message)) say(ctx, 'text', unPiiText(a, String(args.message)));
           dbg(ctx, { event: 'agentDone', node: node.id, steps: a.steps, fields: Object.keys(vals) });
           return { next: agentDone(ctx, node, a, node.next) };
         }
@@ -929,6 +1040,7 @@
       }
       var t = (node.tools || []).indexOf(call.name) >= 0 ? aiTools[call.name] : null;
       if (!t) return { result: { error: 'Unknown tool "' + call.name + '"' } };
+      args = unPii(a, args);
       if (t.write && t.confirm !== false && a.approved !== call.id) {
         var lines = Object.keys(args).map(function (k) { return k + ': ' + (typeof args[k] === 'object' ? JSON.stringify(args[k]) : args[k]); });
         var text = t.confirmText ? interpolate(t.confirmText, Object.assign({}, view(ctx), args))
@@ -938,7 +1050,7 @@
         return { wait: true };
       }
       delete a.approved;
-      return { result: await agentRunTool(ctx, node, t, call.name, args) };
+      return { result: rePii(ctx, node, a, await agentRunTool(ctx, node, t, call.name, args)) };
     }
     // Runs until the agent needs the user (AWAIT), finishes (its next node) or fails.
     async function agentLoop(ctx, node) {
@@ -961,9 +1073,9 @@
         var m;
         try { m = await agentModel(ctx, node, a); }
         catch (e) { return agentFail(ctx, node, a, (e && e.message) || String(e)); }
-        if (m.calls.length) { if (m.text) say(ctx, 'text', m.text); a.pending = m.calls; continue; }
+        if (m.calls.length) { if (m.text) say(ctx, 'text', unPiiText(a, m.text)); a.pending = m.calls; continue; }
         if (m.text) {
-          say(ctx, 'text', m.text);
+          say(ctx, 'text', unPiiText(a, m.text));
           a.waiting = { type: 'reply', prompt: m.text, spec: { kind: 'text' }, label: 'Answer' };
           return AWAIT;
         }
@@ -975,20 +1087,34 @@
       var p = providerOf(node);
       ctx.st.agent = ctx.st.agent || {};
       var a = ctx.st.agent[node.id] = { mode: p.toolMode, steps: 0, questions: 0, pending: [], waiting: null, done: false, next: null, messages: [] };
-      a.messages.push({ role: 'system', content: agentSystem(ctx, node, a.mode) });
+      a.messages.push({ role: 'system', content: agentSystem(ctx, node, a.mode, a) });
       a.messages.push({ role: 'user', content: 'Start the task.' });
       if (node.intro) say(ctx, 'text', interpolate(node.intro, view(ctx)));
       dbg(ctx, { event: 'agentStart', node: node.id, provider: node.provider, mode: a.mode });
       return agentLoop(ctx, node);
+    }
+    // Parses and checks the user's answer to an agent question; a file is stored like an Ask node's.
+    async function agentAnswer(ctx, w, payload) {
+      if (w.spec && w.spec.kind === 'file') {
+        var pf = parseFile(w.spec, payload.file);
+        if (pf.error) return pf;
+        if (!pf.value) return { error: w.spec.parseMessage || 'Please attach a file.' };
+        var old = w.field ? ctx.st.slots[w.field] : null;
+        var meta = Object.assign({ id: await saveFile(ctx, w.field || '#agent', pf.value, pf.data) }, pf.value);
+        if (old && old.id) await removeFile(ctx, old.id);
+        return { value: meta };
+      }
+      var pv = parseValue(w.spec, payload.value);
+      var e = pv.error || await validate(ctx, { input: w.spec }, pv.value);
+      return e ? { error: e } : pv;
     }
     async function handleAgent(ctx, node, payload) {
       var st = ctx.st, a = (st.agent || {})[node.id], w = a && a.waiting;
       if (!w) { say(ctx, 'error', 'There is nothing to answer right now.'); return; }
       var raw = payload.value, t = String(raw === undefined || raw === null ? '' : raw).trim();
       if (w.type === 'edit') {
-        var pe = parseValue(w.spec, raw);
-        var pee = pe.error || await validate(ctx, { input: w.spec }, pe.value);
-        if (pee) { say(ctx, 'error', pee); return; }
+        var pe = await agentAnswer(ctx, w, payload);
+        if (pe.error) { say(ctx, 'error', pe.error); return; }
         st.slots[w.field] = pe.value; touch(ctx, w.field);
         a.waiting = null; st.editing = false; ctx.replay = true;
         await run(ctx, ctx.flow.start);
@@ -1002,14 +1128,30 @@
         else agentResult(a, a.pending.shift(), { cancelled: true, message: 'The user did not confirm. Do not retry unless they ask.' });
       } else if (w.type === 'continue') {
         a.waiting = null;
+      } else if (w.type === 'pick') {
+        var items = w.items || [], ch = null, none = false;
+        if ('pick' in payload) {
+          if (payload.pick === null) none = true;
+          else ch = items.find(function (it) { return it.token === payload.pick; });
+        } else if (t) {
+          var tl = t.toLowerCase();
+          if (tl === String(w.noneLabel || '').toLowerCase() || tl === 'none') none = true;
+          else ch = /^\d+$/.test(tl) ? items[parseInt(tl, 10) - 1] : items.find(function (it) { return String(it.title).toLowerCase().indexOf(tl) >= 0; });
+        }
+        if (!ch && !none) { say(ctx, 'error', 'Please choose one of the records shown.'); return; }
+        a.waiting = null;
+        agentResult(a, a.pending.shift(), none ? { picked: null, message: 'The user chose none of these.' }
+                                               : { picked: rePii(ctx, node, a, ch.values) });
       } else {
-        var pv = parseValue(w.spec, raw);
-        var pve = pv.error || await validate(ctx, { input: w.spec }, pv.value);
-        if (pve) { say(ctx, 'error', pve); return; }
+        var pv = await agentAnswer(ctx, w, payload);
+        if (pv.error) { say(ctx, 'error', pv.error); return; }
         if (w.field) { st.slots[w.field] = pv.value; touch(ctx, w.field); }
         a.waiting = null;
-        if (w.type === 'ask') agentResult(a, a.pending.shift(), { answer: pv.value });
-        else a.messages.push({ role: 'user', content: t });
+        if (w.type === 'ask') {
+          var ans = pv.value;
+          if (!node.sendPii && w.pii && isFilled(ans) && typeof ans !== 'object') ans = piiToken(a, ans);
+          agentResult(a, a.pending.shift(), { answer: rePii(ctx, node, a, ans) });
+        } else a.messages.push({ role: 'user', content: rePii(ctx, node, a, t) });
       }
       var nxt = await agentLoop(ctx, node);
       if (nxt === AWAIT) return;
@@ -1022,7 +1164,7 @@
       ctx.st.agent = ctx.st.agent || {};
       var a = ctx.st.agent[node.id] = ctx.st.agent[node.id] || { mode: 'native', steps: 0, questions: 0, pending: [], messages: [], done: true, next: node.next };
       var q = 'What should ' + (o.label || o.name) + ' be?';
-      a.waiting = { type: 'edit', prompt: q, spec: outputSpec(o), field: o.name, label: o.label || o.name };
+      a.waiting = { type: 'edit', prompt: q, spec: outputSpec(o), field: o.name, label: o.label || o.name, pii: !!o.pii };
       ctx.st.current = node.id; ctx.st.editing = true;
       say(ctx, 'text', q);
     }
@@ -1851,7 +1993,10 @@
           if (!aw.input.kind) aw.input.kind = 'text';
         } else if (n.type === 'agent') {
           var w = ((st.agent || {})[n.id] || {}).waiting;
-          if (w && (w.type === 'confirm' || w.type === 'continue')) {
+          if (w && w.type === 'pick') {
+            aw = { type: 'pick', nodeId: n.id, allowNone: true, noneLabel: w.noneLabel || 'None of these',
+                   items: (w.items || []).map(function (it) { return { token: it.token, title: it.title, subtitle: it.subtitle }; }) };
+          } else if (w && (w.type === 'confirm' || w.type === 'continue')) {
             aw = { type: 'ask', nodeId: n.id, slot: '#agent', label: w.type === 'confirm' ? 'Confirm' : 'Continue', value: null,
                    input: { kind: 'choice', display: 'buttons', options: w.type === 'confirm'
                      ? [{ value: 'confirm', label: w.confirmLabel || 'Confirm' }, { value: 'cancel', label: 'Cancel' }]

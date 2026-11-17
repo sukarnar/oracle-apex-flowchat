@@ -179,5 +179,85 @@ function engine(steps, extra, seen) {
     await eng.start('leave', {});
     assert.strictEqual(log.saved, null);
   });
+  console.log('agent node, phase 2');
+  const pickTools = { find_emp: { description: 'Find employees', type: 'connector', target: 'emps', pick: true,
+                                  title: '{{name}}', subtitle: '{{dept}}' } };
+  const emps = () => ({ rows: [{ emp_id: 'E7', name: 'Ann Lee', dept: 'Sales' }, { emp_id: 'E9', name: 'Bo Chan', dept: 'IT' }] });
+  await test('pick_record shows the found records as cards; the picked record goes back to the model', async () => {
+    const { eng } = engine([
+      { tool_calls: [call('pick_record', { tool: 'find_emp', args: { name: 'a' }, question: 'Who is covering?' })] },
+      (req) => { assert.deepStrictEqual(lastTool(req), { picked: { emp_id: 'E9', name: 'Bo Chan', dept: 'IT' } });
+                 return { tool_calls: [call('pick_record', { tool: 'find_emp', args: {} })] }; },
+      (req) => { assert.strictEqual(lastTool(req).picked, null);
+                 return { tool_calls: [call('finish', { fields: { leave_type: 'sick', days: 1 } })] }; }
+    ], { agent: { tools: ['find_emp'] }, opts: { aiTools: pickTools, connectors: { emps, save: () => ({ ok: true }) } } });
+    let t = await eng.start('leave', {});
+    assert.strictEqual(t.await.type, 'pick');
+    assert.deepStrictEqual(t.await.items.map((i) => [i.title, i.subtitle]), [['Ann Lee', 'Sales'], ['Bo Chan', 'IT']]);
+    assert.strictEqual(t.await.items[0].values, undefined);            // row values stay on the server
+    assert.match(texts(t), /Who is covering\?/);
+    t = await eng.input(t.sessionId, { pick: 'nope' });
+    assert.match(texts(t), /choose one of the records/);
+    t = await eng.input(t.sessionId, { pick: t.await.items[1].token });
+    assert.strictEqual(t.await.type, 'pick');
+    t = await eng.input(t.sessionId, { pick: null });
+    assert.strictEqual(t.await.nodeId, 'review');
+  });
+  await test('pick_record refuses tools that are not searches, and reports no rows', async () => {
+    const { eng } = engine([
+      { tool_calls: [call('pick_record', { tool: 'get_balance', args: {} })] },
+      (req) => { assert.match(lastTool(req).error, /needs one of these tools: find_emp/);
+                 return { tool_calls: [call('pick_record', { tool: 'find_emp', args: {} })] }; },
+      (req) => { assert.deepStrictEqual(lastTool(req).rows, []); return { tool_calls: [call('give_up', { reason: 'nobody' })] }; }
+    ], { agent: { tools: ['find_emp', 'get_balance'] },
+         opts: { aiTools: Object.assign({ get_balance: { description: 'b', type: 'connector', target: 'balance' } }, pickTools),
+                 connectors: { emps: () => ({ rows: [] }), balance: () => ({}) } } });
+    const t = await eng.start('leave', {});
+    assert.match(texts(t), /Please use the leave form/);
+  });
+  await test('ask_user can ask for a file; a file output is filled only by the upload', async () => {
+    const seen = [];
+    const { eng } = engine([
+      { tool_calls: [call('finish', { fields: { leave_type: 'sick', days: 2, note: 'x' } })] },
+      (req) => { assert.match(lastTool(req).error, /note is required \(ask the user to attach it/);
+                 return { tool_calls: [call('ask_user', { question: 'Please attach the sick note.', field: 'note' })] }; },
+      (req) => { const a = lastTool(req).answer; assert.strictEqual(a.name, 'note.pdf'); assert.ok(a.id);
+                 return { tool_calls: [call('finish', { fields: { leave_type: 'sick', days: 2 } })] }; }
+    ], { agent: { tools: [], outputs: [{ name: 'leave_type', kind: 'choice', options: ['annual', 'sick'] }, { name: 'days', kind: 'number' },
+                                       { name: 'note', label: 'Sick note', kind: 'file', accept: '.pdf' }] } }, seen);
+    let t = await eng.start('leave', {});
+    assert.ok(!('note' in seen[0].tools.find((d) => d.function.name === 'finish').function.parameters.properties.fields.properties));
+    assert.deepStrictEqual(t.await.input, { kind: 'file', accept: '.pdf' });
+    t = await eng.input(t.sessionId, { file: { name: 'note.png', mimeType: 'image/png', data: 'aGVsbG8=' } });
+    assert.strictEqual(t.await.slot, 'note');                           // wrong type: asked again
+    t = await eng.input(t.sessionId, { file: { name: 'note.pdf', mimeType: 'application/pdf', data: 'aGVsbG8=' } });
+    assert.strictEqual(t.await.nodeId, 'review');
+    assert.strictEqual(eng.getState(t.sessionId).slots.note.name, 'note.pdf');
+  });
+  await test('PII is sent as placeholders and put back in tool arguments, fields and messages', async () => {
+    const seen = [], log = [];
+    const agent = { tools: ['get_balance'],
+                    outputs: [{ name: 'leave_type', kind: 'choice', options: ['annual', 'sick'] }, { name: 'days', kind: 'number' },
+                              { name: 'phone', kind: 'text', pii: true }] };
+    const { eng } = engine([
+      (req) => { assert.match(req.messages[0].content, /"context.emp_id":"\[PII_1\]"/);
+                 assert.ok(!JSON.stringify(req.messages).includes('E12345'));
+                 return { tool_calls: [call('get_balance', { emp_id: '[PII_1]' })] }; },
+      (req) => { assert.deepStrictEqual(lastTool(req), { owner: '[PII_1]', annual: 12 });
+                 return { tool_calls: [call('ask_user', { question: 'Your phone?', sensitive: true })] }; },
+      (req) => { assert.deepStrictEqual(lastTool(req), { answer: '[PII_2]' });
+                 return { content: 'I will text [PII_2] for [PII_1].', tool_calls: [call('set_field', { field: 'phone', value: '[PII_2]' })] }; },
+      (req) => { assert.deepStrictEqual(lastTool(req), { ok: true });
+                 return { tool_calls: [call('finish', { fields: { leave_type: 'sick', days: 1 } })] }; }
+    ], { agent, opts: { flows: [Object.assign(flow(agent), { piiSlots: ['context.emp_id'], bindings: {} })],
+                        connectors: { balance: (p) => { log.push(p.args); return { owner: p.args.emp_id, annual: 12 }; }, save: () => ({ ok: true }) } } }, seen);
+    let t = await eng.start('leave', { emp_id: 'E12345' });
+    assert.deepStrictEqual(log, [{ emp_id: 'E12345' }]);
+    t = await eng.input(t.sessionId, { value: '0412 555 123' });
+    assert.match(texts(t), /I will text 0412 555 123 for E12345\./);
+    assert.ok(t.fieldUpdates.some((u) => u.slot === 'phone'));
+    assert.strictEqual(t.await.nodeId, 'review');
+    assert.ok(!JSON.stringify(seen.map((r) => r.messages)).includes('0412 555 123'));
+  });
   console.log(passed + ' passed');
 })();

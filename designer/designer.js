@@ -2211,7 +2211,8 @@
   }
 
   // ---- agent
-  const AGENT_KINDS = [['text', 'Text'], ['number', 'Number'], ['date', 'Date'], ['email', 'Email'], ['yesno', 'Yes / no'], ['choice', 'Choice']];
+  const AGENT_KINDS = [['text', 'Text'], ['number', 'Number'], ['date', 'Date'], ['email', 'Email'], ['yesno', 'Yes / no'], ['choice', 'Choice'],
+                       ['file', 'File (the user uploads it)']];
   function aiCat() { return S.ai || { providers: [], tools: [], skills: [] }; }
   function agentSlots() {
     const out = [];
@@ -2259,8 +2260,19 @@
       card.append(h('div', { class: 'grid2' }, F('Field', nameIn),
         F('Label', bound(() => o.label, (v) => setOrDelete(o, 'label', v), { key: kp + '.l', placeholder: 'Leave type' }))));
       card.append(h('div', { class: 'grid2' },
-        F('Type', sel(AGENT_KINDS, o.kind || 'text', (v) => mutate(() => { o.kind = v; if (v !== 'choice') delete o.options; if (v !== 'number') { delete o.min; delete o.max; } }, { panel: true }))),
-        F('', checkbox('Required', o.required !== false, (c) => mutate(() => { if (c) delete o.required; else o.required = false; })))));
+        F('Type', sel(AGENT_KINDS, o.kind || 'text', (v) => mutate(() => {
+          o.kind = v;
+          if (v !== 'choice') delete o.options;
+          if (v !== 'number') { delete o.min; delete o.max; }
+          if (v !== 'file') { delete o.accept; delete o.maxSizeKb; }
+        }, { panel: true }))),
+        h('div', null,
+          checkbox('Required', o.required !== false, (c) => mutate(() => { if (c) delete o.required; else o.required = false; })),
+          checkbox('Personal data (PII)', !!o.pii, (c) => mutate(() => { if (c) o.pii = true; else delete o.pii; })))));
+      if (o.kind === 'file') {
+        card.append(F('Allowed types (optional)', bound(() => o.accept, (v) => setOrDelete(o, 'accept', v), { key: kp + '.acc', placeholder: '.pdf,.jpg' }),
+          'Only the user\'s upload fills this field: the agent asks for it with ask_user and cannot set it itself.'));
+      }
       if (o.kind === 'choice') {
         card.append(F('Options', bound(() => (o.options || []).map((x) => (typeof x === 'object' ? x.value : x)).join(', '),
           (v) => { o.options = v.split(',').map((x) => x.trim()).filter(Boolean); }, { key: kp + '.o', placeholder: 'annual, sick, unpaid', onChange: true }),
@@ -2288,7 +2300,7 @@
       if (c) cur.push(k);
       if (cur.length) n.inputs = cur; else delete n.inputs;
     }))));
-    inBox.append(checkbox('Send PII values to the model (otherwise they are replaced by "(hidden)")', !!n.sendPii,
+    inBox.append(checkbox('Send PII values to the model (otherwise it sees placeholders like [PII_1], and FlowChat puts the real value back when the agent uses one)', !!n.sendPii,
       (c) => mutate(() => { if (c) n.sendPii = true; else delete n.sendPii; })));
     wrap.append(inBox);
 
@@ -2782,7 +2794,9 @@
     return JSON.stringify(steps, null, 2);
   }
   const scriptFor = (n) => (S.mocks['agent:' + n.id] !== undefined ? S.mocks['agent:' + n.id] : defaultScript(n));
-  const toolMockFor = (id) => (S.mocks['tool:' + id] !== undefined ? S.mocks['tool:' + id] : JSON.stringify({ ok: true }, null, 2));
+  const toolReg = (id) => (aiCat().tools || []).find((t) => t.id === id) || {};
+  const toolMockFor = (id) => (S.mocks['tool:' + id] !== undefined ? S.mocks['tool:' + id]
+    : JSON.stringify(toolReg(id).type === 'search' ? { rows: [{ id: 1, name: 'Example record' }, { id: 2, name: 'Another record' }] } : { ok: true }, null, 2));
   function testAi() {
     const providers = {}, tools = {}, skills = {}, cursor = {};
     agentNodes().forEach((n) => {
@@ -2800,9 +2814,11 @@
       };
     });
     agentToolIds().forEach((id) => {
-      const reg = (aiCat().tools || []).find((t) => t.id === id) || {};
+      const reg = toolReg(id);
+      // a search tool (or any tool not in the registry) can feed pick_record: its mock returns {"rows": [...]}
       tools[id] = { description: reg.description || id, type: 'connector', target: 'tool:' + id,
-                    write: reg.id ? !!reg.write : S.mocks['toolw:' + id] === '1' };
+                    write: reg.id ? !!reg.write : S.mocks['toolw:' + id] === '1',
+                    pick: reg.id ? reg.type === 'search' : true, title: reg.titleTemplate, subtitle: reg.subtitleTemplate };
     });
     agentNodes().forEach((n) => (n.skills || []).forEach((id) => {
       const reg = (aiCat().skills || []).find((x) => x.id === id) || {};
@@ -2836,7 +2852,7 @@
       box.append(h('div', { class: 'card mock' },
         h('div', { class: 'card-h' }, h('span', { class: 'mono grow', text: n.id }), h('span', { class: 'chip', text: 'agent script' })),
         h('p', { class: 'hint', text: 'Test replays these steps instead of calling ' + (n.provider || 'the model') +
-          ': {"tool": "ask_user" | "finish" | "handoff" | "give_up" | "load_skill" | a tool id, "args": {...}} or {"reply": "text"}. In APEX the real model runs.' }),
+          ': {"tool": "ask_user" | "pick_record" | "set_field" | "finish" | "handoff" | "give_up" | "load_skill" | a tool id, "args": {...}} or {"reply": "text"}. In APEX the real model runs.' }),
         h('div', { class: 'rowx' }, h('button', { class: 'btn', text: 'Reset to default', onclick: () => { delete S.mocks['agent:' + n.id]; save(); renderMocks(); } })),
         jsonArea(() => scriptFor(n), 'agent:' + n.id, 8, true)));
     });

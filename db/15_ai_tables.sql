@@ -48,6 +48,8 @@ begin
       needs_confirm  varchar2(1)    default 'Y' not null,
       confirm_text   varchar2(4000),
       max_rows       number         default 10,
+      title_template    varchar2(4000),
+      subtitle_template varchar2(4000),
       enabled        varchar2(1)    default 'Y' not null,
       constraint fc_ai_tools_pk primary key (tool_id),
       constraint fc_ai_tools_id_ck check (regexp_like(tool_id, '^[a-z][a-z0-9_]{0,63}$')),
@@ -68,6 +70,25 @@ begin
 end;
 /
 
+-- Agent Phase 2: card text for pick_record (added to installs made before it)
+declare
+  procedure add_col (p_col in varchar2) is
+    l_n pls_integer;
+  begin
+    select count(*) into l_n from user_tab_columns where table_name = 'FC_AI_TOOLS' and column_name = p_col;
+    if l_n = 0 then
+      execute immediate 'alter table fc_ai_tools add (' || lower(p_col) || ' varchar2(4000))';
+      dbms_output.put_line('FC_AI_TOOLS.' || p_col || ' added');
+    end if;
+  end add_col;
+begin
+  add_col('TITLE_TEMPLATE');
+  add_col('SUBTITLE_TEMPLATE');
+end;
+/
+
+comment on column fc_ai_tools.title_template is 'SEARCH tools: the title of each card pick_record shows, e.g. {{last_name}}, {{first_name}} (default: the first three values)';
+comment on column fc_ai_tools.subtitle_template is 'SEARCH tools: the card subtitle, e.g. {{department}}';
 comment on column fc_ai_providers.base_url is 'Up to and including /v1, e.g. https://llm.corp.local/v1 (the engine adds /chat/completions)';
 comment on column fc_ai_providers.credential_id is 'Static id of an APEX Web Credential (e.g. HTTP header Authorization = Bearer <key>); null when the endpoint needs no key';
 comment on column fc_ai_providers.wallet_path is 'Oracle wallet with the corporate CA (and a client certificate for mTLS), e.g. file:/u01/wallets/llm; auto-login (cwallet.sso). Null = the APEX instance wallet';

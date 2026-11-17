@@ -5,8 +5,8 @@ create or replace package body fc_engine as
   c_not_found  constant varchar2(100) := 'I couldn''t find a matching record.';
   c_ttl        constant interval day to second := interval '1' day;
   c_nls        constant varchar2(40) := 'NLS_NUMERIC_CHARACTERS=''.,''';
-  c_ai_kinds   constant varchar2(100) := ',text,number,date,email,yesno,choice,';
-  c_ai_builtins constant varchar2(200) := '["ask_user","finish","handoff","give_up","load_skill"]';
+  c_ai_kinds   constant varchar2(100) := ',text,number,date,email,yesno,choice,file,';
+  c_ai_builtins constant varchar2(200) := '["ask_user","finish","handoff","give_up","load_skill","pick_record","set_field"]';
   c_ai_max_result constant pls_integer := 8000;
 
   type t_ctx is record (
@@ -477,7 +477,14 @@ create or replace package body fc_engine as
     l_draft json_object_t;
   begin
     for i in 0 .. l_list.get_size - 1 loop
-      if c.slots.has(el_str(l_list.get(i))) then add_pii(l_out, c.slots.get(el_str(l_list.get(i))), 'full'); end if;
+      if el_str(l_list.get(i)) like 'context.%' then
+        l_rec := obj(c.state, 'context');
+        if l_rec is not null and l_rec.has(substr(el_str(l_list.get(i)), 9)) then
+          add_pii(l_out, l_rec.get(substr(el_str(l_list.get(i)), 9)), 'full');
+        end if;
+      elsif c.slots.has(el_str(l_list.get(i))) then
+        add_pii(l_out, c.slots.get(el_str(l_list.get(i))), 'full');
+      end if;
     end loop;
     for i in 0 .. l_nodes.get_size - 1 loop
       l_n    := treat(l_nodes.get(i) as json_object_t);
@@ -504,6 +511,15 @@ create or replace package body fc_engine as
             end if;
           end loop;
         end if;
+      elsif l_type = 'agent' then
+        l_flds := arr(l_n, 'outputs');
+        for j in 0 .. l_flds.get_size - 1 loop
+          if l_flds.get(j).is_object then
+            l_f    := treat(l_flds.get(j) as json_object_t);
+            l_mode := pii_mode(l_f);
+            if l_mode is not null and c.slots.has(str(l_f, 'name')) then add_pii(l_out, c.slots.get(str(l_f, 'name')), l_mode); end if;
+          end if;
+        end loop;
       elsif l_type = 'repeat' then
         l_flds  := arr(l_n, 'fields');
         l_items := arr(c.slots, str(l_n, 'slot'));
@@ -1434,6 +1450,7 @@ create or replace package body fc_engine as
     if l_kind is null or instr(c_ai_kinds, ',' || l_kind || ',') = 0 then l_kind := 'text'; end if;
     l_spec.put('kind', l_kind);
     cp('min'); cp('max'); cp('minDate'); cp('maxDate'); cp('minLength'); cp('maxLength'); cp('parseMessage');
+    cp('accept'); cp('maxSizeKb');
     if l_kind = 'choice' then
       l_opts := arr(p_out, 'options');
       for i in 0 .. l_opts.get_size - 1 loop
@@ -1506,6 +1523,181 @@ create or replace package body fc_engine as
     return l;
   end ag_fn;
 
+  -- Tools pick_record can show as cards: the node's SEARCH tools.
+  function ag_pick_tools (p_node in json_object_t) return json_array_t is
+    l_out   json_array_t := json_array_t();
+    l_tools json_array_t := arr(p_node, 'tools');
+    l_tid   varchar2(64);
+  begin
+    for i in 0 .. l_tools.get_size - 1 loop
+      l_tid := substr(el_str(l_tools.get(i)), 1, 64);
+      for t in (select tool_id from fc_ai_tools where tool_id = l_tid and tool_type = 'SEARCH' and enabled = 'Y') loop
+        l_out.append(t.tool_id);
+      end loop;
+    end loop;
+    return l_out;
+  end ag_pick_tools;
+
+  -- A file output is filled only by the user's upload, never by the model.
+  function ag_is_file (p_out in json_object_t) return boolean is
+  begin
+    return str(ag_spec(p_out), 'kind') = 'file';
+  end ag_is_file;
+
+  -- PII placeholders. Unless the node has sendPii, the model sees [PII_n] instead of a personal
+  -- value (state.agent[node].pii maps token to value); the engine puts the value back in tool
+  -- arguments, fields and text shown to the user.
+  function ag_tok (p_a in out nocopy json_object_t, p_v in varchar2) return varchar2 is
+    l_map  json_object_t := obj(p_a, 'pii');
+    l_keys json_key_list;
+    l_n    pls_integer := 0;
+    l_tk   varchar2(30);
+  begin
+    if l_map is null then l_map := json_object_t(); end if;
+    l_keys := l_map.get_keys;
+    if l_keys is not null then
+      l_n := l_keys.count;
+      for i in 1 .. l_keys.count loop
+        if str(l_map, l_keys(i)) = p_v then return l_keys(i); end if;
+      end loop;
+    end if;
+    l_tk := '[PII_' || (l_n + 1) || ']';
+    l_map.put(l_tk, p_v);
+    p_a.put('pii', l_map);
+    return l_tk;
+  end ag_tok;
+
+  -- A value as it appears inside a JSON string (quotes, backslashes and controls escaped).
+  function ag_esc (p_v in varchar2) return varchar2 is
+    l json_array_t := json_array_t();
+    s varchar2(32767);
+  begin
+    l.append(p_v);
+    s := l.to_string;
+    return substr(s, 3, length(s) - 4);
+  end ag_esc;
+
+  function ag_unpii_text (p_a in json_object_t, p_s in varchar2) return varchar2 is
+    l_map  json_object_t := obj(p_a, 'pii');
+    l_keys json_key_list;
+    l_s    varchar2(32767) := p_s;
+  begin
+    if l_map is null or p_s is null then return p_s; end if;
+    l_keys := l_map.get_keys;
+    if l_keys is not null then
+      for i in 1 .. l_keys.count loop l_s := replace(l_s, l_keys(i), str(l_map, l_keys(i))); end loop;
+    end if;
+    return l_s;
+  end ag_unpii_text;
+
+  function ag_unpii (p_a in json_object_t, p_obj in json_object_t) return json_object_t is
+    l_map  json_object_t := obj(p_a, 'pii');
+    l_keys json_key_list;
+    l_txt  clob;
+  begin
+    if l_map is null or p_obj is null then return p_obj; end if;
+    l_keys := l_map.get_keys;
+    if l_keys is null or l_keys.count = 0 then return p_obj; end if;
+    l_txt := p_obj.to_clob;
+    for i in 1 .. l_keys.count loop
+      l_txt := replace(l_txt, l_keys(i), ag_esc(str(l_map, l_keys(i))));
+    end loop;
+    return json_object_t.parse(l_txt);
+  end ag_unpii;
+
+  -- Every personal value the model must not see: the flow's PII values and earlier tokens, longest first.
+  function ag_pii_vals (c in out nocopy t_ctx, p_a in json_object_t) return apex_t_varchar2 is
+    l_all  apex_t_varchar2 := apex_t_varchar2();
+    l_out  apex_t_varchar2 := apex_t_varchar2();
+    l_pp   json_array_t    := pii_pairs(c);
+    l_map  json_object_t   := obj(p_a, 'pii');
+    l_keys json_key_list;
+  begin
+    for i in 0 .. l_pp.get_size - 1 loop
+      l_all.extend;
+      l_all(l_all.count) := str(treat(l_pp.get(i) as json_object_t), 'v');
+    end loop;
+    if l_map is not null then
+      l_keys := l_map.get_keys;
+      if l_keys is not null then
+        for i in 1 .. l_keys.count loop
+          l_all.extend;
+          l_all(l_all.count) := str(l_map, l_keys(i));
+        end loop;
+      end if;
+    end if;
+    if l_all.count = 0 then return l_out; end if;
+    select v bulk collect into l_out
+      from (select distinct column_value v from table(l_all) where length(column_value) >= 3)
+     order by length(v) desc;
+    return l_out;
+  end ag_pii_vals;
+
+  -- Personal values in text on its way to the model (the user's free text) become tokens.
+  function ag_repii_text (c in out nocopy t_ctx, p_node in json_object_t, p_a in out nocopy json_object_t,
+                          p_s in varchar2) return varchar2 is
+    l_vals apex_t_varchar2;
+    l_s    varchar2(32767) := p_s;
+  begin
+    if get_bool(p_node, 'sendPii') or p_s is null then return p_s; end if;
+    l_vals := ag_pii_vals(c, p_a);
+    for i in 1 .. l_vals.count loop
+      if instr(l_s, l_vals(i)) > 0 then l_s := replace(l_s, l_vals(i), ag_tok(p_a, l_vals(i))); end if;
+    end loop;
+    return l_s;
+  end ag_repii_text;
+
+  -- The same for a JSON object (tool results, answers, picked records).
+  function ag_repii (c in out nocopy t_ctx, p_node in json_object_t, p_a in out nocopy json_object_t,
+                     p_obj in json_object_t) return json_object_t is
+    l_vals apex_t_varchar2;
+    l_txt  clob;
+    l_q    clob;
+    l_e    varchar2(32767);
+    l_r    json_object_t;
+  begin
+    if get_bool(p_node, 'sendPii') or p_obj is null then return p_obj; end if;
+    l_vals := ag_pii_vals(c, p_a);
+    if l_vals.count = 0 then return p_obj; end if;
+    l_txt := p_obj.to_clob;
+    l_q   := l_txt;
+    for i in 1 .. l_vals.count loop
+      l_e := ag_esc(l_vals(i));
+      if dbms_lob.instr(l_txt, l_e) > 0 then l_txt := replace(l_txt, l_e, ag_tok(p_a, l_vals(i))); end if;
+    end loop;
+    begin
+      l_r := json_object_t.parse(l_txt);
+    exception when others then
+      -- a value matched inside a number: replace whole string values only
+      for i in 1 .. l_vals.count loop
+        l_e := '"' || ag_esc(l_vals(i)) || '"';
+        if dbms_lob.instr(l_q, l_e) > 0 then l_q := replace(l_q, l_e, '"' || ag_tok(p_a, l_vals(i)) || '"'); end if;
+      end loop;
+      l_r := json_object_t.parse(l_q);
+    end;
+    return l_r;
+  end ag_repii;
+
+  -- The title of a record card: the tool's title template, else its first three values.
+  function ag_title (p_tpl in varchar2, p_vals in json_object_t) return varchar2 is
+    l_keys json_key_list;
+    l_s    varchar2(4000);
+    l_n    pls_integer := 0;
+  begin
+    if p_tpl is not null then return interpolate(p_tpl, p_vals); end if;
+    l_keys := p_vals.get_keys;
+    if l_keys is not null then
+      for i in 1 .. l_keys.count loop
+        if p_vals.get(l_keys(i)).is_scalar and str(p_vals, l_keys(i)) is not null then
+          l_s := substr(l_s || case when l_n > 0 then ' ' || to_char(unistr('\00B7')) || ' ' end || str(p_vals, l_keys(i)), 1, 4000);
+          l_n := l_n + 1;
+          exit when l_n = 3;
+        end if;
+      end loop;
+    end if;
+    return l_s;
+  end ag_title;
+
   -- The tools the model may call: the built-ins, then the node's registered tools.
   function ag_tool_defs (c in out nocopy t_ctx, p_node in json_object_t) return json_array_t is
     l_defs  json_array_t  := json_array_t();
@@ -1521,21 +1713,28 @@ create or replace package body fc_engine as
     l_list  varchar2(4000);
     l_par   json_object_t;
     l_tid   varchar2(64);
+    l_venum json_array_t  := json_array_t();
+    l_picks json_array_t  := ag_pick_tools(p_node);
   begin
     for i in 0 .. l_outs.get_size - 1 loop
       if l_outs.get(i).is_object then
         l_o := treat(l_outs.get(i) as json_object_t);
         if str(l_o, 'name') is not null then
           l_enum.append(str(l_o, 'name'));
-          l_props.put(str(l_o, 'name'), ag_schema(l_o));
-          if nvl(str(l_o, 'required'), 'true') <> 'false' then l_req.append(str(l_o, 'name')); end if;
+          if not ag_is_file(l_o) then
+            l_venum.append(str(l_o, 'name'));
+            l_props.put(str(l_o, 'name'), ag_schema(l_o));
+            if nvl(str(l_o, 'required'), 'true') <> 'false' then l_req.append(str(l_o, 'name')); end if;
+          end if;
         end if;
       end if;
     end loop;
     l_p := json_object_t.parse('{"type":"object","properties":{'
       || '"question":{"type":"string","description":"The question, shown to the user"},'
-      || '"kind":{"type":"string","enum":["text","number","date","email","yesno","choice"],"description":"Answer type (default text)"},'
+      || '"kind":{"type":"string","enum":["text","number","date","email","yesno","choice","file"],"description":"Answer type (default text)"},'
       || '"options":{"type":"array","items":{"type":"string"},"description":"The choices, for kind choice (shown as buttons)"},'
+      || '"accept":{"type":"string","description":"For kind file: allowed file extensions, e.g. .pdf,.jpg"},'
+      || '"sensitive":{"type":"boolean","description":"True when the answer is personal data (it is then shown to you as a placeholder)"},'
       || '"field":{"type":"string",' || case when l_enum.get_size > 0 then '"enum":' || l_enum.to_string || ',' end
       || '"description":"The output field this answer fills, if any"}},"required":["question"]}');
     l_defs.append(ag_fn('ask_user', 'Ask the user one question and wait for the answer. Use it only for information the user has to give.', l_p));
@@ -1569,6 +1768,21 @@ create or replace package body fc_engine as
       l_defs.append(ag_fn('handoff', 'Hand the conversation to another step instead of finishing: ' || l_list, l_p));
     end if;
 
+    if l_picks.get_size > 0 then
+      l_p := json_object_t.parse('{"type":"object","properties":{"tool":{"type":"string","enum":' || l_picks.to_string
+        || '},"args":{"type":"object","description":"The search arguments, as for the tool itself"},'
+        || '"question":{"type":"string","description":"Shown above the cards"}},"required":["tool"]}');
+      l_defs.append(ag_fn('pick_record', 'Search with one of these tools and let the user pick one of the records found '
+        || '(shown as cards). Returns the picked record, or null when the user picks none. Tools: '
+        || replace(replace(replace(l_picks.to_string, '"'), '['), ']'), l_p));
+    end if;
+
+    if l_venum.get_size > 0 then
+      l_p := json_object_t.parse('{"type":"object","properties":{"field":{"type":"string","enum":' || l_venum.to_string
+        || '},"value":{"description":"The value"}},"required":["field","value"]}');
+      l_defs.append(ag_fn('set_field', 'Fill one output field now (the form shows it straight away). finish still has to be called.', l_p));
+    end if;
+
     if l_skls.get_size > 0 then
       l_p := json_object_t.parse('{"type":"object","properties":{"id":{"type":"string","enum":' || l_skls.to_string
                                  || '}},"required":["id"]}');
@@ -1588,7 +1802,8 @@ create or replace package body fc_engine as
     return l_defs;
   end ag_tool_defs;
 
-  function ag_system (c in out nocopy t_ctx, p_node in json_object_t, p_mode in varchar2) return clob is
+  function ag_system (c in out nocopy t_ctx, p_node in json_object_t, p_mode in varchar2,
+                      p_a in out nocopy json_object_t) return clob is
     l_v     json_object_t := vals(c);
     l_pii   json_array_t  := pii_pairs(c);
     l_known json_object_t := json_object_t();
@@ -1625,12 +1840,19 @@ create or replace package body fc_engine as
             if str(treat(l_pii.get(j) as json_object_t), 'v') = l_val then l_hide := true; exit; end if;
           end loop;
         end if;
-        l_known.put(l_k, case when l_hide then '(hidden)' else l_val end);
+        if l_hide then l_known.put(l_k, ag_tok(p_a, l_val)); else l_known.put(l_k, l_val); end if;
       end if;
     end loop;
     l_known.put('app_user', str(l_v, 'app_user'));
     l_known.put('today', to_char(sysdate, 'YYYY-MM-DD'));
     l_txt := l_txt || 'Known values: ' || l_known.to_clob || nl;
+    if not get_bool(p_node, 'sendPii') then
+      l_txt := l_txt || 'Values like [PII_1] stand for personal data. Use them exactly as they are in tool arguments, '
+            || 'fields and messages: the application puts the real value back.' || nl;
+    end if;
+    if ag_pick_tools(p_node).get_size > 0 then
+      l_txt := l_txt || 'To let the user choose one record, use pick_record instead of listing records in a question.' || nl;
+    end if;
     if l_outs.get_size > 0 then
       l_line := 'Output fields: ';
       for i in 0 .. l_outs.get_size - 1 loop
@@ -1959,6 +2181,11 @@ create or replace package body fc_engine as
     l_q     varchar2(32767);
     l_sk    varchar2(100);
     l_cnt   clob;
+    l_tid   varchar2(64);
+    l_sa    json_object_t;
+    l_rows  json_array_t;
+    l_rv    json_object_t;
+    l_name2 varchar2(200);
 
     procedure add_err (p in varchar2) is
     begin
@@ -1972,7 +2199,7 @@ create or replace package body fc_engine as
     end if;
 
     if l_name = 'ask_user' then
-      l_q := str(l_args, 'question');
+      l_q := ag_unpii_text(p_a, str(l_args, 'question'));
       if l_q is null then return ag_err('question is required'); end if;
       if nvl(to_num(str(p_a, 'questions')), 0) >= ag_lim(p_node, 'maxQuestions', 10, 0, 50) then
         return ag_err('No more questions allowed. Finish with what you have, or call give_up.');
@@ -2002,6 +2229,7 @@ create or replace package body fc_engine as
             if l_list.get_size <= 6 then l_spec.put('display', 'buttons'); end if;
           end if;
         end if;
+        if l_kind = 'file' and str(l_args, 'accept') is not null then l_spec.put('accept', substr(str(l_args, 'accept'), 1, 400)); end if;
         l_spec.put('kind', l_kind);
       end if;
       p_a.put('questions', nvl(to_num(str(p_a, 'questions')), 0) + 1);
@@ -2013,20 +2241,88 @@ create or replace package body fc_engine as
       if l_o is not null then
         l_w.put('field', str(l_o, 'name'));
         l_w.put('label', nvl(str(l_o, 'label'), str(l_o, 'name')));
+        l_w.put('pii', pii_mode(l_o) is not null);
       else
         l_w.put('label', 'Answer');
+        l_w.put('pii', get_bool(l_args, 'sensitive'));
       end if;
       p_a.put('waiting', l_w);
       p_status := 'wait';
       return null;
 
+    elsif l_name = 'pick_record' then
+      l_tid := substr(str(l_args, 'tool'), 1, 64);
+      if l_tid is null or not ag_has(ag_pick_tools(p_node), l_tid) then
+        return ag_err('pick_record needs one of these tools: ' || replace(replace(replace(ag_pick_tools(p_node).to_string, '"'), '['), ']'));
+      end if;
+      if nvl(to_num(str(p_a, 'questions')), 0) >= ag_lim(p_node, 'maxQuestions', 10, 0, 50) then
+        return ag_err('No more questions allowed. Finish with what you have, or call give_up.');
+      end if;
+      select * into l_t from fc_ai_tools where tool_id = l_tid;
+      l_sa := obj(l_args, 'args');
+      if l_sa is null then l_sa := json_object_t(); end if;
+      l_r := ag_run_tool(c, p_node, l_t, ag_unpii(p_a, l_sa));
+      if str(l_r, 'error') is not null then return l_r; end if;
+      l_rows := arr(l_r, 'rows');
+      l_list := json_array_t();
+      for i in 0 .. least(l_rows.get_size, 20) - 1 loop
+        if l_rows.get(i).is_object then
+          l_rv := treat(l_rows.get(i) as json_object_t);
+          l_e  := json_object_t();
+          l_e.put('token', lower(rawtohex(dbms_crypto.randombytes(6))) || i);
+          l_e.put('title', nvl(ag_title(l_t.title_template, l_rv), 'Record ' || (i + 1)));
+          if l_t.subtitle_template is not null then l_e.put('subtitle', interpolate(l_t.subtitle_template, l_rv)); end if;
+          l_e.put('values', l_rv);
+          l_list.append(l_e);
+        end if;
+      end loop;
+      if l_list.get_size = 0 then
+        return json_object_t.parse('{"rows":[],"message":"Nothing was found. Tell the user, or search again with other arguments."}');
+      end if;
+      p_a.put('questions', nvl(to_num(str(p_a, 'questions')), 0) + 1);
+      l_q := ag_unpii_text(p_a, nvl(str(l_args, 'question'), 'Which one?'));
+      add_msg(c, 'text', l_q);
+      l_w := json_object_t();
+      l_w.put('type', 'pick');
+      l_w.put('prompt', l_q);
+      l_w.put('noneLabel', 'None of these');
+      l_w.put('items', l_list);
+      p_a.put('waiting', l_w);
+      p_status := 'wait';
+      return null;
+
+    elsif l_name = 'set_field' then
+      l_o := ag_out(p_node, str(l_args, 'field'));
+      if l_o is null or ag_is_file(l_o) then return ag_err('Unknown field.'); end if;
+      l_name2 := str(l_o, 'name');
+      l_args  := ag_unpii(p_a, l_args);
+      l_raw   := str(l_args, 'value');
+      if l_raw is null then return ag_err('value is required'); end if;
+      l_pv  := parse_value(ag_spec(l_o), l_raw);
+      l_err := str(l_pv, 'error');
+      if l_err is null then
+        l_tmp := json_object_t();
+        l_tmp.put('id', l_id);
+        l_tmp.put('input', ag_spec(l_o));
+        l_err := validate(c, l_tmp, l_pv);
+      end if;
+      if l_err is not null then return ag_err(l_name2 || ': ' || l_err); end if;
+      c.slots.put(l_name2, l_pv.get('value'));
+      touch(c, l_name2);
+      return json_object_t.parse('{"ok":true}');
+
     elsif l_name = 'finish' then
-      l_f := obj(l_args, 'fields');
+      l_f := ag_unpii(p_a, obj(l_args, 'fields'));
       if l_f is null then l_f := json_object_t(); end if;
       for i in 0 .. l_outs.get_size - 1 loop
         l_o := treat(l_outs.get(i) as json_object_t);
         l_raw := str(l_f, str(l_o, 'name'));
-        if l_raw is null then
+        if ag_is_file(l_o) then
+          if not (c.slots.has(str(l_o, 'name')) and not c.slots.get(str(l_o, 'name')).is_null)
+             and nvl(str(l_o, 'required'), 'true') <> 'false' then
+            add_err(str(l_o, 'name') || ' is required (ask the user to attach it with ask_user)');
+          end if;
+        elsif l_raw is null then
           if str(c.slots, str(l_o, 'name')) is null and nvl(str(l_o, 'required'), 'true') <> 'false' then
             add_err(str(l_o, 'name') || ' is required');
           end if;
@@ -2054,7 +2350,7 @@ create or replace package body fc_engine as
           touch(c, l_keys(i));
         end loop;
       end if;
-      add_msg(c, 'text', str(l_args, 'message'));
+      add_msg(c, 'text', ag_unpii_text(p_a, str(l_args, 'message')));
       dbg_kv(c, 'agentDone', l_id, 'steps', str(p_a, 'steps'));
       p_next := ag_done(c, p_node, p_a, str(p_node, 'next'));
       p_status := 'next';
@@ -2097,6 +2393,7 @@ create or replace package body fc_engine as
     exception when no_data_found then
       return ag_err('Unknown tool "' || l_name || '"');
     end;
+    l_args := ag_unpii(p_a, l_args);
     if l_t.is_write = 'Y' and l_t.needs_confirm = 'Y' and nvl(str(p_a, 'approved'), '~') <> str(p_call, 'id') then
       if l_t.confirm_text is not null then
         l_mv   := vals(c);
@@ -2125,7 +2422,7 @@ create or replace package body fc_engine as
       return null;
     end if;
     if p_a.has('approved') then p_a.remove('approved'); end if;
-    return ag_run_tool(c, p_node, l_t, l_args);
+    return ag_repii(c, p_node, p_a, ag_run_tool(c, p_node, l_t, l_args));
   end ag_exec;
 
   -- Runs until the agent needs the user (p_await), finishes (returns its next node) or fails.
@@ -2191,10 +2488,10 @@ create or replace package body fc_engine as
       end if;
       l_text := str(l_m, 'text');
       if arr(l_m, 'calls').get_size > 0 then
-        add_msg(c, 'text', l_text);
+        add_msg(c, 'text', ag_unpii_text(l_a, l_text));
         l_a.put('pending', arr(l_m, 'calls'));
       elsif l_text is not null then
-        add_msg(c, 'text', l_text);
+        add_msg(c, 'text', ag_unpii_text(l_a, l_text));
         l_w := json_object_t();
         l_w.put('type', 'reply');
         l_w.put('prompt', substr(l_text, 1, 4000));
@@ -2235,7 +2532,7 @@ create or replace package body fc_engine as
     l_a.put_null('next');
     l_m := json_object_t();
     l_m.put('role', 'system');
-    l_m.put('content', ag_system(c, p_node, l_mode));
+    l_m.put('content', ag_system(c, p_node, l_mode, l_a));
     l_msgs.append(l_m);
     l_m := json_object_t();
     l_m.put('role', 'user');
@@ -2265,6 +2562,7 @@ create or replace package body fc_engine as
     l_w.put('spec', ag_spec(l_o));
     l_w.put('field', p_slot);
     l_w.put('label', nvl(str(l_o, 'label'), p_slot));
+    l_w.put('pii', pii_mode(l_o) is not null);
     l_a.put('waiting', l_w);
     ag_put(c, l_id, l_a);
     c.state.put('current', l_id);
@@ -3311,7 +3609,24 @@ create or replace package body fc_engine as
       elsif l_type = 'agent' then
         l_aw := null;
         l_agw := obj(ag_get(c, l_cur), 'waiting');
-        if l_agw is not null then
+        if l_agw is not null and str(l_agw, 'type') = 'pick' then
+          l_aw := json_object_t();
+          l_aw.put('nodeId', l_cur);
+          l_aw.put('type', 'pick');
+          l_items := json_array_t();
+          l_res   := arr(l_agw, 'items');
+          for i in 0 .. l_res.get_size - 1 loop
+            l_r    := treat(l_res.get(i) as json_object_t);
+            l_item := json_object_t();             -- never the row values: only the token and the card text
+            l_item.put('token', str(l_r, 'token'));
+            l_item.put('title', str(l_r, 'title'));
+            l_item.put('subtitle', str(l_r, 'subtitle'));
+            l_items.append(l_item);
+          end loop;
+          l_aw.put('items', l_items);
+          l_aw.put('allowNone', true);
+          l_aw.put('noneLabel', nvl(str(l_agw, 'noneLabel'), 'None of these'));
+        elsif l_agw is not null then
           l_aw := json_object_t();
           l_aw.put('nodeId', l_cur);
           l_aw.put('type', 'ask');
@@ -4170,6 +4485,8 @@ create or replace package body fc_engine as
           l_fd := treat(arr(l_node, 'fields').get(nvl(to_num(str(l_rs, 'field')), 0)) as json_object_t);
           return pii_mode(l_fd) is not null;
         end if;
+      when 'agent' then
+        return get_bool(obj(ag_get(c, l_cur), 'waiting'), 'pii');
       else null;
     end case;
     return false;
@@ -4255,12 +4572,25 @@ create or replace package body fc_engine as
     l_u     json_object_t;
     l_next  varchar2(200);
     l_await boolean;
+    l_blob  blob;
+    l_items json_array_t;
+    l_it    json_object_t;
+    l_ch    json_object_t;
+    l_pick  varchar2(200);
+    l_none  boolean := false;
   begin
     if l_w is null then
       add_msg(c, 'error', 'There is nothing to answer right now.');
       return;
     end if;
-    if l_type in ('edit', 'ask', 'reply') then
+    if l_type in ('edit', 'ask', 'reply') and str(obj(l_w, 'spec'), 'kind') = 'file' then
+      l_pv  := parse_file(obj(l_w, 'spec'), obj(p_in, 'file'), l_blob);
+      l_err := str(l_pv, 'error');
+      if l_err is null and l_blob is null then
+        l_err := nvl(str(obj(l_w, 'spec'), 'parseMessage'), 'Please attach a file.');
+      end if;
+      if l_err is null then l_pv := save_file(c, nvl(str(l_w, 'field'), '#agent'), l_pv, l_blob); end if;
+    elsif l_type in ('edit', 'ask', 'reply') then
       l_pv  := parse_value(obj(l_w, 'spec'), l_raw);
       l_err := str(l_pv, 'error');
       if l_err is null then
@@ -4269,6 +4599,8 @@ create or replace package body fc_engine as
         l_tmp.put('input', obj(l_w, 'spec'));
         l_err := validate(c, l_tmp, l_pv);
       end if;
+    end if;
+    if l_type in ('edit', 'ask', 'reply') then
       if l_err is not null then
         add_msg(c, 'error', l_err);
         return;
@@ -4307,6 +4639,42 @@ create or replace package body fc_engine as
       end if;
     elsif l_type = 'continue' then
       l_a.put_null('waiting');
+    elsif l_type = 'pick' then
+      l_items := arr(l_w, 'items');
+      if p_in.has('pick') and p_in.get('pick').is_null then
+        l_none := true;
+      else
+        l_pick := str(p_in, 'pick');
+        if l_pick is null and l_t in ('none', lower(nvl(str(l_w, 'noneLabel'), 'None of these'))) then
+          l_none := true;
+        else
+          for i in 0 .. l_items.get_size - 1 loop
+            l_it := treat(l_items.get(i) as json_object_t);
+            if (l_pick is not null and str(l_it, 'token') = l_pick)
+               or (l_pick is null and l_t <> '~' and (l_t = to_char(i + 1) or instr(lower(str(l_it, 'title')), l_t) > 0)) then
+              l_ch := l_it;
+              exit;
+            end if;
+          end loop;
+        end if;
+      end if;
+      if l_ch is null and not l_none then
+        add_msg(c, 'error', 'Please choose one of the records shown.');
+        return;
+      end if;
+      l_a.put_null('waiting');
+      l_pend := arr(l_a, 'pending');
+      l_call := treat(l_pend.get(0) as json_object_t);
+      l_pend.remove(0);
+      l_a.put('pending', l_pend);
+      l_r := json_object_t();
+      if l_none then
+        l_r.put_null('picked');
+        l_r.put('message', 'The user chose none of these.');
+      else
+        l_r.put('picked', ag_repii(c, p_node, l_a, obj(l_ch, 'values')));
+      end if;
+      ag_result(l_a, l_call, l_r);
     else
       l_a.put_null('waiting');
       if l_type = 'ask' then
@@ -4315,12 +4683,17 @@ create or replace package body fc_engine as
         l_pend.remove(0);
         l_a.put('pending', l_pend);
         l_r := json_object_t();
-        l_r.put('answer', l_pv.get('value'));
-        ag_result(l_a, l_call, l_r);
+        if not get_bool(p_node, 'sendPii') and get_bool(l_w, 'pii') and l_pv.get('value') is not null
+           and l_pv.get('value').is_scalar and str(l_pv, 'value') is not null then
+          l_r.put('answer', ag_tok(l_a, str(l_pv, 'value')));
+        else
+          l_r.put('answer', l_pv.get('value'));
+        end if;
+        ag_result(l_a, l_call, ag_repii(c, p_node, l_a, l_r));
       else
         l_u := json_object_t();
         l_u.put('role', 'user');
-        l_u.put('content', trim(l_raw));
+        l_u.put('content', ag_repii_text(c, p_node, l_a, trim(l_raw)));
         ag_append(l_a, l_u);
       end if;
     end if;
