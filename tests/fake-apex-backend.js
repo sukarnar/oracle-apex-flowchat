@@ -104,7 +104,7 @@
 
   var PORTS = ['next', 'else', 'onNotFound', 'onSuccess', 'onError', 'found', 'notFound', 'tooMany', 'cancelled',
                'done', 'noChanges', 'saved', 'conflict', 'forbidden', 'error', 'verified', 'failed', 'none', 'partial'];
-  var TYPES = ['message', 'ask', 'condition', 'lookup', 'summary', 'submit', 'end', 'verify', 'findRecord', 'changeFields', 'saveChanges', 'repeat', 'bulkUpdate', 'set', 'menu', 'email', 'agent'];
+  var TYPES = ['message', 'ask', 'condition', 'lookup', 'summary', 'submit', 'end', 'verify', 'findRecord', 'changeFields', 'saveChanges', 'repeat', 'bulkUpdate', 'set', 'menu', 'email', 'agent', 'rest'];
   function validationErrors(def) {
     var errs = [], ids = {};
     if (!/^[a-z0-9_]{1,100}$/.test(def.flowId || '')) errs.push('flowId must be lowercase letters, digits and _');

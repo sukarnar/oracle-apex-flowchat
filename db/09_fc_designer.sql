@@ -120,7 +120,7 @@ create or replace package body fc_designer as
     l_ports  constant sys.odcivarchar2list := sys.odcivarchar2list(
                'next', 'else', 'onNotFound', 'onSuccess', 'onError', 'found', 'notFound', 'tooMany', 'cancelled',
                'done', 'noChanges', 'saved', 'conflict', 'forbidden', 'error', 'verified', 'failed', 'none', 'partial');
-    l_types  constant varchar2(200) := ',message,ask,condition,lookup,summary,submit,end,verify,findRecord,changeFields,saveChanges,repeat,bulkUpdate,set,menu,email,agent,';
+    l_types  constant varchar2(200) := ',message,ask,condition,lookup,summary,submit,end,verify,findRecord,changeFields,saveChanges,repeat,bulkUpdate,set,menu,email,agent,rest,';
     procedure err (p in varchar2) is
     begin
       if length(l_errs) > 3500 then return; end if;
