@@ -1050,10 +1050,11 @@
       var m = res.choices && res.choices[0] ? res.choices[0].message || {} : res;
       var out = { text: isFilled(m.content) ? String(m.content).trim() : '', calls: [] };
       if (a.mode === 'native') {
+        out.text = cleanText(out.text).trim();
         (m.tool_calls || []).forEach(function (tc, i) {
           var fn = tc.function || {}, args = fn.arguments;
           if (typeof args === 'string') { try { args = JSON.parse(args || '{}'); } catch (e) { args = { _invalid: String(fn.arguments) }; } }
-          out.calls.push({ id: tc.id || 'call_' + a.steps + '_' + i, name: String(fn.name || ''), args: args || {} });
+          out.calls.push({ id: tc.id || 'call_' + a.steps + '_' + i, name: String(fn.name || ''), args: cleanDeep(args || {}) });
         });
         var am = { role: 'assistant', content: isFilled(m.content) ? m.content : null };
         if (out.calls.length) am.tool_calls = out.calls.map(function (c) { return { id: c.id, type: 'function', function: { name: c.name, arguments: JSON.stringify(c.args) } }; });
@@ -1061,12 +1062,36 @@
       } else {
         a.messages.push({ role: 'assistant', content: m.content || '' });
         var j = parseJsonReply(out.text);
-        if (j && j.tool) { out.calls.push({ id: 'call_' + a.steps, name: String(j.tool), args: j.args || {} }); out.text = ''; }
-        else if (j && isFilled(j.reply)) out.text = String(j.reply);
+        if (j && j.tool) { out.calls.push({ id: 'call_' + a.steps, name: String(j.tool), args: cleanDeep(j.args || {}) }); out.text = ''; }
+        else if (j && isFilled(j.reply)) out.text = cleanText(String(j.reply)).trim();
+        else out.text = cleanText(out.text).trim();   // parsed first: a curly quote inside the JSON must not break it
       }
       dbg(ctx, { event: 'agent', node: node.id, step: a.steps, ms: Date.now() - t0, reply: out.text || undefined,
                  calls: out.calls.map(function (c) { return { tool: c.name, args: c.args }; }) });
       return out;
+    }
+    // Model text as plain characters: typographic spaces, dashes, quotes, bullets and the ellipsis become
+    // their plain forms, and invisible characters (zero-width, byte-order mark, soft hyphen, the U+FFFD
+    // replacement character, control characters) are removed. Models such as GPT OSS write U+202F and
+    // U+2011, which a database without AL32UTF8 turns into an inverted question mark.
+    var CLEAN_MAP = [
+      [/[  -   　]/g, ' '],
+      [/[‐-―−•‣⁃]/g, '-'],
+      [/[‘’‚‛′]/g, "'"],
+      [/[“”„‟″]/g, '"'],
+      [/…/g, '...'],
+      [/[​-‍⁠﻿­�\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '']
+    ];
+    function cleanText(v) {
+      if (typeof v !== 'string') return v;
+      CLEAN_MAP.forEach(function (r) { v = v.replace(r[0], r[1]); });
+      return v;
+    }
+    function cleanDeep(v) {
+      if (typeof v === 'string') return cleanText(v);
+      if (Array.isArray(v)) return v.map(cleanDeep);
+      if (v && typeof v === 'object') { var o = {}; Object.keys(v).forEach(function (k) { o[k] = cleanDeep(v[k]); }); return o; }
+      return v;
     }
     function agentResult(a, call, result) {
       var txt = JSON.stringify(result === undefined ? null : result);

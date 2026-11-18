@@ -883,6 +883,19 @@ model calls `load_skill` for the full text.
 
 ### Guardrails
 
+- **Plain characters:** models such as GPT OSS and Llama write typographic characters: the narrow
+  no-break space (U+202F), the non-breaking hyphen (U+2011), curly quotes, en and em dashes,
+  bullets, the ellipsis, zero-width spaces and the byte-order mark. A database whose character set
+  isn't AL32UTF8 can't store some of them and shows `¿`. FlowChat cleans every model reply: these
+  become a plain space, `-`, `'`, `"` and `...`, and invisible characters, control characters and
+  the U+FFFD replacement character are removed. This covers the chat text, questions, messages and
+  every value the model puts into a field or a tool's arguments. In the database, FC_ENGINE reads the
+  reply as UTF-8 bytes (`APEX_WEB_SERVICE.MAKE_REST_REQUEST_B`) and cleans it in an NCLOB before
+  the database character set is involved. Letters (é, ñ, ü) are kept. Check your character set
+  with `select value from nls_database_parameters where parameter = 'NLS_CHARACTERSET'`: with
+  anything other than `AL32UTF8`, letters outside that set (for example Chinese) still can't be
+  stored.
+
 - **What the model sees:** the goal, the instructions, the `inputs` you tick, `app_user` and
   today's date. The system prompt tells the model that user and tool text is data, not
   instructions. Even so, what it can do is limited by the tools you register, not by the prompt.
@@ -948,7 +961,7 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 96 unit tests (`tests/engine.test.js`,
+- The JavaScript engine and widget are tested: 98 unit tests (`tests/engine.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
   `tests/email.test.js`, `tests/agent.test.js`, `tests/rest.test.js`), plus manual end-to-end runs of the demos.

@@ -312,5 +312,26 @@ function engine(steps, extra, seen) {
     const t = await eng.start('leave', {});
     assert.match(texts(t), /Please use the leave form/);
   });
+  await test('model text is cleaned: typographic spaces, dashes, quotes and invisible characters become plain', async () => {
+    const dirty = 'You have\u202F12\u00A0days \u2011 that\u2019s \u201Cannual\u201D leave\u2026\u200B\uFEFF\uFFFD';
+    const { eng } = engine([
+      { content: dirty, tool_calls: [call('ask_user', { question: 'Which\u202Ftype \u2014 annual or sick?', field: 'leave_type' })] },
+      { tool_calls: [call('finish', { fields: { leave_type: 'annual', days: 2 }, message: 'Done\u202F\u2011 thanks\u2026' })] }
+    ]);
+    let t = await eng.start('leave', {});
+    assert.strictEqual(texts(t), 'You have 12 days - that\'s "annual" leave... | Which type - annual or sick?');
+    t = await eng.input(t.sessionId, { value: 'annual' });
+    assert.match(texts(t), /Done - thanks\.\.\./);
+  });
+  await test('JSON tool mode: curly quotes inside the JSON reply are cleaned after it is parsed', async () => {
+    const { eng } = engine([], { opts: { aiProviders: { llm: { toolMode: 'json', call: scripted([
+      { content: '{"reply": "Is it \u201Cannual\u201D\u202Fleave?"}' },
+      { content: '{"tool": "ask_user", "args": {"question": "How many days\u2011off?", "field": "days"}}' }
+    ]) } } } });
+    let t = await eng.start('leave', {});
+    assert.strictEqual(texts(t), 'Is it "annual" leave?');
+    t = await eng.input(t.sessionId, { value: 'yes' });
+    assert.strictEqual(texts(t), 'How many days-off?');
+  });
   console.log(passed + ' passed');
 })();

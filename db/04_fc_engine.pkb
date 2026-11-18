@@ -1398,6 +1398,58 @@ create or replace package body fc_engine as
   -- allowed methods). A flow names only the endpoint, a relative path, query, headers, a body
   -- template and a response mapping, so it never holds a host name or a secret.
   ------------------------------------------------------------------------------
+  ------------------------------------------------------------------------------
+  -- Model text as plain characters. Models such as GPT OSS write typographic characters (U+202F
+  -- narrow no-break space, U+2011 non-breaking hyphen, curly quotes, zero-width spaces). A database
+  -- whose character set isn't AL32UTF8 can't store some of them and shows an inverted question mark.
+  -- So the reply is decoded as UTF-8 into an NCLOB (always Unicode), cleaned there, and only then
+  -- converted to the database character set.
+  --   p_mode 'raw'  : the whole HTTP answer (JSON text): everything except double curly quotes,
+  --                   which may sit inside nested JSON and are left for the next stages
+  --   p_mode 'json' : a JSON document (tool arguments, a JSON-mode reply): double curly quotes -> \"
+  --   p_mode 'text' : text shown to the user: double curly quotes -> "
+  ------------------------------------------------------------------------------
+  function ag_clean (p in nclob, p_mode in varchar2) return nclob is
+    l   nclob := p;
+    l_q nvarchar2(10) := unistr('\201C\201D\201E\201F\2033');
+    l_c varchar2(100);
+  begin
+    if p is null then return p; end if;
+    l := translate(l, unistr('\00A0\2000\2001\2002\2003\2004\2005\2006\2007\2008\2009\200A\202F\205F\3000'
+                           || '\2010\2011\2012\2013\2014\2015\2212\2022\2023\2043'
+                           || '\2018\2019\201A\201B\2032'),
+                      rpad(' ', 15) || rpad('-', 10, '-') || rpad('''', 5, ''''));
+    l := replace(l, unistr('\2026'), '...');
+    l := regexp_replace(l, '[' || unistr('\200B\200C\200D\2060\FEFF\00AD\FFFD') || ']', '');
+    if p_mode = 'text' then
+      for i in 1 .. 31 loop
+        if i not in (9, 10, 13) then l_c := l_c || chr(i); end if;
+      end loop;
+      l := translate(l, 'x' || l_c || chr(127), 'x');   -- removes the control characters (x maps to itself)
+      l := translate(l, l_q, rpad('"', 5, '"'));
+    elsif p_mode = 'json' then
+      for i in 1 .. length(l_q) loop
+        l := replace(l, substr(l_q, i, 1), '\"');
+      end loop;
+    end if;
+    return l;
+  end ag_clean;
+
+  -- An HTTP answer (UTF-8 bytes) as text, cleaned by ag_clean in 'raw' mode.
+  function http_text (p_blob in blob) return clob is
+    l_n    nclob;
+    l_dest integer := 1;
+    l_src  integer := 1;
+    l_lang integer := dbms_lob.default_lang_ctx;
+    l_warn integer;
+  begin
+    if p_blob is null or dbms_lob.getlength(p_blob) = 0 then return null; end if;
+    dbms_lob.createtemporary(l_n, true);
+    dbms_lob.converttoclob(l_n, p_blob, dbms_lob.lobmaxsize, l_dest, l_src,
+                           nls_charset_id('AL32UTF8'), l_lang, l_warn);
+    return to_clob(ag_clean(l_n, 'raw'));
+  end http_text;
+
   -- A value inside a URL: everything but letters, digits, - _ ~ is escaped (also "." and "/", so a
   -- value can never add path segments such as "..").
   function rest_url_part (p in varchar2) return varchar2 is
@@ -2354,19 +2406,23 @@ create or replace package body fc_engine as
         end loop;
       end if;
     end if;
-    l_resp := apex_web_service.make_rest_request(
+    l_resp := http_text(apex_web_service.make_rest_request_b(
                 p_url                  => rtrim(l_p.base_url, '/') || '/chat/completions',
                 p_http_method          => 'POST',
                 p_body                 => l_body.to_clob,
                 p_credential_static_id => l_p.credential_id,
                 p_wallet_path          => l_p.wallet_path,
-                p_transfer_timeout     => nvl(l_p.timeout_secs, 120));
+                p_transfer_timeout     => nvl(l_p.timeout_secs, 120)));
     if apex_web_service.g_status_code not between 200 and 299 then
       raise_application_error(-20032, 'AI provider "' || str(p_node, 'provider') || '" returned HTTP '
         || apex_web_service.g_status_code || ': ' || dbms_lob.substr(l_resp, 300, 1));
     end if;
     l_m := treat(json_object_t.parse(l_resp).get_array('choices').get(0) as json_object_t).get_object('message');
-    if l_m.has('content') and l_m.get('content').is_string then l_text := trim(dbms_lob.substr(l_m.get_clob('content'), 32000, 1)); end if;
+    -- native: plain text, cleaned now; json mode: a JSON reply, cleaned so it still parses (its text is cleaned after)
+    if l_m.has('content') and l_m.get('content').is_string then
+      l_text := trim(dbms_lob.substr(ag_clean(to_nclob(l_m.get_clob('content')),
+                                              case when l_mode = 'native' then 'text' else 'json' end), 8000, 1));
+    end if;
 
     if l_mode = 'native' then
       l_tc := arr(l_m, 'tool_calls');
@@ -2375,10 +2431,12 @@ create or replace package body fc_engine as
         l_fn := obj(l_c, 'function');
         l_args := json_object_t();
         if l_fn.has('arguments') and l_fn.get('arguments').is_object then
-          l_args := l_fn.get_object('arguments');
+          l_args := json_object_t.parse(to_clob(ag_clean(to_nclob(l_fn.get_object('arguments').to_clob), 'json')));
         elsif l_fn.has('arguments') and l_fn.get('arguments').is_string then
           begin
-            if dbms_lob.getlength(l_fn.get_clob('arguments')) > 0 then l_args := json_object_t.parse(l_fn.get_clob('arguments')); end if;
+            if dbms_lob.getlength(l_fn.get_clob('arguments')) > 0 then
+              l_args := json_object_t.parse(to_clob(ag_clean(to_nclob(l_fn.get_clob('arguments')), 'json')));
+            end if;
           exception when others then
             l_args := json_object_t();
             l_args.put('_invalid', substr(str(l_fn, 'arguments'), 1, 1000));
@@ -2424,6 +2482,8 @@ create or replace package body fc_engine as
         l_text := null;
       elsif l_jr is not null and str(l_jr, 'reply') is not null then
         l_text := str(l_jr, 'reply');
+      elsif l_jr is null then
+        l_text := replace(l_text, '\"', '"');   -- not JSON after all: undo the JSON escaping of curly quotes
       end if;
     end if;
     ag_append(p_a, l_am);
