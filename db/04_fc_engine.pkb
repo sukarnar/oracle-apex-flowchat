@@ -389,6 +389,29 @@ create or replace package body fc_engine as
     return p_id;
   end route;
 
+  -- The current exception as a message for the user: for raise_application_error codes (-20000 .. -20999)
+  -- its first line without the "ORA-20001: " prefix (the ORA-06512 / ORA-04088 lines a trigger adds are
+  -- dropped); null for any other error. Call it in an exception handler, before any other SQL.
+  function db_error_text return varchar2 is
+  begin
+    if sqlcode between -20999 and -20000 then
+      return trim(regexp_replace(regexp_substr(sqlerrm, '^[^' || chr(10) || ']*'), '^ORA-[0-9]+: ', ''));
+    end if;
+    return null;
+  end db_error_text;
+
+  -- Undo a failed write back to a savepoint. A data source that committed has nothing left to undo (ORA-01086).
+  procedure undo_to (p_savepoint in varchar2) is
+  begin
+    if p_savepoint = 'fc_save' then
+      rollback to fc_save;
+    elsif p_savepoint = 'fc_bulk_row' then
+      rollback to fc_bulk_row;
+    end if;
+  exception when others then
+    if sqlcode <> -1086 then raise; end if;
+  end undo_to;
+
   ------------------------------------------------------------------------------
   -- connectors
   ------------------------------------------------------------------------------
@@ -3370,8 +3393,22 @@ create or replace package body fc_engine as
       l_orig.put(l_keys(i), obj(l_rec, 'original').get(l_keys(i)));
     end loop;
 
-    l_r := fc_data.update_row(str(l_rec, 'source'), str(l_rec, 'key'), str(l_rec, 'version'),
-                              l_orig, l_changes, obj(c.state, 'context'));
+    -- A database error (a trigger, a constraint, a PLSQL source that raises) undoes only this save, shows
+    -- its message (application errors) and takes the error port; the conversation carries on.
+    savepoint fc_save;
+    begin
+      l_r := fc_data.update_row(str(l_rec, 'source'), str(l_rec, 'key'), str(l_rec, 'version'),
+                                l_orig, l_changes, obj(c.state, 'context'));
+    exception when others then
+      l_err := db_error_text;
+      if l_err is null then
+        apex_debug.error('FlowChat save: %s %s', sqlerrm, dbms_utility.format_error_backtrace);
+      end if;
+      undo_to('fc_save');
+      l_r := json_object_t();
+      l_r.put('status', 'error');
+      if l_err is not null then l_r.put('message', l_err); end if;
+    end;
 
     -- audit trail (before / after) in the session transcript
     l_audit.put('action', 'update');
@@ -3380,6 +3417,7 @@ create or replace package body fc_engine as
     l_audit.put('before', l_orig);
     l_audit.put('after', l_changes);
     l_audit.put('result', nvl(str(l_r, 'status'), 'error'));
+    if str(l_r, 'status') <> 'ok' and str(l_r, 'message') is not null then l_audit.put('message', str(l_r, 'message')); end if;
     l_audit_c := l_audit.to_clob;   -- package-private functions and object methods can't appear inside SQL
     log_ev(c, 'OUT', l_nid, l_audit_c);
 
@@ -4735,6 +4773,9 @@ create or replace package body fc_engine as
     l_audit   json_object_t := json_object_t();
     l_next    varchar2(200);
     l_dummy   varchar2(1);
+    l_reason  varchar2(4000);
+    l_errs    json_array_t := json_array_t();
+    l_e       json_object_t;
   begin
     if l_b is null then return; end if;
     l_v.put('count', to_num(str(l_b, 'count')));
@@ -4776,8 +4817,33 @@ create or replace package body fc_engine as
           l_ok := l_ok + 1;          -- already has the new values
           continue;
         end if;
-        l_r := fc_data.update_row(l_src, l_key, str(l_row, 'version'), l_orig, l_ch, obj(c.state, 'context'));
-        if str(l_r, 'status') = 'ok' then l_ok := l_ok + 1; else l_failed := l_failed + 1; end if;
+        -- each row on its own: a row whose update raises (a trigger, a constraint) is undone and counted as failed
+        savepoint fc_bulk_row;
+        begin
+          l_r := fc_data.update_row(l_src, l_key, str(l_row, 'version'), l_orig, l_ch, obj(c.state, 'context'));
+        exception when others then
+          l_reason := db_error_text;
+          if l_reason is null then
+            apex_debug.error('FlowChat bulk update %s: %s %s', l_key, sqlerrm, dbms_utility.format_error_backtrace);
+          end if;
+          undo_to('fc_bulk_row');
+          l_r := json_object_t();
+          l_r.put('status', 'error');
+          if l_reason is not null then l_r.put('message', l_reason); end if;
+        end;
+        if str(l_r, 'status') = 'ok' then
+          l_ok := l_ok + 1;
+        else
+          l_failed := l_failed + 1;
+          if l_errs.get_size < 20 then
+            l_e := json_object_t();
+            l_e.put('key', l_key);
+            l_e.put('result', nvl(str(l_r, 'status'), 'error'));
+            if str(l_r, 'message') is not null then l_e.put('message', str(l_r, 'message')); end if;
+            l_errs.append(l_e);
+          end if;
+          if not l_v.has('failReason') and str(l_r, 'message') is not null then l_v.put('failReason', str(l_r, 'message')); end if;
+        end if;
       end loop;
 
       -- audit trail in the session transcript
@@ -4787,6 +4853,7 @@ create or replace package body fc_engine as
       l_audit.put('count', l_keys.get_size);
       l_audit.put('updated', l_ok);
       l_audit.put('failed', l_failed);
+      if l_errs.get_size > 0 then l_audit.put('errors', l_errs); end if;
       log_ev(c, 'OUT', l_id, l_audit.to_clob);
       dbg_kv(c, 'bulkUpdate', l_id, 'updated', to_char(l_ok), 'failed', to_char(l_failed));
 
@@ -4795,7 +4862,8 @@ create or replace package body fc_engine as
       l_v.put('failed', l_failed);
       if l_failed > 0 then
         add_msg(c, 'error', interpolate(nvl(str(l_pr, 'partial'),
-          'I updated {{updated}} of {{count}} records. {{failed}} could not be changed (changed by someone else, or not allowed).'), l_v));
+          'I updated {{updated}} of {{count}} records. {{failed}} could not be changed (changed by someone else, or not allowed).'
+          || case when l_v.has('failReason') then ' {{failReason}}' end), l_v));
       else
         add_msg(c, 'text', interpolate(nvl(str(l_pr, 'done'), 'Done. I updated {{updated}} of {{count}} records.'), l_v));
       end if;
@@ -5537,7 +5605,7 @@ create or replace package body fc_engine as
     l json_object_t := json_object_t();
   begin
     if sqlcode between -20999 and -20000 then
-      l.put('error', regexp_replace(sqlerrm, '^ORA-[0-9]+: ', ''));
+      l.put('error', db_error_text);   -- first line only: no ORA-06512 / ORA-04088 lines
     else
       l.put('error', 'Unexpected server error. Please try again.');
       apex_debug.error('FlowChat: %s %s', sqlerrm, dbms_utility.format_error_backtrace);

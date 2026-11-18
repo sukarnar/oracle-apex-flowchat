@@ -1659,6 +1659,21 @@
       say(ctx, 'text', interpolate(f.prompt || (fieldLabel(f) + (cur ? ' is currently ' + cur + '. What should it be?' : ' is empty. What should it be?')), view(ctx)));
     }
 
+    // A data source update that throws, as a message for the user: an error's userMessage, or the first line
+    // of an Oracle application error (ORA-20000 .. ORA-20999) without its prefix; null for anything else.
+    function dsErrorText(e) {
+      if (e && typeof e.userMessage === 'string' && e.userMessage.trim()) return e.userMessage.trim();
+      var m = /^ORA-20\d{3}: ([^\n]*)/.exec(String((e && e.message) || ''));
+      return m ? m[1].trim() : null;
+    }
+    async function dsUpdate(src, req) {
+      try {
+        return (await Promise.resolve(src.update(req))) || {};
+      } catch (e) {
+        var text = dsErrorText(e);
+        return text ? { status: 'error', message: text } : { status: 'error' };
+      }
+    }
     async function runSave(ctx, node) {
       var st = ctx.st, rec = st.records[node.record];
       if (!rec) throw new Error('Save changes "' + node.id + '" needs a loaded record "' + node.record + '".');
@@ -1679,8 +1694,10 @@
 
       var src = source(rec.source), original = {};
       fieldsChanged.forEach(function (f) { original[f] = rec.original[f]; });
-      var r = (await Promise.resolve(src.update({ key: rec.key, version: rec.version, original: original, changes: changes, context: dsContext(ctx).context, verified: verifiedValue(ctx) }))) || {};
-      dbg(ctx, { event: 'update', node: node.id, source: rec.source, key: rec.key, before: original, after: changes, result: r.status || 'error' });
+      // A data source that throws (a database trigger, a failed request) takes the error port; the conversation carries on.
+      var r = await dsUpdate(src, { key: rec.key, version: rec.version, original: original, changes: changes, context: dsContext(ctx).context, verified: verifiedValue(ctx) });
+      dbg(ctx, Object.assign({ event: 'update', node: node.id, source: rec.source, key: rec.key, before: original, after: changes, result: r.status || 'error' },
+                             r.status !== 'ok' && r.message ? { message: r.message } : {}));
       if (r.status === 'ok') {
         if (r.version !== undefined && r.version !== null) rec.version = r.version;
         rec.original = clone(rec.current);
@@ -1846,7 +1863,7 @@
     // Each record is read again and updated with its own version, through the data source
     // (so the updatable whitelist and the row filter apply to every row).
     async function executeBulk(ctx, node, b) {
-      var src = source(node.source), res = { updated: 0, failed: 0, count: b.keys.length };
+      var src = source(node.source), res = { updated: 0, failed: 0, count: b.keys.length }, errors = [];
       for (var i = 0; i < b.keys.length; i++) {
         var key = b.keys[i];
         var cur = await Promise.resolve(src.get({ key: key, context: dsContext(ctx).context, verified: verifiedValue(ctx) }));
@@ -1858,11 +1875,18 @@
         });
         if (!Object.keys(changes).length) { res.updated++; continue; }
         Object.keys(original).forEach(function (f) { if (!(f in changes)) delete original[f]; });
-        var r = (await Promise.resolve(src.update({ key: key, version: cur.version === undefined ? null : cur.version, original: original,
-                                                    changes: changes, context: dsContext(ctx).context, verified: verifiedValue(ctx) }))) || {};
-        if (r.status === 'ok') res.updated++; else res.failed++;
+        // each row on its own: a row whose update throws is counted as failed and the others go ahead
+        var r = await dsUpdate(src, { key: key, version: cur.version === undefined ? null : cur.version, original: original,
+                                      changes: changes, context: dsContext(ctx).context, verified: verifiedValue(ctx) });
+        if (r.status === 'ok') res.updated++;
+        else {
+          res.failed++;
+          if (errors.length < 20) errors.push(Object.assign({ key: key, result: r.status || 'error' }, r.message ? { message: r.message } : {}));
+          if (r.message && !res.failReason) res.failReason = r.message;
+        }
       }
-      dbg(ctx, { event: 'bulkUpdate', node: node.id, source: node.source, changes: b.changes, count: res.count, updated: res.updated, failed: res.failed });
+      dbg(ctx, Object.assign({ event: 'bulkUpdate', node: node.id, source: node.source, changes: b.changes, count: res.count, updated: res.updated, failed: res.failed },
+                             errors.length ? { errors: errors } : {}));
       return res;
     }
     async function handleBulk(ctx, node, payload, cmd) {
@@ -1883,7 +1907,8 @@
         var res = await executeBulk(ctx, node, b);
         delete st.bulk[node.id];
         Object.assign(vals, res);
-        if (res.failed) say(ctx, 'error', interpolate(pr.partial || 'I updated {{updated}} of {{count}} records. {{failed}} could not be changed (changed by someone else, or not allowed).', vals));
+        if (res.failed) say(ctx, 'error', interpolate(pr.partial || ('I updated {{updated}} of {{count}} records. {{failed}} could not be changed (changed by someone else, or not allowed).'
+                                                         + (res.failReason ? ' {{failReason}}' : '')), vals));
         else say(ctx, 'text', interpolate(pr.done || 'Done. I updated {{updated}} of {{count}} records.', vals));
         await run(ctx, res.failed && node.partial ? node.partial : node.done);
         return;

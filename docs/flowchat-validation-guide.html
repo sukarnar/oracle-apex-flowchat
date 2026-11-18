@@ -1,0 +1,467 @@
+<title>FlowChat Data Validation</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@600;700&display=swap">
+<style>
+/* Layout: a reference manual. Sticky contents rail on wide screens, one reading column, code in framed wells. */
+:root {
+  --bg: #f6f7f6;
+  --surface: #ffffff;
+  --well: #eef1ef;
+  --fg: #1c2421;
+  --muted: #5b6862;
+  --line: #d6ddd9;
+  --accent: #0f6b55;
+  --accent-soft: #dcefe8;
+  --warn: #9a5b00;
+  --warn-soft: #fbefd9;
+  --code: #24302b;
+  --kw: #0f6b55;
+  --str: #8a4b12;
+  --cm: #7a8781;
+  --f-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121715; --surface: #18201d; --well: #0d1210; --fg: #e3ebe7; --muted: #9aaaa3; --line: #2b3632;
+    --accent: #5fcfae; --accent-soft: #173a30; --warn: #f0b45a; --warn-soft: #3a2b12;
+    --code: #d9e4df; --kw: #6fd8b8; --str: #f1b27a; --cm: #7d8c86; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #121715; --surface: #18201d; --well: #0d1210; --fg: #e3ebe7; --muted: #9aaaa3; --line: #2b3632;
+  --accent: #5fcfae; --accent-soft: #173a30; --warn: #f0b45a; --warn-soft: #3a2b12;
+  --code: #d9e4df; --kw: #6fd8b8; --str: #f1b27a; --cm: #7d8c86; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg); font: 16px/1.65 var(--f-body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.shell { max-width: 1180px; margin: 0 auto; display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 56px; padding-block: 48px 96px; }
+nav.toc { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 24px); align-self: start; font-size: 14px; }
+nav.toc p { font: 600 12px/1 var(--f-display); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0 0 12px; }
+nav.toc ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; counter-reset: s; }
+nav.toc li { counter-increment: s; }
+nav.toc a { display: block; padding: 4px 8px; border-radius: 4px; color: var(--fg); text-decoration: none; }
+nav.toc a::before { content: counter(s) "  "; color: var(--muted); font-family: var(--f-mono); font-size: 12px; }
+nav.toc a:hover, nav.toc a:focus-visible { background: var(--accent-soft); outline: none; }
+main { min-width: 0; max-width: 780px; }
+header.top { border-bottom: 2px solid var(--fg); padding-bottom: 24px; margin-bottom: 40px; }
+.eyebrow { font: 600 12px/1 var(--f-display); letter-spacing: .1em; text-transform: uppercase; color: var(--accent); margin: 0 0 14px; }
+h1 { font: 700 clamp(34px, 5vw, 48px)/1.05 var(--f-display); margin: 0 0 16px; text-wrap: balance; letter-spacing: -.01em; }
+h2 { font: 700 28px/1.2 var(--f-display); margin: 64px 0 12px; text-wrap: balance; scroll-margin-top: 24px; }
+h2 .n { font: 500 15px var(--f-mono); color: var(--accent); margin-right: 10px; vertical-align: 3px; }
+h3 { font: 600 18px/1.3 var(--f-body); margin: 32px 0 8px; }
+p, li { max-width: 68ch; }
+.lede { font-size: 18px; color: var(--muted); margin: 0; }
+.meta { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-top: 18px; font: 13px var(--f-mono); color: var(--muted); }
+a { color: var(--accent); }
+code { font: 0.88em var(--f-mono); background: var(--well); padding: 1px 5px; border-radius: 3px; }
+pre { background: var(--well); color: var(--code); border: 1px solid var(--line); border-radius: 6px; padding: 16px 18px; overflow-x: auto; font: 13.5px/1.55 var(--f-mono); margin: 16px 0; }
+pre code { background: none; padding: 0; font: inherit; }
+pre .k { color: var(--kw); font-weight: 500; }
+pre .s { color: var(--str); }
+pre .c { color: var(--cm); font-style: italic; }
+.file { font: 12px var(--f-mono); color: var(--muted); margin: 20px 0 -10px; }
+.tablewrap { overflow-x: auto; margin: 16px 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+th, td { text-align: left; vertical-align: top; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+th { font: 600 12px var(--f-display); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); background: var(--well); }
+tr:last-child td { border-bottom: 0; }
+td code { white-space: nowrap; }
+.note, .warn { border-radius: 6px; padding: 14px 18px; margin: 20px 0; font-size: 15px; }
+.note { background: var(--accent-soft); }
+.warn { background: var(--warn-soft); }
+.note strong, .warn strong { display: block; font: 600 12px var(--f-display); letter-spacing: .08em; text-transform: uppercase; margin-bottom: 4px; }
+.warn strong { color: var(--warn); }
+.note strong { color: var(--accent); }
+.note p, .warn p { margin: 4px 0; }
+
+/* the checkpoint ladder */
+.ladder { list-style: none; margin: 24px 0; padding: 0; display: grid; gap: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--surface); }
+.ladder li { display: grid; grid-template-columns: 44px minmax(0, 1fr) minmax(0, 190px); gap: 14px; padding: 14px 16px; border-bottom: 1px solid var(--line); max-width: none; align-items: start; }
+.ladder li:last-child { border-bottom: 0; }
+.ladder .n { font: 500 13px var(--f-mono); color: var(--accent); padding-top: 2px; }
+.ladder .what { font-weight: 600; }
+.ladder .what small { display: block; font-weight: 400; color: var(--muted); font-size: 14px; }
+.ladder .when { font: 12.5px/1.5 var(--f-mono); color: var(--muted); }
+.phase { background: var(--well); font: 600 11px var(--f-display) !important; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); padding: 6px 16px !important; display: block !important; }
+.check { list-style: none; padding: 0; }
+.check li { padding-left: 28px; position: relative; margin: 6px 0; }
+.check li::before { content: ""; position: absolute; left: 4px; top: .55em; width: 11px; height: 11px; border: 1.5px solid var(--accent); border-radius: 2px; }
+footer { margin-top: 72px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+
+@media (max-width: 900px) {
+  .shell { grid-template-columns: minmax(0, 1fr); gap: 24px; padding-block: 28px 64px; }
+  nav.toc { position: static; border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: var(--surface); }
+  nav.toc ol { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+}
+@media (max-width: 560px) {
+  .ladder li { grid-template-columns: 32px minmax(0, 1fr); }
+  .ladder .when { grid-column: 2; }
+  h2 { font-size: 24px; }
+}
+@media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+</style>
+
+<div class="shell">
+<nav class="toc" aria-label="Contents">
+  <p>Contents</p>
+  <ol>
+    <li><a href="#overview">The checkpoints</a></li>
+    <li><a href="#registry">Register the data source</a></li>
+    <li><a href="#input">Input rules</a></li>
+    <li><a href="#validators">Validators</a></li>
+    <li><a href="#editable">Who can change a field</a></li>
+    <li><a href="#rows">Which rows</a></li>
+    <li><a href="#save">What Save changes does</a></li>
+    <li><a href="#locking">Concurrent edits</a></li>
+    <li><a href="#plsql">PL/SQL data sources</a></li>
+    <li><a href="#database">Constraints and triggers</a></li>
+    <li><a href="#bulk">Bulk update</a></li>
+    <li><a href="#placement">Where each rule goes</a></li>
+    <li><a href="#audit">Audit and debugging</a></li>
+    <li><a href="#checklist">Release checklist</a></li>
+  </ol>
+</nav>
+
+<main>
+<header class="top">
+  <p class="eyebrow">FlowChat developer guide</p>
+  <h1>Business rules and validation with data sources</h1>
+  <p class="lede">How FlowChat checks a change before it writes to your tables, what each check is for, and where to put your own rules.</p>
+  <div class="meta"><span>Package FC_DATA · FC_ENGINE</span><span>Nodes findRecord · changeFields · saveChanges · bulkUpdate</span><span>APEX 23.2 · Oracle 26ai</span></div>
+</header>
+
+<h2 id="overview"><span class="n">01</span>The checkpoints</h2>
+<p>A record is edited in three steps. <strong>Find record</strong> loads it, <strong>Change fields</strong> lets the user edit fields one at a time, and <strong>Save changes</strong> writes them. Each step has its own checks, and Save changes runs the earlier ones again because a conversation can last a long time.</p>
+<p>All checks run on the server inside FC_ENGINE and FC_DATA. The widget only displays prompts and sends answers, so nothing the browser sends can skip a rule.</p>
+
+<ol class="ladder" aria-label="Validation checkpoints, in the order they run">
+  <li class="phase">While the user answers</li>
+  <li><span class="n">1</span><span class="what">Input rules<small>Type, range, length, allowed options</small></span><span class="when">field.input</span></li>
+  <li><span class="n">2</span><span class="what">Validators<small>Regex patterns and server connectors</small></span><span class="when">field.validators</span></li>
+  <li><span class="n">3</span><span class="what">Editable check<small>Field whitelist plus the record's state</small></span><span class="when">FC_DATA_SOURCE_FIELDS.UPDATABLE, editableWhen</span></li>
+  <li class="phase">On every search, read and write</li>
+  <li><span class="n">4</span><span class="what">Row filter<small>Which rows this user may see or change</small></span><span class="when">FC_DATA_SOURCES.ROW_FILTER</span></li>
+  <li class="phase">When Save changes runs</li>
+  <li><span class="n">5</span><span class="what">Checks 1 to 3 again<small>Each changed field, against the current answers</small></span><span class="when">run_save</span></li>
+  <li><span class="n">6</span><span class="what">Version check<small>Nobody else saved the row in the meantime</small></span><span class="when">VERSION_COLUMN or original values</span></li>
+  <li><span class="n">7</span><span class="what">Your code and the database<small>PL/SQL source, constraints, triggers</small></span><span class="when">UPDATE_TARGET, DDL</span></li>
+</ol>
+
+<p>Checks 1 to 3 give quick feedback while the user types. Checks 4 to 7 protect the data. A rule that matters to the business belongs in the second group, and can be repeated in the first for a better conversation.</p>
+
+<h2 id="registry"><span class="n">02</span>Register the data source</h2>
+<p>Flows refer to a data source by its id only. The table, its columns and its filter live in two tables that only administrators maintain, so a flow author can't point a flow at another table or widen what it may change.</p>
+<div class="tablewrap"><table>
+<thead><tr><th>Column</th><th>Use for validation</th></tr></thead>
+<tbody>
+<tr><td><code>SOURCE_TYPE</code></td><td><code>TABLE</code>: FC_DATA writes the SQL from the registered columns. <code>PLSQL</code>: your functions do the search, read and update.</td></tr>
+<tr><td><code>VERSION_COLUMN</code></td><td>A number column FC_DATA increases by 1 on every save. It drives the concurrent edit check.</td></tr>
+<tr><td><code>ROW_FILTER</code></td><td>SQL added to every search, read and update as <code>and (…)</code>. It may use <code>:APP_USER</code> and <code>:FC_VERIFIED</code>.</td></tr>
+<tr><td><code>UPDATE_TARGET</code></td><td>For PLSQL sources, the function that saves a change.</td></tr>
+<tr><td><code>FIELDS.UPDATABLE</code></td><td><code>Y</code> on each field a flow may change. The default is <code>N</code>.</td></tr>
+<tr><td><code>FIELDS.MASK</code></td><td><code>last4</code> shows only the last four characters in cards.</td></tr>
+</tbody></table></div>
+
+<p class="file">Example: loan applications a customer may edit while they are pending</p>
+<pre><code><span class="k">insert into</span> fc_data_sources (source_id, source_type, object_name, key_column, version_column, row_filter, description)
+<span class="k">values</span> (<span class="s">'loan_app'</span>, <span class="s">'TABLE'</span>, <span class="s">'LOAN_APPLICATIONS'</span>, <span class="s">'APP_ID'</span>, <span class="s">'ROW_VERSION'</span>,
+        <span class="s">'customer_email = lower(:FC_VERIFIED)'</span>,
+        <span class="s">'Loan applications, limited to the verified customer'</span>);
+
+<span class="k">insert into</span> fc_data_source_fields (source_id, field, column_name, data_type, label, searchable, updatable)
+<span class="k">select</span> <span class="s">'loan_app'</span>, <span class="s">'app_id'</span>,  <span class="s">'APP_ID'</span>,      <span class="s">'VARCHAR2'</span>, <span class="s">'Reference'</span>,  <span class="s">'Y'</span>, <span class="s">'N'</span> <span class="k">from</span> dual <span class="k">union all</span>
+<span class="k">select</span> <span class="s">'loan_app'</span>, <span class="s">'status'</span>,  <span class="s">'STATUS'</span>,      <span class="s">'VARCHAR2'</span>, <span class="s">'Status'</span>,     <span class="s">'N'</span>, <span class="s">'N'</span> <span class="k">from</span> dual <span class="k">union all</span>
+<span class="k">select</span> <span class="s">'loan_app'</span>, <span class="s">'amount'</span>,  <span class="s">'AMOUNT'</span>,      <span class="s">'NUMBER'</span>,   <span class="s">'Amount'</span>,     <span class="s">'N'</span>, <span class="s">'Y'</span> <span class="k">from</span> dual <span class="k">union all</span>
+<span class="k">select</span> <span class="s">'loan_app'</span>, <span class="s">'term'</span>,    <span class="s">'TERM_MONTHS'</span>, <span class="s">'NUMBER'</span>,   <span class="s">'Term'</span>,       <span class="s">'N'</span>, <span class="s">'Y'</span> <span class="k">from</span> dual <span class="k">union all</span>
+<span class="k">select</span> <span class="s">'loan_app'</span>, <span class="s">'income'</span>,  <span class="s">'ANNUAL_INCOME'</span>, <span class="s">'NUMBER'</span>, <span class="s">'Income'</span>,     <span class="s">'N'</span>, <span class="s">'Y'</span> <span class="k">from</span> dual;</code></pre>
+<p>Status and reference are readable but not updatable, so no flow can change them, whatever its JSON says.</p>
+
+<h2 id="input"><span class="n">03</span>Input rules</h2>
+<p>Each field in a <strong>Change fields</strong> node takes the same <code>input</code> object as an Ask node. The engine parses the answer into the right type before anything else sees it, so a validator or your PL/SQL always receives a real number or an ISO date, never free text.</p>
+<div class="tablewrap"><table>
+<thead><tr><th>kind</th><th>Rules you can set</th></tr></thead>
+<tbody>
+<tr><td><code>number</code></td><td><code>min</code>, <code>max</code>, with <code>minMessage</code> and <code>maxMessage</code></td></tr>
+<tr><td><code>date</code></td><td><code>minDate</code>, <code>maxDate</code> (absolute, or relative such as <code>today</code>)</td></tr>
+<tr><td><code>text</code>, <code>email</code></td><td><code>required</code>, <code>minLength</code>, <code>maxLength</code></td></tr>
+<tr><td><code>choice</code>, <code>yesno</code></td><td><code>options</code>, static or from a list of values</td></tr>
+</tbody></table></div>
+<pre><code>{ <span class="s">"id"</span>: <span class="s">"edit_app"</span>, <span class="s">"type"</span>: <span class="s">"changeFields"</span>, <span class="s">"record"</span>: <span class="s">"app"</span>, <span class="s">"done"</span>: <span class="s">"review"</span>,
+  <span class="s">"fields"</span>: [
+    { <span class="s">"field"</span>: <span class="s">"amount"</span>, <span class="s">"label"</span>: <span class="s">"Amount"</span>,
+      <span class="s">"input"</span>: { <span class="s">"kind"</span>: <span class="s">"number"</span>, <span class="s">"min"</span>: 1000, <span class="s">"max"</span>: 500000,
+                 <span class="s">"maxMessage"</span>: <span class="s">"The most we lend is $500,000."</span> } },
+    { <span class="s">"field"</span>: <span class="s">"term"</span>, <span class="s">"label"</span>: <span class="s">"Term"</span>,
+      <span class="s">"input"</span>: { <span class="s">"kind"</span>: <span class="s">"choice"</span>, <span class="s">"options"</span>: [<span class="s">"12"</span>, <span class="s">"24"</span>, <span class="s">"36"</span>, <span class="s">"60"</span>] } }
+  ] }</code></pre>
+<p>When a rule fails, the user sees the message and is asked for the same field again. Nothing is stored.</p>
+
+<h2 id="validators"><span class="n">04</span>Validators</h2>
+<p>A field can list <code>validators</code>, which run in order after the input rules pass. The first failure stops the list.</p>
+<h3>Pattern</h3>
+<pre><code>{ <span class="s">"type"</span>: <span class="s">"regex"</span>, <span class="s">"pattern"</span>: <span class="s">"^\\+?[0-9 ]{8,15}$"</span>, <span class="s">"message"</span>: <span class="s">"Please enter a phone number with 8 to 15 digits."</span> }</code></pre>
+<h3>Server check</h3>
+<p>A <code>server</code> validator calls a connector. Use it for any rule that needs other answers or data: cross-field limits, duplicate checks, credit rules.</p>
+<pre><code>{ <span class="s">"type"</span>: <span class="s">"server"</span>, <span class="s">"connector"</span>: <span class="s">"check_affordability"</span>,
+  <span class="s">"message"</span>: <span class="s">"That amount isn't available."</span> }</code></pre>
+<p>The connector receives the standard payload plus the field being checked:</p>
+<pre><code>{ <span class="s">"sessionId"</span>: <span class="s">"…"</span>, <span class="s">"flowId"</span>: <span class="s">"loan_edit"</span>, <span class="s">"nodeId"</span>: <span class="s">"edit_app"</span>,
+  <span class="s">"slot"</span>: <span class="s">"app.amount"</span>, <span class="s">"value"</span>: 250000,
+  <span class="s">"slots"</span>: { … the conversation's answers … },
+  <span class="s">"appUser"</span>: <span class="s">"JSMITH"</span>, <span class="s">"context"</span>: { … page context, if any … } }</code></pre>
+<p>It returns <code>{"valid": true}</code>, or <code>{"valid": false, "message": "…"}</code>. Its message wins over the one in the flow, so the rule's owner controls the wording.</p>
+
+<p class="file">Connector: amount at most five times annual income</p>
+<pre><code><span class="k">create or replace function</span> check_affordability (p_payload <span class="k">in</span> clob) <span class="k">return</span> clob <span class="k">is</span>
+  l_in     json_object_t := json_object_t.parse(p_payload);
+  l_amount number        := l_in.get_number(<span class="s">'value'</span>);
+  l_income number;
+  l_out    json_object_t := json_object_t();
+<span class="k">begin</span>
+  <span class="c">-- the value being checked is the new amount; income is read from the table by the record key slot</span>
+  <span class="k">select</span> annual_income <span class="k">into</span> l_income
+    <span class="k">from</span> loan_applications
+   <span class="k">where</span> app_id = l_in.get_object(<span class="s">'slots'</span>).get_string(<span class="s">'app_ref'</span>);
+
+  <span class="k">if</span> l_amount &gt; 5 * l_income <span class="k">then</span>
+    l_out.put(<span class="s">'valid'</span>, false);
+    l_out.put(<span class="s">'message'</span>, <span class="s">'We can lend up to '</span> || to_char(5 * l_income, <span class="s">'FM$999,999,999'</span>) ||
+                         <span class="s">', five times your annual income.'</span>);
+  <span class="k">else</span>
+    l_out.put(<span class="s">'valid'</span>, true);
+  <span class="k">end if</span>;
+  <span class="k">return</span> l_out.to_clob;
+<span class="k">exception</span>
+  <span class="k">when</span> no_data_found <span class="k">then</span>
+    l_out.put(<span class="s">'valid'</span>, false);
+    l_out.put(<span class="s">'message'</span>, <span class="s">'I could not find that application.'</span>);
+    <span class="k">return</span> l_out.to_clob;
+<span class="k">end</span>;
+/
+
+<span class="k">insert into</span> fc_connectors (connector_id, connector_type, target, description)
+<span class="k">values</span> (<span class="s">'check_affordability'</span>, <span class="s">'PLSQL'</span>, <span class="s">'CHECK_AFFORDABILITY'</span>, <span class="s">'Amount at most 5 x income'</span>);</code></pre>
+<div class="note"><strong>Payload contents</strong><p><code>slots</code> holds the conversation's answers (the Ask nodes). The loaded record's values are kept apart from them, so a connector that needs a record value either reads it from the table, as above, or relies on a slot that holds the key.</p></div>
+<p>Validators on an <strong>Ask</strong> node work the same way, with <code>slot</code> set to the Ask's slot. A <strong>Submit</strong> node validates every answer again before it calls its connector.</p>
+
+<h2 id="editable"><span class="n">05</span>Who can change a field</h2>
+<p>A field is editable only when both of these are true:</p>
+<ol>
+  <li><strong>The registry allows it.</strong> <code>fc_data.is_updatable</code> returns true when the field has <code>UPDATABLE = 'Y'</code>. For a PLSQL source, a field with no row in FC_DATA_SOURCE_FIELDS counts as updatable, because your update function is expected to enforce the rules.</li>
+  <li><strong>Its <code>editableWhen</code> condition holds.</strong> The condition can read answers and the record's values.</li>
+</ol>
+<pre><code>{ <span class="s">"field"</span>: <span class="s">"amount"</span>, <span class="s">"label"</span>: <span class="s">"Amount"</span>,
+  <span class="s">"editableWhen"</span>: { <span class="s">"all"</span>: [
+      { <span class="s">"slot"</span>: <span class="s">"app.status"</span>, <span class="s">"op"</span>: <span class="s">"="</span>, <span class="s">"value"</span>: <span class="s">"PENDING"</span> },
+      { <span class="s">"slot"</span>: <span class="s">"app.amount"</span>, <span class="s">"op"</span>: <span class="s">"&lt;"</span>, <span class="s">"value"</span>: 1000000 } ] },
+  <span class="s">"lockedMessage"</span>: <span class="s">"The amount is fixed once the application is approved."</span> }</code></pre>
+<p>A locked field is shown with its <code>lockedMessage</code> instead of a prompt. The flow can never make a field editable that the registry doesn't allow; <code>editableWhen</code> can only narrow it further.</p>
+
+<h2 id="rows"><span class="n">06</span>Which rows</h2>
+<p><code>ROW_FILTER</code> is trusted SQL written by an administrator. FC_DATA appends it to the search, the read after a pick, and the <code>UPDATE</code>, so a row outside the filter can't be found, read or changed. Two bind variables are filled by the server, never by the browser:</p>
+<div class="tablewrap"><table>
+<thead><tr><th>Bind</th><th>Value</th><th>Typical filter</th></tr></thead>
+<tbody>
+<tr><td><code>:APP_USER</code></td><td>The signed-in APEX user</td><td><code>owner = :APP_USER</code></td></tr>
+<tr><td><code>:FC_VERIFIED</code></td><td>The value proved by a Verify step in this conversation, otherwise null (so no rows match)</td><td><code>lower(email) = lower(:FC_VERIFIED)</code></td></tr>
+</tbody></table></div>
+<p>Two node options build on it:</p>
+<ul>
+  <li><code>byRowFilter: true</code> on Find record or Bulk update searches with the filter alone, for example "my open requests". The server refuses it for a source that has no row filter.</li>
+  <li><code>requireVerified: "email"</code> refuses the search until the <code>email</code> answer has passed a Verify step with its current value.</li>
+</ul>
+<div class="note"><strong>Tip</strong><p>Keep the filter to simple column comparisons with an index behind them. It runs on every search and every save.</p></div>
+
+<h2 id="save"><span class="n">07</span>What Save changes does</h2>
+<p>Save changes trusts nothing that happened earlier in the conversation. In order, it:</p>
+<ol>
+  <li>Works out the changed fields by comparing the record's current values with the values loaded from the table. With no changes it says so and takes <code>noChanges</code> (or <code>saved</code>).</li>
+  <li>For each changed field, checks that the Change fields node declares it and that it is still editable. If not, it takes <code>forbidden</code>.</li>
+  <li>Runs the field's input rules and validators again. If one fails it shows the message and asks for that field again, and the save waits.</li>
+  <li>Calls <code>fc_data.update_row</code> with the key, the version, the original values and the changes. Only changed fields are sent.</li>
+  <li>Writes an audit event with before, after and the result, then follows the port for the result.</li>
+</ol>
+<div class="tablewrap"><table>
+<thead><tr><th>Result</th><th>Message shown</th><th>Port</th></tr></thead>
+<tbody>
+<tr><td><code>ok</code></td><td>Your <code>message</code>, else <code>savedText</code></td><td><code>saved</code></td></tr>
+<tr><td><code>conflict</code></td><td>Your <code>message</code>, else <code>conflictText</code>, else a default</td><td><code>conflict</code>, else <code>error</code></td></tr>
+<tr><td><code>forbidden</code></td><td>Your <code>message</code>, else "You're not allowed to change this record."</td><td><code>forbidden</code></td></tr>
+<tr><td><code>notfound</code>, anything else</td><td>Your <code>message</code>, else "Sorry, the changes could not be saved."</td><td><code>error</code></td></tr>
+</tbody></table></div>
+<div class="warn"><strong>Connect every port</strong><p>If the port for a result isn't connected, the conversation ends as failed. Give each Save changes node at least <code>saved</code>, <code>conflict</code>, <code>forbidden</code> and <code>error</code>.</p></div>
+
+<h2 id="locking"><span class="n">08</span>Concurrent edits</h2>
+<p>FC_DATA uses optimistic locking, so a row is never held locked while a user is thinking.</p>
+<ul>
+  <li><strong>With a <code>VERSION_COLUMN</code></strong>, the update adds <code>and to_char(t.row_version) = :ver</code> and sets <code>row_version = row_version + 1</code>.</li>
+  <li><strong>Without one</strong>, it requires every changed column to still hold the value that was loaded, using <code>decode</code> so nulls compare as equal.</li>
+</ul>
+<p>When no row is updated, FC_DATA reads the row again. If it is gone (or the row filter now hides it) the result is <code>notfound</code>; otherwise it is <code>conflict</code>. On a conflict the engine reloads the latest values, puts the user's edits on top, and takes the <code>conflict</code> port. Route that port back to your summary so the user can review the merged record before saving again.</p>
+<p>An update that matches more than one row raises <code>-20043</code>, because <code>KEY_COLUMN</code> must be unique.</p>
+
+<h2 id="plsql"><span class="n">09</span>PL/SQL data sources</h2>
+<p>When saving a change means more than one <code>UPDATE</code> (several tables, approvals, workflow state, rules that need a lot of data), register the source as <code>PLSQL</code>. You write three functions with the connector signature, <code>function f(p_payload in clob) return clob</code>, and FC_DATA calls them in place of its own SQL.</p>
+<pre><code><span class="k">insert into</span> fc_data_sources (source_id, source_type, search_target, get_target, update_target, description)
+<span class="k">values</span> (<span class="s">'leave_req'</span>, <span class="s">'PLSQL'</span>, <span class="s">'LEAVE_API.SEARCH'</span>, <span class="s">'LEAVE_API.GET'</span>, <span class="s">'LEAVE_API.SAVE'</span>,
+        <span class="s">'Leave requests, saved through LEAVE_API'</span>);</code></pre>
+<h3>The update contract</h3>
+<p>Your update function receives:</p>
+<pre><code>{ <span class="s">"key"</span>: <span class="s">"LR-1042"</span>, <span class="s">"version"</span>: <span class="s">"7"</span>,
+  <span class="s">"original"</span>: { <span class="s">"start_date"</span>: <span class="s">"2026-12-21"</span> },
+  <span class="s">"changes"</span>:  { <span class="s">"start_date"</span>: <span class="s">"2026-12-24"</span> },
+  <span class="s">"appUser"</span>: <span class="s">"JSMITH"</span>, <span class="s">"verified"</span>: null, <span class="s">"context"</span>: { … } }</code></pre>
+<p>and returns one of these. The flow follows the matching port and shows your message.</p>
+<pre><code>{ <span class="s">"status"</span>: <span class="s">"ok"</span>, <span class="s">"version"</span>: <span class="s">"8"</span>, <span class="s">"message"</span>: <span class="s">"Saved. Your manager has been told."</span> }
+{ <span class="s">"status"</span>: <span class="s">"forbidden"</span>, <span class="s">"message"</span>: <span class="s">"Leave can't start on a public holiday."</span> }
+{ <span class="s">"status"</span>: <span class="s">"conflict"</span> }
+{ <span class="s">"status"</span>: <span class="s">"notfound"</span> }</code></pre>
+<p>Return the new <code>version</code> on success so the next save in the same conversation checks against it.</p>
+
+<p class="file">Example: LEAVE_API.SAVE</p>
+<pre><code><span class="k">function</span> save (p_payload <span class="k">in</span> clob) <span class="k">return</span> clob <span class="k">is</span>
+  l_in   json_object_t := json_object_t.parse(p_payload);
+  l_chg  json_object_t := l_in.get_object(<span class="s">'changes'</span>);
+  l_out  json_object_t := json_object_t();
+  l_row  leave_requests%rowtype;
+  l_from date;
+  l_to   date;
+
+  <span class="k">function</span> reply (p_status <span class="k">in</span> varchar2, p_msg <span class="k">in</span> varchar2 <span class="k">default null</span>) <span class="k">return</span> clob <span class="k">is</span>
+  <span class="k">begin</span>
+    l_out.put(<span class="s">'status'</span>, p_status);
+    <span class="k">if</span> p_msg <span class="k">is not null then</span> l_out.put(<span class="s">'message'</span>, p_msg); <span class="k">end if</span>;
+    <span class="k">return</span> l_out.to_clob;
+  <span class="k">end</span>;
+<span class="k">begin</span>
+  <span class="k">begin</span>
+    <span class="k">select</span> * <span class="k">into</span> l_row <span class="k">from</span> leave_requests
+     <span class="k">where</span> req_id = l_in.get_string(<span class="s">'key'</span>)
+       <span class="k">and</span> employee = l_in.get_string(<span class="s">'appUser'</span>)      <span class="c">-- your own row rule</span>
+       <span class="k">for update nowait</span>;
+  <span class="k">exception</span>
+    <span class="k">when</span> no_data_found <span class="k">then return</span> reply(<span class="s">'notfound'</span>);
+    <span class="k">when</span> others <span class="k">then</span>
+      <span class="k">if</span> sqlcode = -54 <span class="k">then return</span> reply(<span class="s">'conflict'</span>); <span class="k">end if</span>;   <span class="c">-- locked by someone else</span>
+      <span class="k">raise</span>;
+  <span class="k">end</span>;
+
+  <span class="k">if</span> to_char(l_row.row_version) &lt;&gt; l_in.get_string(<span class="s">'version'</span>) <span class="k">then</span>
+    <span class="k">return</span> reply(<span class="s">'conflict'</span>);
+  <span class="k">end if</span>;
+  <span class="k">if</span> l_row.status &lt;&gt; <span class="s">'DRAFT'</span> <span class="k">then</span>
+    <span class="k">return</span> reply(<span class="s">'forbidden'</span>, <span class="s">'This request has been submitted. Ask your manager to return it first.'</span>);
+  <span class="k">end if</span>;
+
+  l_from := <span class="k">case when</span> l_chg.has(<span class="s">'start_date'</span>) <span class="k">then</span> to_date(l_chg.get_string(<span class="s">'start_date'</span>), <span class="s">'YYYY-MM-DD'</span>) <span class="k">else</span> l_row.start_date <span class="k">end</span>;
+  l_to   := <span class="k">case when</span> l_chg.has(<span class="s">'end_date'</span>)   <span class="k">then</span> to_date(l_chg.get_string(<span class="s">'end_date'</span>),   <span class="s">'YYYY-MM-DD'</span>) <span class="k">else</span> l_row.end_date   <span class="k">end</span>;
+
+  <span class="k">if</span> l_to &lt; l_from <span class="k">then</span>
+    <span class="k">return</span> reply(<span class="s">'forbidden'</span>, <span class="s">'The last day must be on or after the first day.'</span>);
+  <span class="k">end if</span>;
+  <span class="k">if</span> holidays.is_holiday(l_from) <span class="k">then</span>
+    <span class="k">return</span> reply(<span class="s">'forbidden'</span>, <span class="s">'Leave can''t start on a public holiday.'</span>);
+  <span class="k">end if</span>;
+  <span class="k">if</span> leave_balance(l_row.employee) &lt; (l_to - l_from + 1) <span class="k">then</span>
+    <span class="k">return</span> reply(<span class="s">'forbidden'</span>, <span class="s">'You don''t have enough leave left for those dates.'</span>);
+  <span class="k">end if</span>;
+
+  <span class="k">update</span> leave_requests
+     <span class="k">set</span> start_date = l_from, end_date = l_to, row_version = row_version + 1
+   <span class="k">where</span> req_id = l_row.req_id;
+
+  l_out.put(<span class="s">'version'</span>, to_char(l_row.row_version + 1));
+  <span class="k">return</span> reply(<span class="s">'ok'</span>, <span class="s">'Saved. Your new dates are '</span> || to_char(l_from, <span class="s">'DD Mon'</span>) ||
+                     <span class="s">' to '</span> || to_char(l_to, <span class="s">'DD Mon'</span>) || <span class="s">'.'</span>);
+<span class="k">end</span> save;</code></pre>
+<div class="note"><strong>Why return a status instead of raising</strong><p>A returned <code>forbidden</code> shows your exact message and takes the <code>forbidden</code> port, and the conversation carries on. A raised exception rolls back the whole turn (see the next section). Raise only for real faults.</p></div>
+<p>Don't commit inside these functions. Each turn runs under the savepoint <code>fc_turn</code>, and APEX commits when the request ends.</p>
+
+<h2 id="database"><span class="n">10</span>Constraints and triggers</h2>
+<p>FC_DATA runs an ordinary <code>UPDATE</code> with bind variables, so check constraints, foreign keys, unique keys and triggers all apply. They are the last line of defence and the only one that also covers changes made outside FlowChat.</p>
+<pre><code><span class="k">create or replace trigger</span> loan_app_bu
+<span class="k">before update of</span> amount <span class="k">on</span> loan_applications <span class="k">for each row</span>
+<span class="k">begin</span>
+  <span class="k">if</span> :old.status &lt;&gt; <span class="s">'PENDING'</span> <span class="k">then</span>
+    raise_application_error(-20001, <span class="s">'The amount is fixed once the application is approved.'</span>);
+  <span class="k">end if</span>;
+<span class="k">end</span>;
+/</code></pre>
+<h3>What the user sees</h3>
+<p>Save changes sets the savepoint <code>fc_save</code> before it calls <code>fc_data.update_row</code>. When the update raises (a trigger, a constraint, a PLSQL source), only that save is undone, the flow takes the <code>error</code> port, and the conversation carries on.</p>
+<ul>
+  <li>Codes <code>-20000</code> to <code>-20999</code>: the user sees the first line of the message without its <code>ORA-nnnnn:</code> prefix. For the trigger above that is "The amount is fixed once the application is approved." The <code>ORA-06512</code> and <code>ORA-04088</code> lines Oracle adds are dropped.</li>
+  <li>Any other error, such as <code>ORA-02290</code> for a check constraint: "Sorry, the changes could not be saved." The details go to the APEX debug log.</li>
+</ul>
+<p>The audit event records <code>"result": "error"</code> and the message. Errors raised anywhere else in a turn still roll back the whole turn to <code>fc_turn</code> and keep the conversation on the same step, with the same first-line message.</p>
+<div class="note"><strong>Give constraints a friendly twin</strong>
+<p>A check constraint's own message isn't readable by customers. For a rule a user can break, also raise it from a trigger with a <code>-20xxx</code> code and a plain sentence, or check it in a validator or a PLSQL source, so the user meets the friendly message first.</p></div>
+
+<h2 id="bulk"><span class="n">11</span>Bulk update</h2>
+<p>Bulk update searches a source, shows how many rows match and asks for confirmation. It then applies the same change to each row through <code>fc_data.update_row</code>, so the field whitelist, the row filter and the version check apply to every row.</p>
+<ul>
+  <li>Rows that return <code>conflict</code>, <code>forbidden</code> or <code>notfound</code> are counted as failed; the rest are saved and the flow takes <code>partial</code> (or <code>done</code> if <code>partial</code> isn't set).</li>
+  <li><code>maxRows</code> (default 50, at most 500) caps the batch. More matches take <code>tooMany</code>.</li>
+  <li><code>set</code> values are written as given, so check any value that comes from an answer (<code>{"slot": …}</code>) on the Ask node that collects it.</li>
+  <li>Each row is updated under its own savepoint, <code>fc_bulk_row</code>. A row whose update raises (a trigger, a constraint) is undone and counted as failed, and the other rows are still saved.</li>
+  <li>The first failure message, from a <code>-20xxx</code> error or a PLSQL source's <code>message</code>, is added to the default partial text. A custom <code>prompts.partial</code> can place it with <code>{{failReason}}</code>.</li>
+  <li>The audit event lists the key, result and message of up to 20 failed rows.</li>
+</ul>
+<pre><code><span class="s">"prompts"</span>: { <span class="s">"partial"</span>: <span class="s">"Closed {{updated}} of {{count}}. {{failed}} were skipped, for example: {{failReason}}"</span> }</code></pre>
+
+<h2 id="placement"><span class="n">12</span>Where each rule goes</h2>
+<div class="tablewrap"><table>
+<thead><tr><th>The rule</th><th>Put it in</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Format or range of one value</td><td><code>input</code></td><td>Instant, no code</td></tr>
+<tr><td>Fixed text pattern</td><td><code>regex</code> validator</td><td>No code</td></tr>
+<tr><td>Depends on other answers or other data</td><td><code>server</code> validator</td><td>Early feedback with your own message</td></tr>
+<tr><td>Depends on the record's state</td><td><code>editableWhen</code></td><td>The field is shown as locked with a reason</td></tr>
+<tr><td>Which fields can ever change</td><td><code>UPDATABLE</code></td><td>Admin-owned; flows can't widen it</td></tr>
+<tr><td>Who may see or change a row</td><td><code>ROW_FILTER</code></td><td>Applied to every search and write</td></tr>
+<tr><td>Rules at save time, several tables, workflow</td><td>PLSQL source</td><td>Full control, friendly status messages</td></tr>
+<tr><td>Must hold for every writer, chat or not</td><td>Constraint or trigger</td><td>Covers all applications</td></tr>
+</tbody></table></div>
+<p>For an important rule, use two layers: one the user meets early with a clear message (a validator or <code>editableWhen</code>), and one that holds whatever happens (a PLSQL source, a constraint or a trigger).</p>
+
+<h2 id="audit"><span class="n">13</span>Audit and debugging</h2>
+<p>Every save writes an <code>OUT</code> event to FC_EVENTS for the Save changes node, with the source, key, values before and after, and the result:</p>
+<pre><code>{ <span class="s">"action"</span>: <span class="s">"update"</span>, <span class="s">"source"</span>: <span class="s">"loan_app"</span>, <span class="s">"key"</span>: <span class="s">"LA-2291"</span>,
+  <span class="s">"before"</span>: { <span class="s">"amount"</span>: 200000 }, <span class="s">"after"</span>: { <span class="s">"amount"</span>: 250000 }, <span class="s">"result"</span>: <span class="s">"ok"</span> }</code></pre>
+<pre><code><span class="c">-- saves that were refused in the last 7 days</span>
+<span class="k">select</span> e.session_id, e.node_id, e.created_at,
+       json_value(e.payload, <span class="s">'$.key'</span>)    <span class="k">as</span> record_key,
+       json_value(e.payload, <span class="s">'$.result'</span>) <span class="k">as</span> result
+  <span class="k">from</span> fc_events e
+ <span class="k">where</span> e.direction = <span class="s">'OUT'</span>
+   <span class="k">and</span> json_value(e.payload, <span class="s">'$.action'</span>) = <span class="s">'update'</span>
+   <span class="k">and</span> json_value(e.payload, <span class="s">'$.result'</span>) &lt;&gt; <span class="s">'ok'</span>
+   <span class="k">and</span> e.created_at &gt; systimestamp - interval <span class="s">'7'</span> day
+ <span class="k">order by</span> e.created_at <span class="k">desc</span>;</code></pre>
+<p>Fields marked <code>pii</code> are masked in the transcript. When a turn fails with an exception and the conversation is being debugged, a <code>DBG</code> event with the error message is written after the rollback.</p>
+<p>The designer's <strong>Test</strong> tab runs the flow in the browser against sample data, which is enough to check routing and messages. Test business rules in the database itself, through the APEX page that hosts the chat widget.</p>
+
+<h2 id="checklist"><span class="n">14</span>Release checklist</h2>
+<ul class="check">
+  <li>Only the fields users should change have <code>UPDATABLE = 'Y'</code>.</li>
+  <li>The source has a <code>ROW_FILTER</code> using <code>:APP_USER</code> or <code>:FC_VERIFIED</code>, unless every user may see every row.</li>
+  <li>The source has a <code>VERSION_COLUMN</code>, or you accept the original-values check.</li>
+  <li>Each changed field has input rules, and cross-field rules have a server validator.</li>
+  <li>State-dependent fields have <code>editableWhen</code> and a <code>lockedMessage</code>.</li>
+  <li>Save changes connects <code>saved</code>, <code>conflict</code>, <code>forbidden</code> and <code>error</code>, and <code>conflict</code> leads back to a summary.</li>
+  <li>PLSQL sources return <code>forbidden</code> with a message rather than raising, return the new <code>version</code>, and never commit.</li>
+  <li>Triggers raise codes between <code>-20000</code> and <code>-20999</code> with a sentence a customer can read.</li>
+  <li>Test a refused save, a conflict (edit the row in SQL Developer mid-conversation) and a row outside the filter.</li>
+</ul>
+
+<footer>FlowChat developer guide · Business rules and validation with data sources · Based on FC_DATA and FC_ENGINE as of November 2026.</footer>
+</main>
+</div>

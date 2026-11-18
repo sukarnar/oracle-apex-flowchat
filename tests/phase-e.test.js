@@ -234,6 +234,64 @@ function bulkSetup() {
     assert.strictEqual(rows[0].version, 2);
     assert.strictEqual(rows[3].version, 1);                              // not matched, untouched
   });
+  await test('bulk update: a row whose update throws fails alone, with its message', async () => {
+    const { rows, src, flow } = bulkSetup();
+    const update = src.update;
+    src.update = (req) => {
+      if (req.key === 2 || req.key === '2') {
+        throw new Error('ORA-20001: App 2 has an open payment.\nORA-06512: at "LOANS.APP_BU", line 3\nORA-04088: error during execution of trigger');
+      }
+      return update(req);
+    };
+    const eng = FC.createEngine({ flows: [flow], dataSources: { apps: src } });
+    let t = await eng.start('bulk', { cur_status: 'NEW' });
+    t = await eng.input(t.sessionId, { value: 'JSMITH' });
+    t = await eng.input(t.sessionId, { command: 'confirm' });
+    assert.match(texts(t), /updated 1 of 2 records\. 1 could not be changed .* App 2 has an open payment\./);
+    assert.ok(!/ORA-/.test(texts(t)), 'no Oracle error text');
+    assert.strictEqual(t.status, 'completed');                            // took the done port
+    assert.deepStrictEqual(rows.map((r) => r.status), ['CLOSED', 'NEW', 'NEW', 'CLOSED']);
+  });
+  await test('save changes: a throwing update takes the error port with a clean message', async () => {
+    const rows = [{ id: 7, email: 'a@b.co', amount: 100, version: 1 }];
+    const src = FC.createMemorySource({ rows, key: 'id', versionField: 'version',
+      fields: { email: { searchable: true }, amount: { updatable: true } } });
+    let fail = 'ORA-20001: The amount is fixed once approved.\nORA-06512: at "LOANS.TRG", line 4';
+    const update = src.update;
+    src.update = (req) => { if (fail) throw new Error(fail); return update(req); };
+    const flow = {
+      flowId: 'upd', start: 'ask',
+      nodes: [
+        { id: 'ask', type: 'ask', slot: 'email', prompt: 'Email?', input: { kind: 'email' }, next: 'find' },
+        { id: 'find', type: 'findRecord', source: 'apps', as: 'app', criteria: [{ field: 'email', slot: 'email' }], found: 'change' },
+        { id: 'change', type: 'changeFields', record: 'app', done: 'save',
+          fields: [{ field: 'amount', label: 'Amount', input: { kind: 'number' } }] },
+        { id: 'save', type: 'saveChanges', record: 'app', saved: 'done', error: 'oops' },
+        { id: 'oops', type: 'end', text: 'Not saved.' },
+        { id: 'done', type: 'end', text: 'Saved.' }
+      ]
+    };
+    const eng = FC.createEngine({ flows: [flow], dataSources: { apps: src } });
+    const edit = async () => {
+      let t = await eng.start('upd');
+      t = await eng.input(t.sessionId, { value: 'a@b.co' });
+      t = await eng.input(t.sessionId, { field: 'amount' });
+      t = await eng.input(t.sessionId, { value: '250' });
+      return eng.input(t.sessionId, { command: 'done' });
+    };
+    let t = await edit();
+    assert.ok(t.messages.some((m) => m.type === 'error' && m.text === 'The amount is fixed once approved.'));
+    assert.match(texts(t), /Not saved\./);
+    assert.strictEqual(rows[0].amount, 100);
+    fail = 'ORA-01722: invalid number';                                   // not an application error: generic text
+    t = await edit();
+    assert.ok(t.messages.some((m) => m.type === 'error' && m.text === 'Sorry, the changes could not be saved.'));
+    assert.ok(!/ORA-/.test(texts(t)));
+    const err = new Error('HTTP 409'); err.userMessage = 'This loan is locked by the underwriter.';
+    fail = null; src.update = (req) => { throw err; };
+    t = await edit();
+    assert.ok(t.messages.some((m) => m.text === 'This loan is locked by the underwriter.'));
+  });
   await test('cancel changes nothing; too many matches is refused; not-updatable fields fail', async () => {
     const { rows, src, flow } = bulkSetup();
     const eng = FC.createEngine({ flows: [flow], dataSources: { apps: src } });

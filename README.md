@@ -570,9 +570,13 @@ defines in `FC_DATA_SOURCES` and `FC_DATA_SOURCE_FIELDS` (see `db/06_demo_data_s
   - `conflict`: someone else changed the record. The latest version is reloaded with the user's
     edits applied on top, so routing back to the review shows the new diff.
   - `forbidden`: the field or row isn't allowed.
-  - `error`: anything else.
+  - `error`: anything else, including a database error during the update (a trigger, a constraint,
+    a PLSQL source that raises). Only that save is undone (savepoint `fc_save`) and the conversation
+    carries on. For `raise_application_error` codes -20000 to -20999 the user sees the first line of
+    the message without its `ORA-` prefix (no `ORA-06512` lines); other errors show
+    "Sorry, the changes could not be saved." and go to the APEX debug log.
 
-  Every save writes the before and after values to `FC_EVENTS`.
+  Every save writes the before and after values to `FC_EVENTS`, plus the message when it failed.
 
 ### Verify step (one-time code) for public pages
 
@@ -724,7 +728,12 @@ select event_id, node_id, json_value(payload, '$.event') event, payload
 - Each record is then read again and updated with its own version through FC_DATA, so the updatable
   whitelist, the row filter and conflict detection apply to every row. The keys never reach the browser.
 - More than `maxRows` matches (at most 500) goes to `tooMany`. Rows that fail (changed meanwhile,
-  not allowed) are counted, and `partial` (or `done`) follows. The result goes to FC_EVENTS.
+  not allowed) are counted, and `partial` (or `done`) follows. The result goes to FC_EVENTS, with the
+  key, result and message of up to 20 failed rows.
+- Each row is updated under its own savepoint (`fc_bulk_row`): a row whose update raises (a trigger,
+  a constraint) is undone and counted as failed, and the other rows are still saved. The first
+  failure message (an application error's text, or a PLSQL source's `message`) is added to the
+  default partial text, and a custom `prompts.partial` can show it as `{{failReason}}`.
 - New values come from `{"value": …}` or an earlier answer `{"slot": "new_status"}`.
 
 ### File answers
@@ -961,13 +970,16 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 98 unit tests (`tests/engine.test.js`,
+- The JavaScript engine and widget are tested: 100 unit tests (`tests/engine.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
   `tests/email.test.js`, `tests/agent.test.js`, `tests/rest.test.js`), plus manual end-to-end runs of the demos.
 - **The REST call node's and REST tools' PL/SQL (`run_rest`, `rest_call`, `rest_tool` and the other `rest_*` helpers in `FC_ENGINE`,
   `17_rest_endpoints.sql`, `list_rest` in `FC_DESIGNER`) has not been compiled or called a real API
   yet.** It mirrors the tested JavaScript engine.
+- **The database-error handling in Save changes and Bulk update (`db_error_text`, `undo_to` and the
+  `fc_save` / `fc_bulk_row` savepoints in `FC_ENGINE`) has not been compiled or tested against a real
+  trigger yet.** It mirrors the tested JavaScript engine.
 - **The Agent node's PL/SQL (the `ag_*` routines in `FC_ENGINE`, `15_ai_tables.sql`, `list_ai` in
   `FC_DESIGNER`) has not been compiled or run against a real model yet.** It mirrors the tested
   JavaScript engine.
