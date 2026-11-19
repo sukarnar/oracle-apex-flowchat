@@ -128,7 +128,18 @@ const CHAT = {
     { seq: 10, prompt: 'Start Automatically', type: 'CHECKBOX', def: 'Y', req: false,
       help: 'Off: the chat waits until JavaScript calls apex.region(staticId).element[0].querySelector(\'flow-chat\').start() (or $(\'#staticId_chat\')[0].start()).' },
     { seq: 11, prompt: 'Height', type: 'TEXT', def: '560px', req: false,
-      help: 'Height of the chat, as a CSS length: e.g. 560px or calc(100vh - 200px).' }
+      help: 'Height of the chat, as a CSS length: e.g. 560px or calc(100vh - 200px). Floating: the height of the open panel, never taller than the window.' },
+    { seq: 12, prompt: 'Display', type: 'SELECT LIST', def: 'inline', req: true,
+      help: 'Inline: the chat fills the region. Floating: a chat button in a corner of the page, a slim bar with the current question when minimized, and a floating panel when open (full screen on phones). The conversation starts when the chat is first opened. Use the Blank with Attributes region template, so the region adds no frame or space. JavaScript: $("#staticId_chat")[0].open() / .minimize() / .close() / .toggle(); events fc-open, fc-minimize, fc-close.',
+      values: [['Inline', 'inline'], ['Floating', 'floating']] },
+    { seq: 13, prompt: 'Position', type: 'SELECT LIST', def: 'bottom-right', req: true,
+      help: 'Floating: the page corner for the chat button and panel.',
+      values: [['Bottom Right', 'bottom-right'], ['Bottom Left', 'bottom-left']] },
+    { seq: 14, prompt: 'Start As', type: 'SELECT LIST', def: 'launcher', req: true,
+      help: 'Floating: how the chat first appears. Button: only the chat button (the conversation starts when opened). Minimized: the bar with the first question. Open: the panel (on phones the button is shown instead). A conversation kept across reloads (Keep Conversation) comes back the way the user left it.',
+      values: [['Button', 'launcher'], ['Minimized', 'peek'], ['Open', 'open']] },
+    { seq: 15, prompt: 'Teaser', type: 'TEXT', def: '', req: false, translatable: true,
+      help: 'Floating: a short message shown beside the chat button after a few seconds, e.g. Need a hand with this form? Shown once per browser tab; leave empty for none.' }
   ],
   plsql: `
 -- FlowChat Chat region plugin. Needs FC_ENGINE (db/04_fc_engine.pkb) in the parsing schema.
@@ -170,7 +181,15 @@ begin
   attr('resume', case when p_region.attribute_08 in ('session', 'local') then p_region.attribute_08 end);
   attr('theme', case when p_region.attribute_09 in ('light', 'dark') then p_region.attribute_09 end);
   if p_region.attribute_10 = 'N' then sys.htp.prn(' manual-start'); end if;
-  attr('style', '--fc-height: ' || l_height);
+  if p_region.attribute_12 = 'floating' then
+    attr('display', 'floating');
+    attr('position', case when p_region.attribute_13 = 'bottom-left' then 'bottom-left' else 'bottom-right' end);
+    attr('start-state', case when p_region.attribute_14 in ('peek', 'open') then p_region.attribute_14 else 'launcher' end);
+    attr('teaser', p_region.attribute_15);
+    attr('style', '--fc-height: min(' || l_height || ', calc(100vh - 110px))');
+  else
+    attr('style', '--fc-height: ' || l_height);
+  end if;
   sys.htp.p('></flow-chat>');
   return l_result;
 end render;

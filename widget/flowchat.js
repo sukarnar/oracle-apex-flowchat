@@ -259,11 +259,52 @@
     '.drop.over{border-color:var(--fc-accent);background:color-mix(in srgb,var(--fc-accent) 8%,transparent)}',
     '.drop .name{flex:1;min-width:0;color:var(--fc-muted);overflow-wrap:anywhere}',
     '.restored{opacity:.75}',
+    // ---- floating mode: launcher, peek bar and a floating panel in a page corner
+    '[hidden]{display:none!important}',
+    '.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}',
+    ':host([display=floating]){position:fixed;z-index:var(--fc-z,1000);right:max(20px,env(safe-area-inset-right,0px));',
+    'bottom:max(20px,env(safe-area-inset-bottom,0px));--fc-height:min(560px,calc(100vh - 110px));--fc-width:380px}',
+    ':host([display=floating][position=bottom-left]){right:auto;left:max(20px,env(safe-area-inset-left,0px))}',
+    '.dock{display:flex;flex-direction:column;align-items:flex-end;gap:12px}',
+    ':host([position=bottom-left]) .dock{align-items:flex-start}',
+    '.dock .fc{width:var(--fc-width);max-width:calc(100vw - 40px);box-shadow:0 12px 40px rgba(20,30,50,.22);animation:fc-pop .18s ease-out}',
+    '@keyframes fc-pop{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}',
+    '.win{background:none;border:0;color:var(--fc-muted);width:30px;height:30px;border-radius:8px;display:grid;place-items:center;cursor:pointer;flex:none}',
+    '.win:hover,.win:focus-visible{background:var(--fc-surface);color:var(--fc-text);outline:none}.win svg{width:18px;height:18px}',
+    '.launcher{position:relative;width:56px;height:56px;border-radius:50%;border:0;background:var(--fc-accent);color:var(--fc-accent-text);',
+    'display:grid;place-items:center;cursor:pointer;box-shadow:0 6px 20px rgba(20,30,50,.25);transition:transform .15s ease}',
+    '.launcher:hover{transform:scale(1.05)}.launcher:focus-visible{outline:3px solid color-mix(in srgb,var(--fc-accent) 45%,transparent);outline-offset:3px}',
+    '.launcher svg{width:26px;height:26px}',
+    '.badge{position:absolute;top:-3px;right:-3px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:var(--fc-error);',
+    'color:#fff;font-size:11.5px;font-weight:600;display:grid;place-items:center;border:2px solid var(--fc-bg)}',
+    '.lrow{display:flex;align-items:center;gap:12px}:host([position=bottom-left]) .lrow{flex-direction:row-reverse}',
+    '.teaser{display:flex;align-items:center;gap:4px;max-width:240px;background:var(--fc-bg);color:var(--fc-text);border:1px solid var(--fc-border);',
+    'border-radius:14px;padding:4px 4px 4px 12px;font-size:13.5px;box-shadow:0 6px 20px rgba(20,30,50,.15);animation:fc-in .25s ease-out}',
+    '.teaser .open{background:none;border:0;padding:6px 0;font:inherit;color:inherit;text-align:left;cursor:pointer}',
+    '.teaser .win{width:26px;height:26px}.teaser .win svg{width:14px;height:14px}',
+    '.peek{width:var(--fc-width);max-width:calc(100vw - 40px);background:var(--fc-bg);border:1px solid var(--fc-border);border-radius:var(--fc-radius);',
+    'box-shadow:0 8px 28px rgba(20,30,50,.18);overflow:hidden;position:relative;animation:fc-in .2s ease-out}',
+    '.peek-row{display:flex;align-items:center;gap:6px;padding:8px 6px 9px 12px}',
+    '.peek .open{flex:1;min-width:0;display:flex;align-items:center;gap:10px;background:none;border:0;padding:0;font:inherit;color:inherit;text-align:left;cursor:pointer}',
+    '.peek .open:focus-visible{outline:2px solid var(--fc-accent);outline-offset:2px;border-radius:8px}',
+    '.peek .avatar{width:30px;height:30px}.peek .avatar svg{width:16px;height:16px}',
+    '.peek .t{display:block;font-weight:600;font-size:13.5px}',
+    '.peek .q{display:block;font-size:12.5px;color:var(--fc-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+    '.peek.done .q{color:var(--fc-success)}',
+    '.peek .progress{top:auto;bottom:0}',
+    '.pulse{animation:fc-pulse 1.2s ease-out 1}',
+    '@keyframes fc-pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--fc-accent) 55%,transparent)}100%{box-shadow:0 0 0 14px transparent}}',
+    '@media (max-width:600px){',
+    ':host([display=floating]) .dock .fc{position:fixed;inset:0;width:auto;max-width:none;height:100%;border-radius:0;border:0;',
+    'padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px)}}',
     '@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}'
   ].join('');
 
   var ICON_BOT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>';
-  var ICON_SEND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
+  var ICON_MIN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 12h12"/></svg>';
+  var ICON_X = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+  var ICON_UP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 15l6-6 6 6"/></svg>';
+  var ICON_SEND ='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
 
   function h(tag, cls, text) {
     var e = document.createElement(tag);
@@ -313,7 +354,128 @@
       if (this._mounted) return;
       this._mounted = true;
       this._build();
+      if (this._floating) { this._initFloating(); return; }
       if (!this.hasAttribute('manual-start')) setTimeout(() => this.start(), 0);
+    }
+
+    // ---------------------------------------------------------------- floating mode
+    // States: 'closed' (launcher only), 'peek' (a bar with the current question), 'open' (the panel).
+    // The conversation starts on first open, unless a saved one can be resumed or start-state asks otherwise.
+    get state() { return this._floating ? this._state : 'open'; }
+
+    _initFloating() {
+      var ui = this._loadUi();
+      var want = (this.getAttribute('start-state') || 'launcher').toLowerCase();
+      var saved = this._hasSaved();
+      var state = ui && saved ? ui : want === 'open' ? 'open' : want === 'peek' ? 'peek' : saved ? 'peek' : 'closed';
+      if (this._narrow() && state === 'open' && !(ui === 'open' && saved)) state = saved ? 'peek' : 'closed';   // never cover a phone screen unasked
+      this._setState(state, { quiet: true });
+      if ((state !== 'closed' || saved) && !this.hasAttribute('manual-start')) this._ensureStarted();
+      var t = this.getAttribute('teaser');
+      if (t && state === 'closed' && !this._teaserDismissed()) {
+        this._teaserTimer = setTimeout(() => { if (this._state === 'closed') this._teaser.hidden = false; },
+                                       Math.max(0, parseInt(this.getAttribute('teaser-delay') || '3000', 10) || 0));
+      }
+    }
+
+    _narrow() { return window.matchMedia ? window.matchMedia('(max-width: 600px)').matches : false; }
+
+    _ensureStarted() {
+      if (this._started) return;
+      this._started = true;
+      setTimeout(() => this.start(), 0);
+    }
+
+    _hasSaved() {
+      var s = this._store();
+      if (!s) return false;
+      try { var v = JSON.parse(s.getItem(this._storeKey()) || 'null'); return !!(v && v.sid && Date.now() - (v.at || 0) <= 864e5); }
+      catch (e) { return false; }
+    }
+    _loadUi() {
+      var s = this._store();
+      try { var v = s && s.getItem(this._storeKey() + ':ui'); return v === 'open' || v === 'peek' || v === 'closed' ? v : null; }
+      catch (e) { return null; }
+    }
+    _saveUi() { var s = this._store(); if (s) try { s.setItem(this._storeKey() + ':ui', this._state); } catch (e) { /* blocked */ } }
+    _teaserKey() { return 'flowchat-teaser:' + this._storeKey(); }
+    _teaserDismissed() { try { return window.sessionStorage.getItem(this._teaserKey()) === '1'; } catch (e) { return false; } }
+    _dismissTeaser() {
+      clearTimeout(this._teaserTimer);
+      if (this._teaser) this._teaser.hidden = true;
+      try { window.sessionStorage.setItem(this._teaserKey(), '1'); } catch (e) { /* blocked */ }
+    }
+
+    /** Opens the chat panel (floating mode). Starts the conversation on first open. */
+    open() {
+      if (!this._floating) return;
+      this._setState('open');
+      this._ensureStarted();
+    }
+    /** Minimizes to the peek bar while a conversation is going, else to the launcher (always the launcher on phones). */
+    minimize() {
+      if (!this._floating) return;
+      var live = this._turn && this._turn.status === 'in_progress';
+      this._setState(live && !this._narrow() ? 'peek' : 'closed');
+    }
+    /** Closes to the launcher. The conversation is kept. */
+    close() { if (this._floating) this._setState('closed'); }
+    toggle() { if (this._state === 'open') this.minimize(); else this.open(); }
+
+    _setState(s, o) {
+      o = o || {};
+      var prev = this._state;
+      this._state = s;
+      this._wrap.hidden = s !== 'open';
+      this._peek.hidden = s !== 'peek';
+      this._lrow.hidden = s !== 'closed';
+      this._launcher.setAttribute('aria-expanded', String(s === 'open'));
+      if (s !== 'closed') this._dismissTeaser();
+      if (s === 'open') {
+        this._unread = 0; this._renderBadge(); this._scroll();
+        if (!o.quiet) setTimeout(() => {
+          var f = this._composer.querySelector('input,button.primary,button.chip,button') || this._wrap.querySelector('.win');
+          if (f) f.focus({ preventScroll: true });
+        }, 40);
+      } else if (prev === 'open' && !o.quiet) {
+        (s === 'peek' ? this._peekOpen : this._launcher).focus({ preventScroll: true });
+      }
+      this._saveUi();
+      if (prev !== s && !o.quiet) this._emit(s === 'open' ? 'fc-open' : s === 'peek' ? 'fc-minimize' : 'fc-close', { state: s });
+    }
+
+    _renderBadge() {
+      this._badge.hidden = !this._unread;
+      this._badge.textContent = this._unread > 9 ? '9+' : String(this._unread || '');
+      var label = this.getAttribute('launcher-label') || ('Open ' + (this.getAttribute('heading') || 'chat'));
+      this._launcher.setAttribute('aria-label', label + (this._unread ? ' (' + this._unread + ' new)' : ''));
+    }
+
+    // Called for each bot message: the peek bar shows the latest one; unread count and announcement while not open.
+    _noteBot(msg) {
+      if (!this._floating || this._restoring) return;
+      var text = msg.text || '';
+      if (text) this._peekQ.textContent = text;
+      if (this._state !== 'open' && text && !/^Something went wrong/.test(text)) {
+        this._unread = (this._unread || 0) + 1;
+        this._renderBadge();
+        this._sr.textContent = (this.getAttribute('heading') || 'Assistant') + ': ' + text;
+      }
+    }
+
+    // After each turn: done styling, a single pulse when a question waits while minimized, and settle to the launcher when finished.
+    _noteTurn(turn) {
+      if (!this._floating) return;
+      var done = turn.status === 'completed';
+      this._peek.classList.toggle('done', done);
+      if (done) {
+        this._peekQ.textContent = '✓ ' + (this._peekQ.textContent || 'Done');
+        if (this._state === 'peek') setTimeout(() => { if (this._state === 'peek') this._setState('closed', { quiet: true }); }, 6000);
+      }
+      if (this._state !== 'open' && turn.status === 'in_progress' && turn['await']) {
+        var el = this._state === 'peek' ? this._peek : this._launcher;
+        el.classList.remove('pulse'); void el.offsetWidth; el.classList.add('pulse');
+      }
     }
 
     /** Programmatic configuration: { transport, adapter, context } */
@@ -363,11 +525,65 @@
       this._composer = h('div', 'composer');
       wrap.append(header, this._log, this._composer);
       this._wrap = wrap;
-      this._shadow.append(style, wrap);
+      this._floating = (this.getAttribute('display') || '').toLowerCase() === 'floating';
+      if (!this._floating) { this._shadow.append(style, wrap); return; }
+
+      // floating: [panel] [peek bar] [teaser + launcher], stacked in a page corner
+      var heading = this.getAttribute('heading') || 'Assistant';
+      var win = (cls, icon, label, fn) => {
+        var b = h('button', 'win ' + cls); b.type = 'button'; b.innerHTML = icon;
+        b.setAttribute('aria-label', label); b.title = label; b.addEventListener('click', fn); return b;
+      };
+      header.insertBefore(win('min', ICON_MIN, 'Minimize', () => this.minimize()), prog);
+      header.insertBefore(win('close', ICON_X, 'Close', () => this.close()), prog);
+      wrap.id = 'fc-panel';
+      wrap.setAttribute('role', 'dialog');
+      wrap.setAttribute('aria-modal', 'false');
+      wrap.setAttribute('aria-label', heading);
+      wrap.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.stopPropagation(); this.minimize(); } });
+
+      var peek = h('div', 'peek'); peek.hidden = true;
+      var prow = h('div', 'peek-row');
+      var popen = h('button', 'open'); popen.type = 'button';
+      popen.setAttribute('aria-label', 'Open ' + heading);
+      var pav = h('span', 'avatar'); pav.innerHTML = ICON_BOT;
+      var ptx = h('span'); ptx.style.minWidth = '0';
+      this._peekQ = h('span', 'q', this.getAttribute('subheading') || '');
+      ptx.append(h('span', 't', heading), this._peekQ);
+      popen.append(pav, ptx);
+      popen.addEventListener('click', () => this.open());
+      prow.append(popen, win('up', ICON_UP, 'Open', () => this.open()), win('close', ICON_X, 'Close', () => this.close()));
+      var pprog = h('div', 'progress'); this._peekBar = h('span'); pprog.append(this._peekBar);
+      peek.append(prow, pprog);
+      this._peek = peek; this._peekOpen = popen;
+
+      var lrow = h('div', 'lrow');
+      var teaser = h('div', 'teaser'); teaser.hidden = true;
+      var topen = h('button', 'open', this.getAttribute('teaser') || ''); topen.type = 'button';
+      topen.addEventListener('click', () => this.open());
+      teaser.append(topen, win('dismiss', ICON_X, 'Dismiss', () => this._dismissTeaser()));
+      var launcher = h('button', 'launcher'); launcher.type = 'button';
+      launcher.innerHTML = ICON_BOT;
+      launcher.setAttribute('aria-controls', 'fc-panel');
+      launcher.setAttribute('aria-haspopup', 'dialog');
+      this._badge = h('span', 'badge'); this._badge.hidden = true; this._badge.setAttribute('aria-hidden', 'true');
+      launcher.append(this._badge);
+      launcher.addEventListener('click', () => this.toggle());
+      lrow.append(teaser, launcher);
+      this._teaser = teaser; this._launcher = launcher; this._lrow = lrow;
+
+      this._sr = h('div', 'sr'); this._sr.setAttribute('aria-live', 'polite');
+      var dock = h('div', 'dock');
+      dock.append(wrap, peek, lrow, this._sr);
+      this._unread = 0;
+      this._renderBadge();
+      this._shadow.append(style, dock);
     }
 
     /** Starts the conversation. With resume on, picks up a saved one first unless fresh is true. */
     async start(fresh) {
+      this._started = true;
+      if (this._peek) { this._peek.classList.remove('done'); this._peekQ.textContent = this.getAttribute('subheading') || ''; }
       this._log.textContent = '';
       this._composer.textContent = '';
       this._sid = null; this._turn = null; this._transcript = [];
@@ -454,6 +670,7 @@
       }
       this._setProgress(turn);
       this._renderComposer(turn);
+      this._noteTurn(turn);
       if (turn.status === 'in_progress') this._remember(); else this._forget();
       this._emit('fc-turn', turn);
       if (turn.status === 'completed') {
@@ -494,6 +711,7 @@
       var p = turn.progress || { done: 0, total: 0 };
       var pct = turn.status === 'completed' ? 100 : (p.total ? Math.round((p.done / p.total) * 100) : 0);
       this._bar.style.width = pct + '%';
+      if (this._peekBar) this._peekBar.style.width = pct + '%';
     }
 
     _scroll() { var l = this._log; requestAnimationFrame(function () { l.scrollTop = l.scrollHeight; }); }
@@ -505,6 +723,7 @@
     }
 
     _addBot(msg) {
+      this._noteBot(msg);
       if (!this._restoring && this._transcript && !/^Something went wrong/.test(msg.text || '')) this._transcript.push({ b: msg });
       var m = h('div', 'msg bot' + (msg.type === 'error' ? ' error' : msg.type === 'success' ? ' success' : ''));
       if (msg.type === 'list') {

@@ -73,7 +73,8 @@ python -m http.server 8765
 ```
 Then open <http://localhost:8765/demo/> (create), <http://localhost:8765/demo/update.html> (search and update)
 or <http://localhost:8765/demo/verify.html> (search and update on a public page, with a one-time code),
-or <http://localhost:8765/demo/expenses.html> (line items, a file upload and the masked debug log).
+or <http://localhost:8765/demo/expenses.html> (line items, a file upload and the masked debug log),
+or <http://localhost:8765/demo/floating.html> (the assistant as a floating chat button).
 The flows are fetched over HTTP, so opening the files directly won't work.
 
 ## 1b. Design flows visually
@@ -264,12 +265,48 @@ Run `my_flow.sql`. Each run creates a new version. Sessions that have already st
    | **Keep Conversation** | across reloads: No, Browser Tab (sessionStorage) or Browser (localStorage) |
    | **Theme** | Automatic, Light or Dark |
    | **Start Automatically** | off: start it from JavaScript with `document.getElementById('<static id>_chat').start()` |
-   | **Height** | a CSS length, default `560px` |
+   | **Height** | a CSS length, default `560px` (Floating: the open panel, never taller than the window) |
+   | **Display** | Inline (fills the region) or Floating (see below) |
+   | **Position** | Floating: Bottom Right or Bottom Left |
+   | **Start As** | Floating: Button, Minimized or Open |
+   | **Teaser** | Floating: a short line beside the button, e.g. "Need a hand with this form?" (translatable) |
 
 No `FC_START` / `FC_INPUT` processes are needed: the region has its own AJAX callback, and it is
 stricter than the processes. It starts only the flow (and version) set on the region, whatever the
 browser sends, and continues only conversations of that flow. The chat element's id is the region's
 static id plus `_chat` (`R<region id>_chat` without a static id). Several chat regions can be on one page.
+
+### Floating chat (minimized mode)
+
+With **Display** = Floating (`display="floating"` on the element) the chat sits in a corner of the page
+instead of in the region. Give the region the **Blank with Attributes** template so it adds no frame or space.
+
+| State | What the user sees |
+|---|---|
+| Button (`closed`) | A round chat button, an optional teaser beside it, and a count of new messages |
+| Minimized (`peek`) | A slim bar with the heading, the current question and the progress bar; the form stays visible |
+| Open (`open`) | The chat panel, 380 px wide, with Minimize and Close in its header; full screen below 600 px |
+
+- **The conversation starts when the chat is first opened**, so pages where nobody uses it make no calls.
+  Start As = Minimized or Open, or a conversation kept by Keep Conversation, starts it straight away.
+- **Minimize** (or Esc) goes to the bar while a conversation is going, otherwise to the button. On
+  phones it always goes to the button. **Close** goes to the button; the conversation is kept.
+- While minimized, new bot messages update the bar, add to the button's count, and are read out by
+  screen readers. A question waiting for an answer makes the bar or button pulse once (not with
+  reduced motion). When the conversation finishes, the bar shows the closing message, then turns
+  back into the button.
+- With Keep Conversation on, the state (open, minimized or closed) is remembered across reloads too.
+- The teaser shows once per browser tab, after 3 seconds (`teaser-delay` in milliseconds on the element).
+
+```js
+const chat = document.getElementById('R_CHAT_chat');   // the region's static id + _chat
+chat.open();        // also: minimize(), close(), toggle(); chat.state is 'closed', 'peek' or 'open'
+chat.addEventListener('fc-open', () => apex.item('P10_HELP_USED').setValue('Y'));   // fc-minimize, fc-close too
+```
+
+A Dynamic Action on a "Help me fill this in" button can open it with *Execute JavaScript Code*:
+`document.getElementById('R_CHAT_chat').open();`. Change the size with CSS on the element:
+`#R_CHAT_chat { --fc-width: 420px; --fc-z: 900; }`.
 
 ### Without the plugin (a Static Content region and two processes)
 
