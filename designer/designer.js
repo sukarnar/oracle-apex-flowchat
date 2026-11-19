@@ -1217,7 +1217,10 @@
       if (n.type === 'changeFields') (n.fields || []).forEach((f) => chips.push(h('span', { class: 'chip slot', text: f.field || '?' })));
       if (n.type === 'repeat') (n.fields || []).forEach((f) => chips.push(h('span', { class: 'chip slot', text: f.field || '?' })));
       if (n.type === 'bulkUpdate') (n.criteria || []).forEach((c) => chips.push(h('span', { class: 'chip', text: c.field + ' ' + (c.op || 'eq') + ' ' + c.slot })));
-      if (n.pii || (n.type === 'ask' && (S.flow.piiSlots || []).indexOf(n.slot) >= 0)) chips.push(h('span', { class: 'chip', text: 'PII', title: 'Masked in logs' }));
+      const hid = n.redact || ((n.type === 'changeFields' || n.type === 'repeat') && (n.fields || []).some((f) => f.redact))
+        || (n.type === 'agent' && (n.outputs || []).some((o) => o && o.redact));
+      if (hid) chips.push(h('span', { class: 'chip', text: 'Hidden', title: 'Hidden on screen and masked in logs' }));
+      else if (n.pii || (n.type === 'ask' && (S.flow.piiSlots || []).indexOf(n.slot) >= 0)) chips.push(h('span', { class: 'chip', text: 'PII', title: 'Masked in logs' }));
       if (chips.length) el.append(h('div', { class: 'nchips' }, chips));
       const ps = ports(n);
       ps.forEach((p, i) => {
@@ -1684,9 +1687,22 @@
           'Up to 20480 KB.')),
         h('p', { class: 'hint', text: 'The file goes to FC_FILES (in the Test tab: memory). The answer holds {id, name, size, mimeType}; your Submit connector reads the content by id.' }));
     }
-    box.append(F('In logs', sel([['', 'Show the value'], ['true', 'Redact it (PII)'], ['last4', 'Show only the last 4 characters']],
-      o.pii === true ? 'true' : (o.pii || ''), (v) => mutate(() => setOrDelete(o, 'pii', v === 'true' ? true : v), { panel: true })),
-      'PII values are masked in FC_EVENTS and debug logs. The chat itself still shows them to the user.'));
+    const typed = ['text', 'email', 'number'].indexOf(kind) >= 0;
+    const rd = o.redact === true ? 'full' : (o.redact || '');
+    if (typed || rd) {
+      box.append(F('On screen', sel([['', 'Show as typed'], ['full', 'Hide it'], ['last4', 'Hide it, show the last 4 in the chat']], rd,
+        (v) => mutate(() => { setOrDelete(o, 'redact', v); if (!v) delete o.allowReveal; }, { panel: true })),
+        'Hidden answers are typed into a masked box and shown masked in the chat, in later messages and on the summary. Connectors and the save still get the real value.'));
+      if (rd) box.append(checkbox('Let the user reveal what they typed', o.allowReveal !== false,
+        (c) => mutate(() => { if (c) delete o.allowReveal; else o.allowReveal = false; })));
+    }
+    if (rd) {
+      box.append(F('In logs', h('span', { class: 'hint', text: rd === 'last4' && !o.pii ? 'Only the last 4 characters (hidden answers are always masked in logs).' : 'Masked (hidden answers are always masked in logs).' })));
+    } else {
+      box.append(F('In logs', sel([['', 'Show the value'], ['true', 'Redact it (PII)'], ['last4', 'Show only the last 4 characters']],
+        o.pii === true ? 'true' : (o.pii || ''), (v) => mutate(() => setOrDelete(o, 'pii', v === 'true' ? true : v), { panel: true })),
+        'PII values are masked in FC_EVENTS and debug logs. To hide the value in the chat too, use On screen.'));
+    }
     return box;
   }
 
@@ -2397,7 +2413,8 @@
         }, { panel: true }))),
         h('div', null,
           checkbox('Required', o.required !== false, (c) => mutate(() => { if (c) delete o.required; else o.required = false; })),
-          checkbox('Personal data (PII)', !!o.pii, (c) => mutate(() => { if (c) o.pii = true; else delete o.pii; })))));
+          checkbox('Personal data (PII)', !!o.pii, (c) => mutate(() => { if (c) o.pii = true; else delete o.pii; })),
+          checkbox('Hide on screen', !!o.redact, (c) => mutate(() => { if (c) o.redact = 'full'; else { delete o.redact; delete o.allowReveal; } })))));
       if (o.kind === 'file') {
         card.append(F('Allowed types (optional)', bound(() => o.accept, (v) => setOrDelete(o, 'accept', v), { key: kp + '.acc', placeholder: '.pdf,.jpg' }),
           'Only the user\'s upload fills this field: the agent asks for it with ask_user and cannot set it itself.'));

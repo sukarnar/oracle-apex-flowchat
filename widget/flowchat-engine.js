@@ -266,6 +266,38 @@
     return out;
   }
 
+  // "redact": true | "full" | "last4" on an Ask node, a field or an agent output hides the value on
+  // screen: typed into a hidden box, masked in the chat. It also implies "pii" for the logs.
+  function redactMode(x) {
+    var r = x && x.redact;
+    return !r || r === 'false' ? null : r === 'last4' ? 'last4' : 'full';
+  }
+  function piiOf(x) {
+    if (x && x.pii && x.pii !== 'false') return x.pii;
+    var r = redactMode(x);
+    return r === 'last4' ? 'last4' : r ? true : null;
+  }
+  var REDACT_FULL = '••••••••';
+  // Masks redacted values in every string inside x (chat messages and cards), longest first.
+  function maskDeep(x, pairs) {
+    if (!pairs.length) return x;
+    var sorted = pairs.slice().sort(function (a, b) { return b.v.length - a.v.length; });
+    function txt(t) {
+      sorted.forEach(function (p) {
+        if (p.v.length < 3) { if (t === p.v) t = p.mode === 'last4' ? '•••• ' + p.v : REDACT_FULL; return; }
+        t = t.split(p.v).join(p.mode === 'last4' ? '•••• ' + p.v.slice(-4) : REDACT_FULL);
+      });
+      return t;
+    }
+    function walk(v) {
+      if (typeof v === 'string') return txt(v);
+      if (Array.isArray(v)) return v.map(walk);
+      if (v && typeof v === 'object') { var o = {}; Object.keys(v).forEach(function (k) { o[k] = walk(v[k]); }); return o; }
+      return v;
+    }
+    return walk(x);
+  }
+
   // Names in a flow's "context" list: ["dept", {"name": "emp_id", "label": "..."}] -> ["dept", "emp_id"]
   function contextNames(flow) {
     return (flow.context || []).map(function (c) { return c && typeof c === 'object' ? c.name : c; }).filter(Boolean).map(String);
@@ -434,31 +466,34 @@
     // ---- PII and debug
     // [{v, mode}] for every value that logs must never show: PII answers, PII record fields and
     // PII line-item fields, plus the flow's piiSlots.
-    function piiPairs(ctx) {
+    function piiPairs(ctx) { return valuePairs(ctx, piiOf, true); }
+    // [{v, mode}] for the values the chat must show masked ("redact").
+    function redactPairs(ctx) { return valuePairs(ctx, redactMode, false); }
+    function valuePairs(ctx, pick, withList) {
       var out = [], st = ctx.st;
       function add(v, mode) {
         if (!isFilled(v)) return;
         if (typeof v === 'object') { if (isFilled(v.name)) out.push({ v: String(v.name), mode: 'full' }); return; }
         out.push({ v: String(v), mode: mode === 'last4' ? 'last4' : 'full' });
       }
-      (ctx.flow.piiSlots || []).forEach(function (s) { add(/^context\./.test(s) ? (st.context || {})[s.slice(8)] : st.slots[s], 'full'); });
+      if (withList) (ctx.flow.piiSlots || []).forEach(function (s) { add(/^context\./.test(s) ? (st.context || {})[s.slice(8)] : st.slots[s], 'full'); });
       ctx.flow.nodes.forEach(function (n) {
-        if (n.type === 'ask' && n.pii) add(st.slots[n.slot], n.pii);
-        if (n.type === 'agent') (n.outputs || []).forEach(function (o) { if (o && o.pii) add(st.slots[o.name], o.pii); });
+        if (n.type === 'ask' && pick(n)) add(st.slots[n.slot], pick(n));
+        if (n.type === 'agent') (n.outputs || []).forEach(function (o) { if (o && pick(o)) add(st.slots[o.name], pick(o)); });
         if (n.type === 'changeFields' && st.records[n.record]) {
           (n.fields || []).forEach(function (f) {
-            if (!f.pii) return;
-            add(st.records[n.record].current[f.field], f.pii);
-            add(st.records[n.record].original[f.field], f.pii);
+            if (!pick(f)) return;
+            add(st.records[n.record].current[f.field], pick(f));
+            add(st.records[n.record].original[f.field], pick(f));
           });
         }
         if (n.type === 'repeat') {
           var items = Array.isArray(st.slots[n.slot]) ? st.slots[n.slot] : [];
           var draft = (st.repeat[n.id] || {}).draft || {};
           (n.fields || []).forEach(function (f) {
-            if (!f.pii) return;
-            items.forEach(function (it) { add(it[f.field], f.pii); });
-            add(draft[f.field], f.pii);
+            if (!pick(f)) return;
+            items.forEach(function (it) { add(it[f.field], pick(f)); });
+            add(draft[f.field], pick(f));
           });
         }
       });
@@ -472,11 +507,20 @@
     function currentIsPii(ctx) {
       var st = ctx.st, n = ctx.nodes[st.current];
       if (!n) return false;
-      if (n.type === 'ask') return !!n.pii || (ctx.flow.piiSlots || []).indexOf(n.slot) >= 0;
-      if (n.type === 'agent') { var aw = ((st.agent || {})[n.id] || {}).waiting; return !!(aw && aw.pii); }
-      if (n.type === 'changeFields' && st.editingField) { var f = fieldDef(n, st.editingField); return !!(f && f.pii); }
-      if (n.type === 'repeat' && st.repeat[n.id]) { var rf = (n.fields || [])[st.repeat[n.id].field]; return !!(rf && rf.pii); }
-      return false;
+      if (n.type === 'ask') return !!piiOf(n) || (ctx.flow.piiSlots || []).indexOf(n.slot) >= 0;
+      if (n.type === 'agent') { var aw = ((st.agent || {})[n.id] || {}).waiting; return !!(aw && (aw.pii || aw.redact)); }
+      var d = currentDef(ctx);
+      return !!(d && piiOf(d));
+    }
+    // The Ask node, field or agent output the user is answering right now (null for menus etc.).
+    function currentDef(ctx) {
+      var st = ctx.st, n = ctx.nodes[st.current];
+      if (!n) return null;
+      if (n.type === 'ask') return n;
+      if (n.type === 'agent') { var aw = ((st.agent || {})[n.id] || {}).waiting; return aw && aw.redact ? { redact: aw.redact, allowReveal: aw.allowReveal } : null; }
+      if (n.type === 'changeFields' && st.editingField) return fieldDef(n, st.editingField) || null;
+      if (n.type === 'repeat' && st.repeat[n.id]) return (n.fields || [])[st.repeat[n.id].field] || null;
+      return null;
     }
     // The input as logs may show it: no one-time codes, no file contents, PII answers redacted.
     function inputForLog(ctx, payload) {
@@ -1155,7 +1199,8 @@
           var q = unPiiText(a, String(args.question));
           say(ctx, 'text', q);
           a.waiting = { type: 'ask', prompt: q, spec: spec, field: out ? out.name : null, label: out ? (out.label || out.name) : 'Answer',
-                        pii: !!(out ? out.pii : args.sensitive) };
+                        pii: !!(out ? piiOf(out) : args.sensitive), redact: out ? redactMode(out) : null,
+                        allowReveal: !(out && out.allowReveal === false) };
           return { wait: true };
         }
         case 'pick_record': {
@@ -1354,7 +1399,8 @@
       ctx.st.agent = ctx.st.agent || {};
       var a = ctx.st.agent[node.id] = ctx.st.agent[node.id] || { mode: 'native', steps: 0, questions: 0, pending: [], messages: [], done: true, next: node.next };
       var q = 'What should ' + (o.label || o.name) + ' be?';
-      a.waiting = { type: 'edit', prompt: q, spec: outputSpec(o), field: o.name, label: o.label || o.name, pii: !!o.pii };
+      a.waiting = { type: 'edit', prompt: q, spec: outputSpec(o), field: o.name, label: o.label || o.name, pii: !!piiOf(o),
+                    redact: redactMode(o), allowReveal: o.allowReveal !== false };
       ctx.st.current = node.id; ctx.st.editing = true;
       say(ctx, 'text', q);
     }
@@ -2279,9 +2325,15 @@
                  cancelLabel: n.cancelLabel || 'Cancel', danger: true };
         }
       }
+      var rp = redactPairs(ctx), msgs = maskDeep(ctx.out, rp);
+      if (aw) {
+        aw = maskDeep(aw, rp);
+        var rd = aw.type === 'ask' && !aw.menu ? currentDef(ctx) : null, rm = redactMode(rd);
+        if (rm) { aw.redact = rm; aw.allowReveal = rd.allowReveal !== false; aw.value = null; }
+      }
       return {
         sessionId: ctx.sid, flowId: st.flowId, version: st.version, status: st.status,
-        messages: ctx.out,
+        messages: msgs,
         'await': aw,
         fieldUpdates: ctx.updates.map(function (s) {
           return { slot: s, value: isFilled(v[s]) ? v[s] : null,

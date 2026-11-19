@@ -465,11 +465,24 @@ create or replace package body fc_engine as
   -- logging: PII masking and debug events (FC_EVENTS)
   ------------------------------------------------------------------------------
   -- "pii": true | "last4" on a node or field -> 'full' | 'last4' (null = not PII)
+  -- "redact": true | "full" | "last4" -> hidden on screen ('full' | 'last4'; null = shown)
+  function redact_mode (p in json_object_t) return varchar2 is
+    l varchar2(30) := str(p, 'redact');
+  begin
+    return case when l is null or l = 'false' then null when l = 'last4' then 'last4' else 'full' end;
+  end redact_mode;
+
+  -- A hidden ("redact") value is always PII as well.
   function pii_mode (p in json_object_t) return varchar2 is
     l varchar2(30) := str(p, 'pii');
   begin
-    return case when l is null or l = 'false' then null when l = 'last4' then 'last4' else 'full' end;
+    return case when l is null or l = 'false' then redact_mode(p) when l = 'last4' then 'last4' else 'full' end;
   end pii_mode;
+
+  function pick_mode (p in json_object_t, p_redact in boolean) return varchar2 is
+  begin
+    return case when p_redact then redact_mode(p) else pii_mode(p) end;
+  end pick_mode;
 
   procedure add_pii (p_arr in out nocopy json_array_t, p_el in json_element_t, p_mode in varchar2) is
     l   json_object_t := json_object_t();
@@ -485,9 +498,10 @@ create or replace package body fc_engine as
 
   -- Every value that logs must never show in clear: PII answers, PII record fields and PII
   -- line-item fields, plus the flow's "piiSlots".
-  function pii_pairs (c in out nocopy t_ctx) return json_array_t is
+  -- p_redact = true: only the values the chat must show masked ("redact"), without piiSlots.
+  function pii_pairs (c in out nocopy t_ctx, p_redact in boolean default false) return json_array_t is
     l_out   json_array_t := json_array_t();
-    l_list  json_array_t := arr(c.flow, 'piiSlots');
+    l_list  json_array_t := case when p_redact then json_array_t() else arr(c.flow, 'piiSlots') end;
     l_nodes json_array_t := c.flow.get_array('nodes');
     l_n     json_object_t;
     l_type  varchar2(30);
@@ -514,8 +528,8 @@ create or replace package body fc_engine as
       l_n    := treat(l_nodes.get(i) as json_object_t);
       l_type := str(l_n, 'type');
       if l_type = 'ask' then
-        if pii_mode(l_n) is not null and c.slots.has(str(l_n, 'slot')) then
-          add_pii(l_out, c.slots.get(str(l_n, 'slot')), pii_mode(l_n));
+        if pick_mode(l_n, p_redact) is not null and c.slots.has(str(l_n, 'slot')) then
+          add_pii(l_out, c.slots.get(str(l_n, 'slot')), pick_mode(l_n, p_redact));
         end if;
       elsif l_type = 'changeFields' then
         l_rec := obj(c.records, str(l_n, 'record'));
@@ -524,7 +538,7 @@ create or replace package body fc_engine as
           for j in 0 .. l_flds.get_size - 1 loop
             l_f    := treat(l_flds.get(j) as json_object_t);
             l_fld  := str(l_f, 'field');
-            l_mode := pii_mode(l_f);
+            l_mode := pick_mode(l_f, p_redact);
             if l_mode is not null then
               if obj(l_rec, 'current') is not null and obj(l_rec, 'current').has(l_fld) then
                 add_pii(l_out, obj(l_rec, 'current').get(l_fld), l_mode);
@@ -540,7 +554,7 @@ create or replace package body fc_engine as
         for j in 0 .. l_flds.get_size - 1 loop
           if l_flds.get(j).is_object then
             l_f    := treat(l_flds.get(j) as json_object_t);
-            l_mode := pii_mode(l_f);
+            l_mode := pick_mode(l_f, p_redact);
             if l_mode is not null and c.slots.has(str(l_f, 'name')) then add_pii(l_out, c.slots.get(str(l_f, 'name')), l_mode); end if;
           end if;
         end loop;
@@ -551,7 +565,7 @@ create or replace package body fc_engine as
         for j in 0 .. l_flds.get_size - 1 loop
           l_f    := treat(l_flds.get(j) as json_object_t);
           l_fld  := str(l_f, 'field');
-          l_mode := pii_mode(l_f);
+          l_mode := pick_mode(l_f, p_redact);
           if l_mode is not null then
             for k in 0 .. l_items.get_size - 1 loop
               if l_items.get(k).is_object then
@@ -598,6 +612,37 @@ create or replace package body fc_engine as
     end loop;
     return l_out;
   end mask_clob;
+
+  -- The chat's version of mask_clob: hidden ("redact") values become bullets in the turn JSON
+  -- (messages, cards, the field menu). Values under 3 characters are masked in the answer only.
+  function mask_display (c in out nocopy t_ctx, p_text in clob) return clob is
+    l_pairs json_array_t := pii_pairs(c, true);
+    l_out   clob := p_text;
+    l_p     json_object_t;
+    l_v     varchar2(4000);
+    l_tmp   json_object_t;
+    l_txt   varchar2(32767);
+    l_esc   varchar2(32767);
+    l_dot   varchar2(40) := to_char(unistr('\2022\2022\2022\2022'));
+  begin
+    if p_text is null or l_pairs.get_size = 0 then return p_text; end if;
+    for pass in 1 .. 3 loop
+      for i in 0 .. l_pairs.get_size - 1 loop
+        l_p := treat(l_pairs.get(i) as json_object_t);
+        l_v := str(l_p, 'v');
+        if (pass = 1 and length(l_v) >= 20) or (pass = 2 and length(l_v) between 8 and 19) or (pass = 3 and length(l_v) < 8) then
+          l_tmp := json_object_t();
+          l_tmp.put('v', l_v);
+          l_txt := l_tmp.to_string;
+          l_esc := substr(l_txt, 7, length(l_txt) - 8);
+          if length(l_esc) >= 3 then
+            l_out := replace(l_out, l_esc, case when str(l_p, 'm') = 'last4' then l_dot || ' ' || substr(l_v, -4) else l_dot || l_dot end);
+          end if;
+        end if;
+      end loop;
+    end loop;
+    return l_out;
+  end mask_display;
 
   -- One FC_EVENTS row, PII values masked.
   procedure log_ev (c in out nocopy t_ctx, p_dir in varchar2, p_node in varchar2, p_payload in clob) is
@@ -2716,6 +2761,10 @@ create or replace package body fc_engine as
         l_w.put('field', str(l_o, 'name'));
         l_w.put('label', nvl(str(l_o, 'label'), str(l_o, 'name')));
         l_w.put('pii', pii_mode(l_o) is not null);
+        if redact_mode(l_o) is not null then
+          l_w.put('redact', redact_mode(l_o));
+          l_w.put('allowReveal', nvl(str(l_o, 'allowReveal'), 'true') <> 'false');
+        end if;
       else
         l_w.put('label', 'Answer');
         l_w.put('pii', get_bool(l_args, 'sensitive'));
@@ -3042,6 +3091,10 @@ create or replace package body fc_engine as
     l_w.put('field', p_slot);
     l_w.put('label', nvl(str(l_o, 'label'), p_slot));
     l_w.put('pii', pii_mode(l_o) is not null);
+    if redact_mode(l_o) is not null then
+      l_w.put('redact', redact_mode(l_o));
+      l_w.put('allowReveal', nvl(str(l_o, 'allowReveal'), 'true') <> 'false');
+    end if;
     l_a.put('waiting', l_w);
     ag_put(c, l_id, l_a);
     c.state.put('current', l_id);
@@ -4064,8 +4117,37 @@ create or replace package body fc_engine as
     end if;
   end run;
 
+  -- The Ask node, field or agent output being answered right now, when it is hidden ("redact").
+  function current_redact (c in out nocopy t_ctx) return json_object_t is
+    l_cur  varchar2(200) := str(c.state, 'current');
+    l_node json_object_t;
+    l_fd   json_object_t;
+    l_rs   json_object_t;
+    l_w    json_object_t;
+  begin
+    if l_cur is null or not c.nodes.has(l_cur) then return null; end if;
+    l_node := get_node(c, l_cur);
+    case str(l_node, 'type')
+      when 'ask' then l_fd := l_node;
+      when 'changeFields' then
+        if str(c.state, 'editingField') is not null then l_fd := field_def(l_node, str(c.state, 'editingField')); end if;
+      when 'repeat' then
+        l_rs := rp_state(c, l_cur);
+        if l_rs is not null then
+          l_fd := treat(arr(l_node, 'fields').get(nvl(to_num(str(l_rs, 'field')), 0)) as json_object_t);
+        end if;
+      when 'agent' then
+        l_w := obj(ag_get(c, l_cur), 'waiting');
+        if l_w is not null and str(l_w, 'redact') is not null and nvl(str(l_w, 'type'), 'ask') in ('ask', 'edit') then l_fd := l_w; end if;
+      else null;
+    end case;
+    if l_fd is null or redact_mode(l_fd) is null then return null; end if;
+    return l_fd;
+  end current_redact;
+
   function build_turn (c in out nocopy t_ctx) return clob is
     l_turn    json_object_t := json_object_t();
+    l_red     json_object_t;
     l_aw      json_object_t;
     l_node    json_object_t;
     l_type    varchar2(30);
@@ -4310,8 +4392,19 @@ create or replace package body fc_engine as
     l_turn.put('flowId', str(c.state, 'flowId'));
     l_turn.put('version', to_num(str(c.state, 'version')));
     l_turn.put('status', str(c.state, 'status'));
-    l_turn.put('messages', c.out_msgs);
-    if l_aw is not null then l_turn.put('await', l_aw); else l_turn.put_null('await'); end if;
+    l_turn.put('messages', json_array_t.parse(mask_display(c, c.out_msgs.to_clob)));
+    if l_aw is not null then
+      l_aw := json_object_t.parse(mask_display(c, l_aw.to_clob));
+      if str(l_aw, 'type') = 'ask' and not get_bool(l_aw, 'menu') then l_red := current_redact(c); end if;
+      if l_red is not null then
+        l_aw.put('redact', redact_mode(l_red));
+        l_aw.put('allowReveal', nvl(str(l_red, 'allowReveal'), 'true') <> 'false');
+        l_aw.put_null('value');
+      end if;
+      l_turn.put('await', l_aw);
+    else
+      l_turn.put_null('await');
+    end if;
     l_turn.put('fieldUpdates', l_updates);
     l_turn.put('progress', l_prog);
     l_turn.put('canGoBack', c.history.get_size > 0 or str(c.state, 'editingField') is not null

@@ -53,6 +53,7 @@ tests/      engine.test.js           node tests/engine.test.js
             appuser.test.js          node tests/appuser.test.js (built-in {{app_user}})
             phase-e.test.js          node tests/phase-e.test.js (versions, debug, PII, resume, Repeat, Bulk update, files)
             set.test.js              node tests/set.test.js (Set values node, context variables)
+            redact.test.js           node tests/redact.test.js (hidden answers: masked input, chat and logs)
             menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
             email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
             rest.test.js             node tests/rest.test.js (REST call node: URL building, body template, mapping, routing, refusals, replay)
@@ -732,7 +733,31 @@ select event_id, node_id, json_value(payload, '$.event') event, payload
   or `••••1234`, wherever they appear: the answer itself, the summary, messages that repeat it, record
   values. The input that sets a PII answer is logged as `[redacted]`.
 - The chat, the session state (`FC_SESSIONS.STATE`, needed to run the conversation) and connector
-  payloads still hold the real values. Purge sessions with `fc_engine.purge_expired`.
+  payloads still hold the real values. Purge sessions with `fc_engine.purge_expired`. To hide a
+  value in the chat too, use **On screen** (below).
+
+### Hidden answers (masked while typing)
+
+For values nobody should see over the user's shoulder: SSN, card or account numbers, IBANs, PINs.
+
+- In the designer, set **On screen** on an Ask node, a Change fields field or a Repeat item field
+  (text, email and number answers): **Hide it** (`"redact": true`) or **Hide it, show the last 4 in
+  the chat** (`"redact": "last4"`). For an agent output, tick **Hide on screen**. The node shows a
+  **Hidden** chip.
+- **While typing** the box shows dots. It isn't spell-checked, autocorrected or offered to password
+  managers, and the text can't be copied out of it. An eye button lets the user check what they
+  typed; it hides again when the answer is sent. Untick **Let the user reveal what they typed**
+  (`"allowReveal": false`) for values that must never be shown, such as PINs.
+- **In the chat** the answer bubble shows `••••••••` or `•••• 6789`, and so does every later message,
+  summary, record card and field menu that would contain the value (`{{ssn}}` included). The saved
+  transcript (Keep Conversation) holds only the masked text. Going back to the question doesn't
+  prefill the old value: the user types it again.
+- **In logs** a hidden answer is always PII, so FC_EVENTS masks it with no extra setting.
+- **Not masked:** connectors, validators, the save to the data source and page items bound with
+  `bindings` get the real value, which is the point. In the browser-only setup (JS engine, no
+  database) the engine's state, including the value, lives in the page; for sensitive fields use the
+  database engine, where the browser only keeps a session id.
+- Values shorter than 3 characters are masked in the answer bubble but not inside other messages.
 
 ### Repeat: line items and child rows
 
@@ -1007,13 +1032,15 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 100 unit tests (`tests/engine.test.js`,
+- The JavaScript engine and widget are tested: 104 unit tests (`tests/engine.test.js`, `tests/redact.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
   `tests/email.test.js`, `tests/agent.test.js`, `tests/rest.test.js`), plus manual end-to-end runs of the demos.
 - **The REST call node's and REST tools' PL/SQL (`run_rest`, `rest_call`, `rest_tool` and the other `rest_*` helpers in `FC_ENGINE`,
   `17_rest_endpoints.sql`, `list_rest` in `FC_DESIGNER`) has not been compiled or called a real API
   yet.** It mirrors the tested JavaScript engine.
+- **Hidden answers in PL/SQL (`redact_mode`, `mask_display`, `current_redact` in `FC_ENGINE`) have
+  not been compiled yet.** They mirror the tested JavaScript engine.
 - **The database-error handling in Save changes and Bulk update (`db_error_text`, `undo_to` and the
   `fc_save` / `fc_bulk_row` savepoints in `FC_ENGINE`) has not been compiled or tested against a real
   trigger yet.** It mirrors the tested JavaScript engine.

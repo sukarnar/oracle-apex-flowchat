@@ -229,6 +229,11 @@
     '.btn.primary{background:var(--fc-accent);border-color:var(--fc-accent);color:var(--fc-accent-text);font-weight:500}',
     '.btn:disabled{opacity:.55;cursor:default}',
     '.send{width:42px;padding:0;display:grid;place-items:center}.send svg{width:18px;height:18px}',
+    '.secret{flex:1;min-width:0;position:relative;display:flex}.secret input{padding-right:40px}',
+    'input.masked{-webkit-text-security:disc;letter-spacing:.08em}',
+    '.reveal{position:absolute;right:4px;top:50%;transform:translateY(-50%);width:32px;height:32px;border:0;border-radius:8px;',
+    'background:transparent;color:var(--fc-muted);cursor:pointer;display:grid;place-items:center}',
+    '.reveal:hover{color:var(--fc-text)}.reveal:focus-visible{outline:2px solid var(--fc-accent)}.reveal svg{width:18px;height:18px}',
     '.chips{display:flex;flex-wrap:wrap;gap:8px}',
     '.chip{font:inherit;font-size:13.5px;padding:8px 13px;border-radius:999px;border:1px solid var(--fc-accent);background:transparent;color:var(--fc-accent);cursor:pointer}',
     '.chip:hover{background:var(--fc-accent);color:var(--fc-accent-text)}',
@@ -304,6 +309,17 @@
   var ICON_MIN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 12h12"/></svg>';
   var ICON_X = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
   var ICON_UP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 15l6-6 6 6"/></svg>';
+  var ICON_EYE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+  var ICON_EYE_OFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.9 17.9A10.4 10.4 0 0 1 12 19c-6.5 0-10-7-10-7a18.5 18.5 0 0 1 4.2-5.1M9.9 5.2A9.7 9.7 0 0 1 12 5c6.5 0 10 7 10 7a18.6 18.6 0 0 1-2.2 3.2M14.1 14.1a3 3 0 0 1-4.2-4.2M2 2l20 20"/></svg>';
+  // Browsers that can disc-mask a text box (Chromium, Safari) avoid type=password, so password
+  // managers don't offer to save the answer; elsewhere type=password is the fallback.
+  var TEXT_SECURITY = !!(window.CSS && window.CSS.supports && window.CSS.supports('-webkit-text-security', 'disc'));
+  // How a redacted answer is shown in the chat.
+  function maskAnswer(a, v) {
+    v = String(v == null ? '' : v);
+    if (!v) return '(skipped)';
+    return a.redact === 'last4' ? '•••• ' + v.slice(-4) : '••••••••';
+  }
   var ICON_SEND ='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
 
   function h(tag, cls, text) {
@@ -787,7 +803,7 @@
       inp.setAttribute('aria-label', 'Search ' + (a.label || a.slot));
       inp.placeholder = spec.placeholder || 'Type to search ' + opts.length + ' options...';
       var shown = [];
-      var pick = (o) => this.send({ value: o.value }, o.label || o.value);
+      var pick = (o) => this.send({ value: o.value }, a.redact ? maskAnswer(a, o.label || o.value) : (o.label || o.value));
       var draw = () => {
         var t = inp.value.trim().toLowerCase();
         box.textContent = '';
@@ -941,7 +957,7 @@
         var opts = spec.kind === 'yesno' ? [{ value: 'yes', label: 'Yes' }, { value: 'no', label: 'No' }] : (spec.options || []);
         opts.forEach((o) => {
           var b = h('button', 'chip', o.label || o.value); b.type = 'button';
-          b.addEventListener('click', () => this.send({ value: o.value }, o.label || o.value));
+          b.addEventListener('click', () => this.send({ value: o.value }, a.redact ? maskAnswer(a, o.label || o.value) : (o.label || o.value)));
           chips.append(b);
           if (!focusEl) focusEl = b;
         });
@@ -968,13 +984,43 @@
         if (a.value !== null && a.value !== undefined) inp.value = String(a.value);
         var send = h('button', 'btn primary send'); send.type = 'submit'; send.innerHTML = ICON_SEND;
         send.setAttribute('aria-label', 'Send');
-        form.append(inp, send);
+        var hide = null;
+        if (a.redact && spec.kind !== 'date') {
+          // Sensitive answer: hidden while typing, never spell-checked, saved or copied out.
+          inp.autocomplete = 'off'; inp.spellcheck = false;
+          inp.setAttribute('autocapitalize', 'off'); inp.setAttribute('autocorrect', 'off');
+          ['data-lpignore', 'data-1p-ignore', 'data-bwignore'].forEach(function (k) { inp.setAttribute(k, 'true'); });
+          inp.setAttribute('data-form-type', 'other');
+          if (!TEXT_SECURITY && inp.type === 'email') inp.type = 'text';
+          hide = (on) => {
+            if (TEXT_SECURITY) inp.classList.toggle('masked', on);
+            else inp.type = on ? 'password' : 'text';
+          };
+          hide(true);
+          ['copy', 'cut'].forEach(function (ev) { inp.addEventListener(ev, function (e) { if (TEXT_SECURITY ? inp.classList.contains('masked') : inp.type === 'password') e.preventDefault(); }); });
+          var box = h('span', 'secret'); box.append(inp);
+          if (a.allowReveal !== false) {
+            var eye = h('button', 'reveal'); eye.type = 'button'; eye.innerHTML = ICON_EYE;
+            eye.setAttribute('aria-label', 'Show answer'); eye.setAttribute('aria-pressed', 'false');
+            eye.addEventListener('click', () => {
+              var shown = eye.getAttribute('aria-pressed') !== 'true';
+              hide(!shown);
+              eye.setAttribute('aria-pressed', String(shown));
+              eye.setAttribute('aria-label', shown ? 'Hide answer' : 'Show answer');
+              eye.innerHTML = shown ? ICON_EYE_OFF : ICON_EYE;
+              inp.focus();
+            });
+            box.append(eye);
+          }
+          form.append(box, send);
+        } else form.append(inp, send);
         form.addEventListener('submit', (e) => {
           e.preventDefault();
           var v = inp.value.trim();
           if (!v && spec.required !== false) { inp.focus(); return; }
-          // Secret answers (one-time codes) are not echoed into the transcript.
-          this.send({ value: v }, a.secret ? '•'.repeat(v.length) : (v || '(skipped)'));
+          if (hide) hide(true);
+          // Secret answers (one-time codes) and redacted answers are not echoed into the transcript.
+          this.send({ value: v }, a.secret ? '•'.repeat(v.length) : a.redact ? maskAnswer(a, v) : (v || '(skipped)'));
         });
         c.append(form); focusEl = inp;
       }
@@ -1025,7 +1071,7 @@
   FlowChatElement.DomAdapter = DomAdapter;
   FlowChatElement.ApexAdapter = ApexAdapter;
   FlowChatElement.NoneAdapter = NoneAdapter;
-  FlowChatElement.version = '1.2.0';   // 1.2.0: floating mode (display="floating")
+  FlowChatElement.version = '1.3.0';   // 1.2.0: floating mode (display="floating")
   // Only one copy can define <flow-chat>. If an older one got there first (for example
   // #APP_FILES#flowchat.js next to the region plugin), say so instead of failing silently.
   var existing = customElements.get('flow-chat');
