@@ -1025,6 +1025,18 @@
   FlowChatElement.DomAdapter = DomAdapter;
   FlowChatElement.ApexAdapter = ApexAdapter;
   FlowChatElement.NoneAdapter = NoneAdapter;
-  window.FlowChat = FlowChatElement;
-  customElements.define('flow-chat', FlowChatElement);
+  FlowChatElement.version = '1.2.0';   // 1.2.0: floating mode (display="floating")
+  // Only one copy can define <flow-chat>. If an older one got there first (for example
+  // #APP_FILES#flowchat.js next to the region plugin), say so instead of failing silently.
+  var existing = customElements.get('flow-chat');
+  if (existing) {
+    if (existing !== FlowChatElement) {
+      console.warn('[flow-chat] Another copy of flowchat.js (' + (existing.version || 'an older version') + ') was loaded first, ' +
+        'so this copy (' + FlowChatElement.version + ') is not used and its features (such as display="floating") are missing. ' +
+        'Load flowchat.js once: with the FlowChat Chat plugin, remove #APP_FILES#flowchat.js from the page and application JavaScript File URLs.');
+    }
+  } else {
+    window.FlowChat = FlowChatElement;
+    customElements.define('flow-chat', FlowChatElement);
+  }
 })();
