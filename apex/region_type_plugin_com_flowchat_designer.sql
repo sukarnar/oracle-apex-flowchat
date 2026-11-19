@@ -90,7 +90,7 @@ wwv_flow_imp_shared.create_plugin(
 'callback (no page process needed). Anyone who can open the page can publish flows: protect the page or the',
 'region with an authorization scheme. Use one designer region per page.'))
 ,p_version_identifier=>'1.1.0'
-,p_files_version=>1
+,p_files_version=>134111874
 );
 wwv_flow_imp_shared.create_plugin_attribute(
  p_id=>wwv_flow_imp.id(481516234200011)

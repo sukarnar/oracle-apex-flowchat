@@ -123,7 +123,7 @@ wwv_flow_imp_shared.create_plugin(
 'through this region''s own AJAX callback (no FC_START / FC_INPUT processes needed). The region only starts',
 'the flow set in its attributes, and only continues conversations of that flow.'))
 ,p_version_identifier=>'1.1.0'
-,p_files_version=>1
+,p_files_version=>541306987
 );
 wwv_flow_imp_shared.create_plugin_attribute(
  p_id=>wwv_flow_imp.id(481516234300011)

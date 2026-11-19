@@ -227,6 +227,13 @@ end ajax;
 
 // ------------------------------------------------------------------------------------------ export
 const q = (s) => "'" + String(s).replace(/'/g, "''") + "'";
+// The files version is part of the #PLUGIN_FILES# URL, so browsers fetch the files again after an
+// import only when it changes: derived from the files' content (a positive integer below 2^31).
+const filesVersion = (def) => {
+  const hash = require('crypto').createHash('sha256');
+  def.files.forEach(([src]) => hash.update(fs.readFileSync(path.join(ROOT, src))));
+  return (parseInt(hash.digest('hex').slice(0, 8), 16) % 2000000000) + 1;
+};
 const join = (lines) => 'wwv_flow_string.join(wwv_flow_t_varchar2(\n' + lines.map(q).join(',\n') + '))';
 
 function build(def) {
@@ -277,7 +284,7 @@ wwv_flow_imp_shared.create_plugin(
 ,p_subscribe_plugin_settings=>true
 ,p_help_text=>${join(def.help)}
 ,p_version_identifier=>'${VERSION}'
-,p_files_version=>1
+,p_files_version=>${filesVersion(def)}
 );`);
 
   def.attrs.forEach((a) => {
