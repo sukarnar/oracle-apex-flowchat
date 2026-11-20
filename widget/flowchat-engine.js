@@ -74,6 +74,12 @@
  * req = {endpoint, method, path (relative, values URL-encoded), headers, body, nodeId, sessionId, flowId, appUser}.
  * The node maps the JSON response into slots ("map": {slot: "$.path"}); 2xx -> next, 404 -> onNotFound
  * (when set), anything else -> onError (or the conversation fails).
+ *
+ * Workflow node: starts an APEX workflow. In the browser engine pass options.startWorkflow(req) ->
+ * {workflowId} (or the id itself), where req = {workflow (static id), applicationId, parameters:
+ * [{name, value, formatMask}], detailKey, nodeId, sessionId, flowId, appUser}; the node's "parameters" are
+ * {NAME: "{{template}}"} (an ISO date gets format mask YYYY-MM-DD). The id goes into
+ * resultSlot; a failure goes to onError (or the conversation fails). A replayed edit never starts it again.
  */
 (function (global) {
   'use strict';
@@ -687,6 +693,52 @@
       dbg(ctx, { event: 'branch', node: node.id, choice: parsed.value, next: opt.next || null });
       if (st.editing) { st.editing = false; ctx.replay = true; await run(ctx, ctx.flow.start); }
       else await run(ctx, opt.next);
+    }
+
+    // ---- workflow: start an APEX workflow with parameters built from the answers
+    var ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+    // "parameters": {NAME: "template"} (plus optional "formatMasks": {NAME: mask}), or [{name, value, formatMask}].
+    function workflowParams(node) {
+      if (Array.isArray(node.parameters)) return node.parameters;
+      var pm = node.parameters || {}, fm = node.formatMasks || {};
+      return Object.keys(pm).map(function (k) { return { name: k, value: pm[k], formatMask: fm[k] || null }; });
+    }
+    function workflowRequest(ctx, node) {
+      var v = view(ctx);
+      return {
+        workflow: String(node.workflow || '').trim(),
+        applicationId: isFilled(node.applicationId) ? Number(node.applicationId) : null,
+        parameters: workflowParams(node).filter(function (p) { return p && String(p.name || '').trim(); }).map(function (p) {
+          var val = interpolate(p.value == null ? '' : String(p.value), v);
+          var fm = p.formatMask || (ISO_DATE.test(val) ? 'YYYY-MM-DD' : null);
+          return { name: String(p.name).trim(), value: val === '' ? null : val, formatMask: fm };
+        }),
+        detailKey: oneLine(interpolate(node.detailKey || '', v)) || null
+      };
+    }
+    // Starts the workflow; returns the next node (onError, else the conversation fails, when it can't).
+    async function runWorkflow(ctx, node) {
+      var req = workflowRequest(ctx, node), problem = null, wid = null, text = null;
+      if (!req.workflow) problem = 'no workflow static id';
+      else if (typeof options.startWorkflow !== 'function') problem = 'no workflow starter (pass options.startWorkflow)';
+      else {
+        try {
+          var r = await Promise.resolve(options.startWorkflow(Object.assign({ nodeId: node.id, sessionId: ctx.sid, flowId: ctx.flow.flowId,
+                                                                               appUser: appUserOf(ctx) }, req)));
+          wid = r && typeof r === 'object' ? r.workflowId : r;
+          if (!isFilled(wid)) problem = (r && r.message) || 'the workflow did not start';
+          if (r && typeof r === 'object' && r.message && !isFilled(wid)) text = r.message;
+        } catch (e) { problem = (e && e.message) || String(e); text = dsErrorText(e); }
+      }
+      if (!problem && node.resultSlot) { ctx.st.slots[node.resultSlot] = wid; touch(ctx, node.resultSlot); }
+      dbg(ctx, { event: 'workflow', node: node.id, workflow: req.workflow, parameters: req.parameters.map(function (p) { return p.name; }),
+                 workflowId: problem ? undefined : wid, error: problem || undefined });
+      if (problem) {
+        say(ctx, 'error', text || interpolate(node.errorMessage || "Sorry, I couldn't start that request right now.", view(ctx)));
+        return node.onError || failed(ctx);
+      }
+      if (node.message) say(ctx, 'text', interpolate(node.message, view(ctx)));
+      return node.next;
     }
 
     // ---- email: send a message built from templates, via a connector or options.sendEmail
@@ -1620,7 +1672,7 @@
         else if (n.type === 'agent') { total++; var ag = (ctx.st.agent || {})[n.id]; if (!ag || !ag.done) break; done++; id = ag.next; }
         else if (n.type === 'verify') id = n.verified;
         else if (n.type === 'bulkUpdate') id = n.done;
-        else if (n.type === 'message' || n.type === 'lookup' || n.type === 'set' || n.type === 'email' || n.type === 'rest') id = n.next;
+        else if (n.type === 'message' || n.type === 'lookup' || n.type === 'set' || n.type === 'email' || n.type === 'rest' || n.type === 'workflow') id = n.next;
         else break;
       }
       if (ctx.st.status === 'completed') done = total;
@@ -2143,6 +2195,13 @@
             id = nxt;
             break;
           }
+          case 'workflow':
+            // Replaying an edit never starts the workflow again.
+            if (ctx.replay) { id = node.next; break; }
+            nxt = await runWorkflow(ctx, node);
+            if (nxt === null && st.status === 'failed') return;
+            id = nxt;
+            break;
           case 'email':
             // Replaying an edit never sends the email again.
             if (ctx.replay) { id = node.next; break; }

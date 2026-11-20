@@ -57,6 +57,7 @@ tests/      engine.test.js           node tests/engine.test.js
             menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
             email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
             rest.test.js             node tests/rest.test.js (REST call node: URL building, body template, mapping, routing, refusals, replay)
+            workflow.test.js         node tests/workflow.test.js (Workflow node: parameters, date masks, id, errors, replay)
             agent.test.js            node tests/agent.test.js (Agent node, scripted model: questions, tools, confirm, finish, handoff, limits, JSON mode, pick_record, files, PII placeholders, set_field, REST tools)
             apex-embed-test.html     designer inside a page-wide form, like APEX
             apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
@@ -502,6 +503,38 @@ HR team",
   - **Designer:** the endpoint field lists `FC_REST_ENDPOINTS` (database mode) and checks the
     method against it. The Test tab never calls the API: each REST call node answers with a mock
     (`{"status": 200, "body": {...}}`, with buttons for 404, 500 and a timeout).
+- **Workflow node:** starts an APEX workflow (APEX 23.2+), typically an approval, once the chat
+  has collected what it needs:
+  ```json
+  { "id": "approve", "type": "workflow", "workflow": "LEAVE_APPROVAL",
+    "parameters": { "P_EMP_ID": "{{context.emp_id}}", "P_START": "{{start_date}}", "P_DAYS": "{{days}}" },
+    "detailKey": "{{request_id}}", "resultSlot": "workflow_id",
+    "message": "Your request is on its way for approval (reference {{workflow_id}}).",
+    "errorMessage": "Sorry, I couldn't start the approval.", "next": "done", "onError": "manual_form" }
+  ```
+  - **How it starts:** FC_ENGINE calls `APEX_WORKFLOW.START_WORKFLOW` in the application the chat runs
+    in (or `applicationId`), as the signed-in APEX user, inside the chat turn's transaction (a
+    failure is rolled back to savepoint `fc_wf`). The flow names the workflow by its **Static ID**,
+    so the browser can't start any other one.
+  - **Parameters:** `{STATIC_ID: "template"}`, filled in from the answers. An ISO date
+    (`2026-12-01`, which is how date answers are stored) is passed with format mask `YYYY-MM-DD`; set
+    another per parameter with `"formatMasks": {"P_START": "DD-MON-YYYY"}`. Every required workflow
+    parameter must be listed, or the start fails.
+  - **Detail primary key** (`detailKey`): the row the workflow's Additional Data reads, for example
+    the id a Submit just created.
+  - **Result:** the new workflow id goes into `resultSlot`. Then `next`.
+  - **Failure** (an unknown static id, a missing parameter, an error raised while starting): the
+    chat shows `errorMessage`, or for `raise_application_error` codes -20000 to -20999 the raised
+    text without `ORA-` codes, and goes to `onError`. Without `onError` the conversation ends as
+    failed. Other errors go to the APEX debug log.
+  - **Replays:** editing an earlier answer never starts the workflow again.
+  - **Order:** put it after the Submit that saves the request, so the workflow's detail row exists,
+    and use the submit's result (`{{request_id}}`) as the detail key.
+  - **JavaScript engine:** pass `startWorkflow: (req) => ({ workflowId })`, where
+    `req = {workflow, applicationId, parameters: [{name, value, formatMask}], detailKey, appUser, ...}`.
+  - **Designer:** the **Workflow** palette item edits the static ID, parameters, detail key and the
+    workflow id field. The Test tab never starts a workflow: each Workflow node answers with a mock
+    (`{"workflowId": 1001}`, with buttons for a failure and a raised message).
 - **Signed-in user:** `{{app_user}}` is built in and works in any message, prompt or condition
   (`{"slot": "app_user", "op": "=", "value": "ADMIN"}`) with no field or binding. In APEX, FC_ENGINE
   fills it from the APEX session (`APP_USER`), so the browser can't change it. A slot or context value
@@ -1032,7 +1065,7 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 104 unit tests (`tests/engine.test.js`, `tests/redact.test.js`,
+- The JavaScript engine and widget are tested: 110 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/workflow.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
   `tests/email.test.js`, `tests/agent.test.js`, `tests/rest.test.js`), plus manual end-to-end runs of the demos.
@@ -1047,6 +1080,9 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 - **The Agent node's PL/SQL (the `ag_*` routines in `FC_ENGINE`, `15_ai_tables.sql`, `list_ai` in
   `FC_DESIGNER`) has not been compiled or run against a real model yet.** It mirrors the tested
   JavaScript engine.
+- **The Workflow node's PL/SQL (`run_workflow` in `FC_ENGINE`, the `workflow` type in
+  `FC_DESIGNER`'s check) has not been compiled or started a real APEX workflow yet.** It mirrors the
+  tested JavaScript engine. It needs APEX 23.2 or later (`APEX_WORKFLOW`).
 - **The Email node's PL/SQL (`run_email` in `FC_ENGINE`) has not been compiled or sent a real email
   yet.** It mirrors the tested JavaScript engine.
 - **The Phase E PL/SQL (`FC_ENGINE`, `01_tables.sql`, `upgrade_phase_e.sql`, `14_seed_expense_flow.sql`)

@@ -137,6 +137,8 @@
                  make: (id) => ({ id, type: 'email', to: '', from: '', subject: '', body: '' }) },
     rest:      { label: 'REST call', color: '#4f46e5', desc: 'Call a REST API registered in FC_REST_ENDPOINTS and put parts of its JSON answer into fields.',
                  make: (id) => ({ id, type: 'rest', endpoint: '', method: 'GET', path: '/', map: {} }) },
+    workflow:  { label: 'Workflow',  color: '#0d9488', desc: 'Start an APEX workflow (an approval or back-office process) with parameters from the answers.',
+                 make: (id) => ({ id, type: 'workflow', workflow: '', parameters: {}, resultSlot: 'workflow_id' }) },
     end:       { label: 'End',       color: '#475569', desc: 'Finish the conversation.',
                  make: (id) => ({ id, type: 'end', text: 'All done!' }) },
     repeat:    { label: 'Repeat',    color: '#0284c7', desc: 'Collect a list of items (line items, children, expenses), each with its own questions.',
@@ -332,6 +334,7 @@
       case 'lookup': return [{ key: 'next', label: 'next' }, { key: 'onNotFound', label: 'not found', optional: true }];
       case 'submit': return [{ key: 'onSuccess', label: 'success' }, { key: 'onError', label: 'error', optional: true }];
       case 'email': return [{ key: 'next', label: 'sent' }, { key: 'onError', label: 'error', optional: true }];
+      case 'workflow': return [{ key: 'next', label: 'started' }, { key: 'onError', label: 'error', optional: true }];
       case 'rest': return [{ key: 'next', label: 'ok' }, { key: 'onNotFound', label: '404', optional: true }, { key: 'onError', label: 'error', optional: true }];
       case 'agent': return [{ key: 'next', label: 'finished' }]
         .concat((n.exits || []).map((e, i) => ({ key: 'exit:' + i, label: e.name || 'exit ' + (i + 1) })))
@@ -419,6 +422,7 @@
     S.flow.nodes.forEach((n) => {
       if (n.type === 'set') (n.assign || []).forEach((a) => push(a.slot));
       if (n.type === 'rest') { Object.keys(n.map || {}).forEach(push); push(n.statusSlot); }
+      if (n.type === 'workflow') push(n.resultSlot);
     });
     return out;
   }
@@ -545,6 +549,11 @@
       ['text', 'prompt', 'to', 'cc', 'bcc', 'replyTo', 'from', 'subject', 'body', 'message', 'errorMessage']
         .forEach((k) => { if (typeof n[k] === 'string') n[k] = n[k].replace(re, '{{' + newSlot + '}}'); });
       if (n.type === 'email' && n.attachments) n.attachments = n.attachments.map((s) => (s === oldSlot ? newSlot : s));
+      if (n.type === 'workflow') {
+        if (n.resultSlot === oldSlot) n.resultSlot = newSlot;
+        if (typeof n.detailKey === 'string') n.detailKey = n.detailKey.replace(re, '{{' + newSlot + '}}');
+        Object.keys(n.parameters || {}).forEach((k) => { n.parameters[k] = String(n.parameters[k]).replace(re, '{{' + newSlot + '}}'); });
+      }
       if (n.type === 'rest') {
         if (n.map && oldSlot in n.map && !(newSlot in n.map)) { n.map[newSlot] = n.map[oldSlot]; delete n.map[oldSlot]; }
         if (n.statusSlot === oldSlot) n.statusSlot = newSlot;
@@ -931,6 +940,18 @@
           (n.attachments || []).forEach((a) => { if (files.indexOf(a) < 0) add('error', 'Attachment "' + a + '" is not a file answer.', n.id); });
           break;
         }
+        case 'workflow': {
+          if (!String(n.workflow || '').trim()) add('error', 'Workflow has no static ID.', n.id);
+          if (n.applicationId !== undefined && !/^\d+$/.test(String(n.applicationId))) add('error', 'Application ID must be a number.', n.id);
+          Object.keys(n.parameters || {}).forEach((k) => {
+            if (!/^[A-Za-z][A-Za-z0-9_$#]{0,254}$/.test(k)) add('error', 'Parameter "' + k + '" is not a valid static ID.', n.id);
+            placeholders(n.parameters[k], n.id);
+          });
+          if (n.resultSlot && !/^[a-z][a-z0-9_]{0,99}$/.test(n.resultSlot)) add('error', 'Workflow ID field "' + n.resultSlot + '" must be lowercase letters, digits and _.', n.id);
+          if (!n.onError) add('warning', 'If the workflow can\'t start, the conversation ends as failed. Connect "error" to a step that explains what to do.', n.id);
+          ['detailKey', 'message', 'errorMessage'].forEach((k) => placeholders(n[k], n.id));
+          break;
+        }
         case 'rest': {
           const m = String(n.method || 'GET').toUpperCase();
           if (!n.endpoint) add('error', 'REST call has no endpoint.', n.id);
@@ -1176,6 +1197,8 @@
       case 'lookup': case 'submit': return n.connector ? 'Calls ' + n.connector : '';
       case 'agent': return n.goal ? (n.provider ? '[' + n.provider + '] ' : '') + n.goal : 'No task yet';
       case 'email': return n.to ? 'To ' + n.to + (n.subject ? ': ' + n.subject : '') : 'No recipient yet';
+      case 'workflow': return n.workflow ? 'Start ' + n.workflow + (Object.keys(n.parameters || {}).length ? ' (' + Object.keys(n.parameters).join(', ') + ')' : '') +
+        (n.resultSlot ? ' → ' + n.resultSlot : '') : 'No workflow yet';
       case 'rest': return n.endpoint ? (n.method || 'GET') + ' ' + n.endpoint + (n.path && n.path !== '/' ? ' ' + n.path : '') +
         (Object.keys(n.map || {}).length ? ' → ' + Object.keys(n.map).join(', ') : '') : 'No endpoint yet';
       case 'verify': return n.slot ? 'Send a code to ' + n.slot + (n.connector ? ' via ' + n.connector : '') : '';
@@ -1551,7 +1574,7 @@
     );
     const editors = { message: textEditor, end: textEditor, ask: askEditor, condition: condEditor, lookup: connEditor, submit: connEditor,
                       summary: summaryEditor, verify: verifyEditor, findRecord: findEditor, changeFields: changeEditor, saveChanges: saveEditor,
-                      repeat: repeatEditor, bulkUpdate: bulkEditor, set: setEditor, menu: menuEditor, email: emailEditor, rest: restEditor, agent: agentEditor };
+                      repeat: repeatEditor, bulkUpdate: bulkEditor, set: setEditor, menu: menuEditor, email: emailEditor, rest: restEditor, agent: agentEditor, workflow: workflowEditor };
     body.append(editors[n.type](n));
     if (n.type !== 'condition' && n.type !== 'menu' && n.type !== 'agent' && n.type !== 'end') {
       body.append(h('h4', { class: 'sub', text: 'Connections' }));
@@ -1563,6 +1586,7 @@
           : 'Optional. Used when the connector returns found: false.') :
         p.key === 'onError' ? (n.type === 'email' ? 'Optional. Without it the flow shows the error and carries on to the next step.'
           : n.type === 'rest' ? 'Optional. Used for any other status, a timeout or a refused call. Without it the conversation ends as failed.'
+          : n.type === 'workflow' ? 'Optional. Used when the workflow can\'t start (unknown static ID, a missing required parameter, an error raised by the workflow). Without it the conversation ends as failed.'
           : 'Optional. Without it a failed submit ends the conversation.') : PORT_HINTS[p.key] || null)));
     }
     const probs = analyze().list.filter((x) => x.nodeId === n.id);
@@ -2355,6 +2379,30 @@
     return wrap;
   }
 
+  // ---- workflow
+  function workflowEditor(n) {
+    const wrap = h('div');
+    wrap.append(h('div', { class: 'grid2' },
+      F('Workflow static ID', bound(() => n.workflow, (v) => setOrDelete(n, 'workflow', v.trim()), { mono: true, key: n.id + '.wf', placeholder: 'LEAVE_APPROVAL', panel: true }),
+        'Shared Components > Workflows > the workflow\'s Static ID.'),
+      F('Application ID (optional)', bound(() => n.applicationId, (v) => setOrDelete(n, 'applicationId', v.trim() ? (Number(v) || v.trim()) : ''), { mono: true, key: n.id + '.wfapp', placeholder: 'this application' }),
+        'Leave empty for the application the chat runs in.')));
+    wrap.append(kvRows(n, 'parameters', { title: 'Parameters', keyPh: 'P_STATIC_ID', valPh: '{{field}}', addLabel: '+ Parameter', newKey: 'P_PARAM', newVal: '',
+      hint: 'Parameter static ID ← value. {{placeholders}} are filled in from the answers. Dates (YYYY-MM-DD) are passed with that format mask; numbers and text as they are. Every required workflow parameter must be here.' }));
+    const dk = bound(() => n.detailKey, (v) => setOrDelete(n, 'detailKey', v), { mono: true, key: n.id + '.wfdk', placeholder: '{{request_id}}' });
+    wrap.append(F('Detail primary key (optional)', dk, 'The row the workflow is about (its Additional Data: the workflow reads that row by this key).'), slotChips(dk));
+    wrap.append(F('Workflow ID into field (optional)', bound(() => n.resultSlot, (v) => setOrDelete(n, 'resultSlot', v.trim()), { mono: true, key: n.id + '.wfres', placeholder: 'workflow_id' }),
+      'The new workflow\'s ID, e.g. for a message, a Submit or a link to the Workflow Console.'));
+    wrap.append(h('h4', { class: 'sub', text: 'Chat messages' }));
+    wrap.append(F('After starting (optional)', bound(() => n.message, (v) => setOrDelete(n, 'message', v), { key: n.id + '.wfmsg', placeholder: 'Your request is on its way for approval (reference {{workflow_id}}).' })));
+    wrap.append(F('If it can\'t start', bound(() => n.errorMessage, (v) => setOrDelete(n, 'errorMessage', v), { key: n.id + '.wferr', placeholder: 'Sorry, I couldn\'t start that request right now.' }),
+      'An error raised with raise_application_error (-20000 to -20999) is shown instead, as written.'));
+    wrap.append(h('div', { class: 'card' }, h('div', { class: 'hint', style: 'margin:0', text:
+      'The workflow starts as the signed-in APEX user, in the same database transaction as the chat turn. It is not started again when the user edits an earlier answer and the flow replays. In Test, nothing starts: the mock is used.' }),
+      h('button', { class: 'lnk', text: 'Edit the test mock →', onclick: () => setTab('test') })));
+    return wrap;
+  }
+
   // ---- agent
   const AGENT_KINDS = [['text', 'Text'], ['number', 'Number'], ['date', 'Date'], ['email', 'Email'], ['yesno', 'Yes / no'], ['choice', 'Choice'],
                        ['file', 'File (the user uploads it)']];
@@ -2997,6 +3045,19 @@
     return { status: r.status || 200, body: r.body === undefined ? null : r.body };
   }
 
+  // Workflow test doubles: Test never starts a workflow; each Workflow node answers with its mock.
+  const workflowNodes = () => S.flow.nodes.filter((n) => n.type === 'workflow');
+  const workflowMockFor = (n) => (S.mocks['wf:' + n.id] !== undefined ? S.mocks['wf:' + n.id] : JSON.stringify({ workflowId: 1001 }, null, 2));
+  function testWorkflow(req) {
+    const n = workflowNodes().find((x) => x.id === req.nodeId);
+    let r;
+    try { r = JSON.parse(workflowMockFor(n)); } catch (e) { throw new Error('The test mock for workflow "' + req.nodeId + '" is not valid JSON.'); }
+    if (r && r.error) { const e = new Error(String(r.error)); e.userMessage = r.userMessage || null; throw e; }
+    toast('Test workflow (not started): ' + req.workflow + ' with ' + (req.parameters.map((p) => p.name + '=' + (p.value === null ? '' : p.value)).join(', ') || 'no parameters') +
+      (req.detailKey ? ', detail ' + req.detailKey : '') + ' → ' + r.workflowId, 7000);
+    return r;
+  }
+
   const mockFor = (id, role) => (S.mocks[id] !== undefined ? S.mocks[id] : JSON.stringify(ROLE_PRESETS[role][0][1], null, 2));
 
   let testSources = {};
@@ -3008,8 +3069,8 @@
     const ids = Object.keys(uses);
     const srcs = sourceUses();
     const lvs = Object.keys(lovUses());
-    const agents = agentNodes(), tids = agentToolIds(), rests = restNodes();
-    if (!ids.length && !srcs.length && !lvs.length && !agents.length && !rests.length) { box.append(h('p', { class: 'hint', text: 'This flow calls no connectors, data sources or lookup lists.' })); return; }
+    const agents = agentNodes(), tids = agentToolIds(), rests = restNodes(), wfs = workflowNodes();
+    if (!ids.length && !srcs.length && !lvs.length && !agents.length && !rests.length && !wfs.length) { box.append(h('p', { class: 'hint', text: 'This flow calls no connectors, data sources or lookup lists.' })); return; }
     const jsonArea = (get, key, rows, isArr) => {
       const ta = h('textarea', { class: 'in mono', rows, spellcheck: 'false' });
       ta.value = get();
@@ -3018,6 +3079,17 @@
       check();
       return ta;
     };
+    wfs.forEach((n) => {
+      const setWf = (v) => { if (v === null) delete S.mocks['wf:' + n.id]; else S.mocks['wf:' + n.id] = JSON.stringify(v, null, 2); save(); renderMocks(); };
+      box.append(h('div', { class: 'card mock' },
+        h('div', { class: 'card-h' }, h('span', { class: 'mono grow', text: n.id }), h('span', { class: 'chip', text: 'workflow ' + (n.workflow || '?') })),
+        h('p', { class: 'hint', text: 'Test answers with this instead of starting the workflow: {"workflowId": 1001}, or {"error": "...", "userMessage": "..."} for a failure.' }),
+        h('div', { class: 'rowx' },
+          h('button', { class: 'btn', text: 'Starts', onclick: () => setWf(null) }),
+          h('button', { class: 'btn', text: 'Fails', onclick: () => setWf({ error: 'ORA-01403: no data found' }) }),
+          h('button', { class: 'btn', text: 'Raises a message', onclick: () => setWf({ error: 'ORA-20001: You already have a pending request.', userMessage: 'You already have a pending request.' }) })),
+        jsonArea(() => workflowMockFor(n), 'wf:' + n.id, 4, false)));
+    });
     rests.forEach((n) => {
       box.append(h('div', { class: 'card mock' },
         h('div', { class: 'card-h' }, h('span', { class: 'mono grow', text: n.id }), h('span', { class: 'chip', text: 'REST ' + (n.method || 'GET') + ' ' + (n.endpoint || '?') })),
@@ -3231,7 +3303,7 @@
     const appUser = (window.apex && apex.env && apex.env.APP_USER) || 'TEST_USER';
     testDebug = [];
     testEngine = FlowChatEngine.createEngine({ flows: [flow], connectors, dataSources: buildTestSources(), lovs: buildTestLovs(), appUser,
-      sendEmail: (m) => { showTestEmail(m); return { ok: true }; }, rest: testRest,
+      sendEmail: (m) => { showTestEmail(m); return { ok: true }; }, rest: testRest, startWorkflow: testWorkflow,
       aiProviders: ai.providers, aiTools: ai.tools, aiSkills: ai.skills,
       onDebug: flow.debug ? (e) => { testDebug.push(e); } : null });
     const chat = $('simChat');

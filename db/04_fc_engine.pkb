@@ -407,6 +407,8 @@ create or replace package body fc_engine as
       rollback to fc_save;
     elsif p_savepoint = 'fc_bulk_row' then
       rollback to fc_bulk_row;
+    elsif p_savepoint = 'fc_wf' then
+      rollback to fc_wf;
     end if;
   exception when others then
     if sqlcode <> -1086 then raise; end if;
@@ -1747,6 +1749,101 @@ create or replace package body fc_engine as
   end rest_call;
 
   -- Calls the endpoint and maps the response into slots. Returns the next node, or null after failed().
+  -- Workflow node: starts an APEX workflow (APEX_WORKFLOW.START_WORKFLOW) of this application, or of
+  -- "applicationId". "parameters": {NAME: template} or [{name, value, formatMask}], over the answers; an ISO date
+  -- value gets format mask YYYY-MM-DD unless one is given. The workflow id goes into "resultSlot".
+  function run_workflow (c in out nocopy t_ctx, p_node in json_object_t) return varchar2 is
+    l_id      varchar2(200)  := str(p_node, 'id');
+    l_v       json_object_t  := vals(c);
+    l_static  varchar2(255)  := trim(str(p_node, 'workflow'));
+    l_app     number         := nvl(to_num(str(p_node, 'applicationId')), apex_application.g_flow_id);
+    l_detail  varchar2(4000) := one_line(interpolate(str(p_node, 'detailKey'), l_v));
+    l_list    json_array_t   := arr(p_node, 'parameters');
+    l_pmap    json_object_t  := obj(p_node, 'parameters');
+    l_masks   json_object_t  := obj(p_node, 'formatMasks');
+    l_keys    json_key_list;
+    l_p       json_object_t;
+    l_val     varchar2(32767);
+    l_params  apex_workflow.t_workflow_parameters;
+    l_names   json_array_t   := json_array_t();
+    l_wid     number;
+    l_problem varchar2(4000);
+    l_text    varchar2(4000);
+    l_ev      json_object_t;
+    k         pls_integer;
+  begin
+    -- "parameters": {NAME: "template"} (with optional "formatMasks": {NAME: mask}) becomes the list form.
+    if l_pmap is not null then
+      l_keys := l_pmap.get_keys;
+      if l_keys is not null then
+        for i in 1 .. l_keys.count loop
+          l_p := json_object_t();
+          l_p.put('name', l_keys(i));
+          l_p.put('value', str(l_pmap, l_keys(i)));
+          if str(l_masks, l_keys(i)) is not null then l_p.put('formatMask', str(l_masks, l_keys(i))); end if;
+          l_list.append(l_p);
+        end loop;
+      end if;
+    end if;
+    for i in 0 .. l_list.get_size - 1 loop
+      if l_list.get(i).is_object then
+        l_p := treat(l_list.get(i) as json_object_t);
+        if trim(str(l_p, 'name')) is not null then
+          l_val := interpolate(str(l_p, 'value'), l_v);
+          k := l_params.count + 1;
+          l_params(k).static_id    := trim(str(l_p, 'name'));
+          l_params(k).string_value := l_val;
+          l_params(k).format_mask  := nvl(str(l_p, 'formatMask'),
+                                          case when regexp_like(l_val, '^[0-9]{4}-[0-9]{2}-[0-9]{2}$') then 'YYYY-MM-DD' end);
+          l_names.append(trim(str(l_p, 'name')));
+        end if;
+      end if;
+    end loop;
+
+    if l_static is null then
+      l_problem := 'no workflow static id';
+    else
+      savepoint fc_wf;
+      begin
+        l_wid := apex_workflow.start_workflow(
+                   p_application_id => l_app,
+                   p_static_id      => l_static,
+                   p_detail_pk      => l_detail,
+                   p_parameters     => l_params);
+        if l_wid is null then l_problem := 'the workflow did not start'; end if;
+      exception when others then
+        l_problem := substr(sqlerrm, 1, 4000);
+        l_text    := db_error_text;
+        apex_debug.error('FlowChat: workflow %s did not start: %s', l_static, sqlerrm);
+        undo_to('fc_wf');
+      end;
+    end if;
+
+    if l_problem is null and str(p_node, 'resultSlot') is not null then
+      c.slots.put(str(p_node, 'resultSlot'), l_wid);
+      touch(c, str(p_node, 'resultSlot'));
+    end if;
+
+    if dbg_enabled(c) then
+      l_ev := json_object_t();
+      l_ev.put('event', 'workflow');
+      l_ev.put('node', l_id);
+      l_ev.put('workflow', l_static);
+      l_ev.put('parameters', l_names);
+      if l_problem is null then l_ev.put('workflowId', l_wid); else l_ev.put('error', l_problem); end if;
+      dbg(c, l_id, l_ev);
+    end if;
+
+    if l_problem is not null then
+      add_msg(c, 'error', nvl(l_text, interpolate(nvl(str(p_node, 'errorMessage'),
+                                                      'Sorry, I couldn''t start that request right now.'), vals(c))));
+      if str(p_node, 'onError') is null then return failed(c); end if;
+      return str(p_node, 'onError');
+    end if;
+    add_msg(c, 'text', interpolate(str(p_node, 'message'), vals(c)));
+    return str(p_node, 'next');
+  end run_workflow;
+
   function run_rest (c in out nocopy t_ctx, p_node in json_object_t, p_quiet in boolean) return varchar2 is
     l_id      varchar2(200)  := str(p_node, 'id');
     l_map     json_object_t  := obj(p_node, 'map');
@@ -3872,7 +3969,7 @@ create or replace package body fc_engine as
         l_id := str(l_n, 'verified');
       elsif l_type = 'bulkUpdate' then
         l_id := str(l_n, 'done');
-      elsif l_type in ('message', 'lookup', 'set', 'email', 'rest') then
+      elsif l_type in ('message', 'lookup', 'set', 'email', 'rest', 'workflow') then
         l_id := str(l_n, 'next');
       else
         exit;
@@ -3936,6 +4033,15 @@ create or replace package body fc_engine as
             l_id := str(l_node, 'next');
           else
             l_id := run_rest(c, l_node, c.replay);
+            if l_id is null and str(c.state, 'status') = 'failed' then return; end if;
+          end if;
+
+        when 'workflow' then
+          -- Replaying an edit never starts the workflow again.
+          if c.replay then
+            l_id := str(l_node, 'next');
+          else
+            l_id := run_workflow(c, l_node);
             if l_id is null and str(c.state, 'status') = 'failed' then return; end if;
           end if;
 
