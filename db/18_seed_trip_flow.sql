@@ -1293,7 +1293,9 @@ begin
             "kind": "text",
             "minLength": 2,
             "maxLength": 100
-          }
+          },
+          "note": "For a flight, the airline and flight number (e.g. LH 401); for a train, the operator and train number.",
+          "noteStyle": "tip"
         }
       ],
       "next": "export_gate",
@@ -1315,7 +1317,8 @@ begin
         "kind": "yesno"
       },
       "next": "has_devices",
-      "skipIfFilled": true
+      "skipIfFilled": true,
+      "note": "Count everything you carry: laptop, phone, tablet, USB drives."
     },
     {
       "id": "has_devices",
@@ -1500,7 +1503,9 @@ begin
         "kind": "yesno"
       },
       "next": "clr_visa",
-      "skipIfFilled": true
+      "skipIfFilled": true,
+      "note": "Many countries need your passport to be valid for at least 6 months after you return.",
+      "noteStyle": "warning"
     },
     {
       "id": "clr_visa",

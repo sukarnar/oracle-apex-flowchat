@@ -4225,6 +4225,29 @@ create or replace package body fc_engine as
   end run;
 
   -- The Ask node, field or agent output being answered right now, when it is hidden ("redact").
+  -- The definition of what is being asked now: the Ask (or menu) node, or the list's / record's field.
+  function current_field (c in out nocopy t_ctx) return json_object_t is
+    l_cur  varchar2(200) := str(c.state, 'current');
+    l_node json_object_t;
+    l_rs   json_object_t;
+  begin
+    if l_cur is null or not c.nodes.has(l_cur) then return null; end if;
+    l_node := get_node(c, l_cur);
+    case str(l_node, 'type')
+      when 'ask' then return l_node;
+      when 'menu' then return l_node;
+      when 'changeFields' then
+        if str(c.state, 'editingField') is not null then return field_def(l_node, str(c.state, 'editingField')); end if;
+      when 'repeat' then
+        l_rs := rp_state(c, l_cur);
+        if l_rs is not null then
+          return treat(arr(l_node, 'fields').get(nvl(to_num(str(l_rs, 'field')), 0)) as json_object_t);
+        end if;
+      else null;
+    end case;
+    return null;
+  end current_field;
+
   function current_redact (c in out nocopy t_ctx) return json_object_t is
     l_cur  varchar2(200) := str(c.state, 'current');
     l_node json_object_t;
@@ -4255,6 +4278,9 @@ create or replace package body fc_engine as
   function build_turn (c in out nocopy t_ctx) return clob is
     l_turn    json_object_t := json_object_t();
     l_red     json_object_t;
+    l_nd      json_object_t;
+    l_n       json_object_t;
+    l_note    varchar2(4000);
     l_aw      json_object_t;
     l_node    json_object_t;
     l_type    varchar2(30);
@@ -4501,6 +4527,19 @@ create or replace package body fc_engine as
     l_turn.put('status', str(c.state, 'status'));
     l_turn.put('messages', json_array_t.parse(mask_display(c, c.out_msgs.to_clob)));
     if l_aw is not null then
+      -- An information note shown with the question while it is being answered; empty = none.
+      if str(l_aw, 'type') = 'ask' then
+        l_nd := current_field(c);
+        if l_nd is not null and str(l_nd, 'note') is not null then
+          l_note := trim(interpolate(str(l_nd, 'note'), l_view));
+          if l_note is not null then
+            l_n := json_object_t();
+            l_n.put('text', l_note);
+            l_n.put('style', case when str(l_nd, 'noteStyle') in ('info', 'tip', 'warning') then str(l_nd, 'noteStyle') else 'info' end);
+            l_aw.put('note', l_n);
+          end if;
+        end if;
+      end if;
       l_aw := json_object_t.parse(mask_display(c, l_aw.to_clob));
       if str(l_aw, 'type') = 'ask' and not get_bool(l_aw, 'menu') then l_red := current_redact(c); end if;
       if l_red is not null then

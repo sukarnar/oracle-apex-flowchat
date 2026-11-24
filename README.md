@@ -56,6 +56,7 @@ tests/      engine.test.js           node tests/engine.test.js
             phase-e.test.js          node tests/phase-e.test.js (versions, debug, PII, resume, Repeat, Bulk update, files)
             set.test.js              node tests/set.test.js (Set values node, context variables)
             redact.test.js           node tests/redact.test.js (hidden answers: masked input, chat and logs)
+            note.test.js             node tests/note.test.js (information notes on questions)
             menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
             email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
             rest.test.js             node tests/rest.test.js (REST call node: URL building, body template, mapping, routing, refusals, replay)
@@ -641,6 +642,13 @@ defines in `FC_DATA_SOURCES` and `FC_DATA_SOURCE_FIELDS` (see `db/06_demo_data_s
 - **Leaving a step out of the summary:** `"inSummary": false` on an Ask or Repeat (designer: Ask →
   Advanced → **Show in the summary**) keeps it off the summary, for example a "which trip?" picker. It
   still counts as answered. The trip_booking sample uses it.
+- **Information notes:** `"note"` on an Ask, a Menu, or a Repeat or Change fields field shows a box
+  above the answer while that question is open, for example
+  `"note": "Use the name exactly as it appears on your passport."`. `"noteStyle"` is `info` (the
+  default), `tip` or `warning`. `{{field}}` placeholders are filled in, and hidden answers stay masked.
+  A note that comes out empty isn't shown. The note isn't a chat message, so it doesn't stay in the
+  history once the question is answered. Designer: **Note** and **Note style** under the question;
+  nodes with a note show a "Note" chip. The trip_booking sample has three.
 - **saveChanges**: re-validates every changed field and checks it's editable and updatable, then
   updates only those columns, guarded by the version. Its exits:
   - `saved`: the update succeeded.
@@ -1063,7 +1071,8 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 { "sessionId": "9F3A...", "flowId": "loan_application", "version": 1, "status": "in_progress",
   "messages": [ { "type": "error", "text": "The maximum is $500,000." } ],
   "await": { "type": "ask", "nodeId": "ask_amount", "slot": "amount", "label": "Loan amount",
-             "input": { "kind": "number", "min": 1000, "max": 500000, "prefix": "$" }, "value": null },
+             "input": { "kind": "number", "min": 1000, "max": 500000, "prefix": "$" }, "value": null,
+             "note": { "text": "Most loans are between $10,000 and $50,000.", "style": "info" } },
   "fieldUpdates": [ { "slot": "email", "value": "a@b.co", "display": "a@b.co",
                       "binding": { "apex": "P10_EMAIL", "dom": "#email" } } ],
   "progress": { "done": 1, "total": 6 }, "canGoBack": true }
@@ -1071,7 +1080,7 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 126 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
+- The JavaScript engine and widget are tested: 132 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
   `tests/email.test.js`, `tests/agent.test.js`, `tests/rest.test.js`), plus manual end-to-end runs of the demos.

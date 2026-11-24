@@ -547,8 +547,9 @@
         if (a.from === oldSlot) a.from = newSlot;
         if (typeof a.template === 'string') a.template = a.template.replace(re, '{{' + newSlot + '}}');
       });
-      ['text', 'prompt', 'to', 'cc', 'bcc', 'replyTo', 'from', 'subject', 'body', 'message', 'errorMessage']
+      ['text', 'prompt', 'note', 'to', 'cc', 'bcc', 'replyTo', 'from', 'subject', 'body', 'message', 'errorMessage']
         .forEach((k) => { if (typeof n[k] === 'string') n[k] = n[k].replace(re, '{{' + newSlot + '}}'); });
+      (n.fields || []).forEach((fd) => { if (fd && typeof fd.note === 'string') fd.note = fd.note.replace(re, '{{' + newSlot + '}}'); });
       if (n.type === 'email' && n.attachments) n.attachments = n.attachments.map((s) => (s === oldSlot ? newSlot : s));
       if (n.type === 'workflow') {
         if (n.resultSlot === oldSlot) n.resultSlot = newSlot;
@@ -806,6 +807,7 @@
           if (!opts.length) add('error', 'Menu has no options.', n.id);
           if (!n.prompt) add('warning', 'Menu has no question text; only the buttons are shown.', n.id);
           else placeholders(n.prompt, n.id);
+          if (n.note) placeholders(n.note, n.id);
           if (n.slot) {
             if (n.slot === BUILTIN_USER) add('error', '"' + BUILTIN_USER + '" is set by the server and can\'t be changed.', n.id);
             else if (!/^[a-z][a-z0-9_]{0,99}$/.test(n.slot)) add('error', 'Field name "' + n.slot + '" must be lowercase letters, digits and _.', n.id);
@@ -829,6 +831,7 @@
           else if (!/^[a-z][a-z0-9_]{0,99}$/.test(n.slot)) add('error', 'Field name "' + n.slot + '" must be lowercase letters, digits and _.', n.id);
           if (!n.prompt) add('error', 'Ask has no question text.', n.id);
           placeholders(n.prompt, n.id);
+          if (n.note) placeholders(n.note, n.id);
           checkChoice(spec, n.id, 'Choice question');
           if (spec.kind === 'number' && isFilled(spec.min) && isFilled(spec.max) && spec.min > spec.max) add('error', 'Minimum is greater than maximum.', n.id);
           if (spec.kind === 'file') {
@@ -857,6 +860,7 @@
             if (spec.kind === 'file') add('error', 'Item fields can\'t be file answers. Use a separate Ask step for the file.', n.id);
             checkChoice(spec, n.id, 'Choice field "' + fd.field + '"');
             checkValidators(fd.validators, n.id);
+            if (fd.note) placeholders(fd.note, n.id);
           });
           const itemNames = (n.fields || []).map((fd) => fd.field).concat(['n', 'item', 'count', 'min', 'max', 'title']);
           [n.prompt].concat((n.fields || []).map((fd) => fd.prompt)).forEach((t) => placeholders(String(t || '')
@@ -1243,6 +1247,8 @@
       if (n.type === 'bulkUpdate') (n.criteria || []).forEach((c) => chips.push(h('span', { class: 'chip', text: c.field + ' ' + (c.op || 'eq') + ' ' + c.slot })));
       const hid = n.redact || ((n.type === 'changeFields' || n.type === 'repeat') && (n.fields || []).some((f) => f.redact))
         || (n.type === 'agent' && (n.outputs || []).some((o) => o && o.redact));
+      if (n.note || ((n.type === 'changeFields' || n.type === 'repeat') && (n.fields || []).some((f) => f && f.note)))
+        chips.push(h('span', { class: 'chip', text: 'Note', title: 'Shows an information note while the question is answered' }));
       if (hid) chips.push(h('span', { class: 'chip', text: 'Hidden', title: 'Hidden on screen and masked in logs' }));
       else if (n.pii || (n.type === 'ask' && (S.flow.piiSlots || []).indexOf(n.slot) >= 0)) chips.push(h('span', { class: 'chip', text: 'PII', title: 'Masked in logs' }));
       if (chips.length) el.append(h('div', { class: 'nchips' }, chips));
@@ -1650,6 +1656,7 @@
       F('Label', bound(() => n.label, (v) => setOrDelete(n, 'label', v), { key: n.id + '.label' }))));
     const prompt = bound(() => n.prompt, (v) => setOrDelete(n, 'prompt', v), { multiline: true, key: n.id + '.prompt' });
     wrap.append(F('Question', prompt), slotChips(prompt));
+    wrap.append(noteEditor(n, n.id));
 
     wrap.append(answerEditor(n, n.id, { file: true }));
 
@@ -1666,6 +1673,18 @@
         F('Too large / long message', bound(() => spec.maxMessage, (v) => setIn('maxMessage', v), { key: n.id + '.maxm' }))));
     wrap.append(adv);
     return wrap;
+  }
+
+  // Information note shown with the question while the user answers it (Ask, Menu, list and record fields).
+  const NOTE_STYLES = [['info', 'Information'], ['tip', 'Tip'], ['warning', 'Warning']];
+  function noteEditor(o, kp) {
+    const ta = bound(() => o.note, (v) => setOrDelete(o, 'note', v),
+      { multiline: true, rows: 2, key: kp + '.note', placeholder: '(optional) e.g. Use the name exactly as it appears on your passport.' });
+    return h('div', null,
+      F('Note', ta, 'Shown in a box above the answer while this question is open. {{field}} placeholders work; leave empty for none.'),
+      h('div', { class: 'grid2' },
+        F('Note style', sel(NOTE_STYLES, o.noteStyle || 'info', (v) => mutate(() => setOrDelete(o, 'noteStyle', v === 'info' ? null : v)))),
+        h('span')));
   }
 
   // Answer type + constraints for anything with an .input spec (Ask nodes, Change-fields fields).
@@ -2034,7 +2053,8 @@
     f.nodes.forEach((n) => {
       if (n.type === 'findRecord' && n.as === oldA) n.as = newA;
       if (n.record === oldA) n.record = newA;
-      ['text', 'prompt', 'cardTitle', 'againPrompt'].forEach((k) => { n[k] = fixText(n[k]); });
+      ['text', 'prompt', 'note', 'cardTitle', 'againPrompt'].forEach((k) => { n[k] = fixText(n[k]); });
+      (n.fields || []).forEach((fd) => { if (fd && fd.note) fd.note = fixText(fd.note); });
       if (n.prompts) Object.keys(n.prompts).forEach((k) => { n.prompts[k] = fixText(n.prompts[k]); });
       (n.branches || []).forEach((b) => fixCond(b.when));
       if (n.type === 'changeFields') (n.fields || []).forEach((fd) => { fixCond(fd.editableWhen); fd.prompt = fixText(fd.prompt); });
@@ -2249,7 +2269,7 @@
         F('Label', bound(() => fd.label, (v) => setOrDelete(fd, 'label', v), { key: kp + '.lb' }))));
       det.append(F('Question (optional)', bound(() => fd.prompt, (v) => setOrDelete(fd, 'prompt', v),
         { key: kp + '.pq', placeholder: (fd.label || 'Field') + ' is currently …. What should it be?' })));
-      det.append(answerEditor(fd, kp), validatorsEditor(fd, kp), h('h4', { class: 'sub', text: 'Lock' }), editableWhenEditor(fd, kp));
+      det.append(noteEditor(fd, kp), answerEditor(fd, kp), validatorsEditor(fd, kp), h('h4', { class: 'sub', text: 'Lock' }), editableWhenEditor(fd, kp));
       wrap.append(det);
     });
     if (n.record) {
@@ -2548,6 +2568,7 @@
     const list = n.options = n.options || [];
     const pr = bound(() => n.prompt, (v) => setOrDelete(n, 'prompt', v), { key: n.id + '.mp', placeholder: 'What would you like to do?', multiline: true });
     wrap.append(F('Question', pr), slotChips(pr));
+    wrap.append(noteEditor(n, n.id));
     wrap.append(h('p', { class: 'hint', text: 'The options show as buttons (pills); the user can also type an option\'s label or number. ' +
       'Each option goes to its own step. A menu shows again every time the flow reaches it, so later steps can loop back to it.' }));
     const slots = knownSlots().filter((s) => s !== BUILTIN_USER).concat([BUILTIN_USER]);
@@ -2683,7 +2704,7 @@
         F('Field', bound(() => fd.field, (v) => { fd.field = v.trim(); }, { mono: true, key: kp + '.fn', onChange: true, panel: true })),
         F('Label', bound(() => fd.label, (v) => setOrDelete(fd, 'label', v), { key: kp + '.lb' }))));
       det.append(F('Question', bound(() => fd.prompt, (v) => setOrDelete(fd, 'prompt', v), { key: kp + '.pq', placeholder: (fd.label || 'Field') + ' for {{item}} {{n}}?' })));
-      det.append(answerEditor(fd, kp), validatorsEditor(fd, kp));
+      det.append(noteEditor(fd, kp), answerEditor(fd, kp), validatorsEditor(fd, kp));
       wrap.append(det);
     });
     wrap.append(h('button', { class: 'lnk', text: '+ Add question', onclick: () => mutate(() => {

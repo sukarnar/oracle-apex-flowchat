@@ -519,6 +519,7 @@
       return !!(d && piiOf(d));
     }
     // The Ask node, field or agent output the user is answering right now (null for menus etc.).
+    var NOTE_STYLES = ['info', 'tip', 'warning'];
     function currentDef(ctx) {
       var st = ctx.st, n = ctx.nodes[st.current];
       if (!n) return null;
@@ -2384,6 +2385,12 @@
           aw = { type: 'confirm', nodeId: n.id, confirmLabel: interpolate(n.confirmLabel || 'Update {{count}}', bv),
                  cancelLabel: n.cancelLabel || 'Cancel', danger: true };
         }
+      }
+      // An information note shown with the question while it is being answered (Ask, menu, a list's or a
+      // record's field). {{placeholders}} are filled in; an empty result shows no note.
+      if (aw && aw.type === 'ask') {
+        var nd = aw.menu ? ctx.nodes[st.current] : currentDef(ctx), nt = nd && typeof nd.note === 'string' ? interpolate(nd.note, v).trim() : '';
+        if (nt) aw.note = { text: nt, style: NOTE_STYLES.indexOf(nd.noteStyle) >= 0 ? nd.noteStyle : 'info' };
       }
       var rp = redactPairs(ctx), msgs = maskDeep(ctx.out, rp);
       if (aw) {

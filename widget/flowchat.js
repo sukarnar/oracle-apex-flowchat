@@ -240,6 +240,10 @@
     '.tools{display:flex;justify-content:space-between;gap:8px;font-size:12.5px}',
     '.link{background:none;border:0;padding:0;color:var(--fc-muted);font:inherit;cursor:pointer}.link:hover{color:var(--fc-text)}',
     '.hint{color:var(--fc-muted)}',
+    '.note{display:flex;gap:8px;align-items:flex-start;margin:0 0 10px;padding:9px 11px;border-radius:10px;font-size:13.5px;line-height:1.45;',
+    'border:1px solid color-mix(in srgb,var(--fc-note) 35%,transparent);background:color-mix(in srgb,var(--fc-note) 9%,var(--fc-bg));color:var(--fc-text);white-space:pre-line}',
+    '.note svg{width:17px;height:17px;flex:none;margin-top:1px;color:var(--fc-note)}',
+    '.note.info{--fc-note:#2563eb}.note.tip{--fc-note:#0d9488}.note.warning{--fc-note:#d97706}',
     '.busy .composer{opacity:.6;pointer-events:none}',
     '.row.ro{grid-template-columns:minmax(90px,40%) 1fr}',
     's.before{color:var(--fc-muted)}.arrow{color:var(--fc-muted)}',
@@ -309,6 +313,12 @@
   var ICON_MIN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 12h12"/></svg>';
   var ICON_X = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
   var ICON_UP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 15l6-6 6 6"/></svg>';
+  // Information note icons (Ask "note"): info, tip (light bulb), warning.
+  var NOTE_ICONS = {
+    info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>',
+    tip: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.3h6c0-1 .4-1.8 1-2.3A7 7 0 0 0 12 2z"/></svg>',
+    warning: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>'
+  };
   var ICON_EYE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
   var ICON_EYE_OFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.9 17.9A10.4 10.4 0 0 1 12 19c-6.5 0-10-7-10-7a18.5 18.5 0 0 1 4.2-5.1M9.9 5.2A9.7 9.7 0 0 1 12 5c6.5 0 10 7 10 7a18.6 18.6 0 0 1-2.2 3.2M14.1 14.1a3 3 0 0 1-4.2-4.2M2 2l20 20"/></svg>';
   // Browsers that can disc-mask a text box (Chromium, Safari) avoid type=password, so password
@@ -883,7 +893,16 @@
         c.append(again);
         return;
       }
-      var a = turn['await'], spec = a.input || {}, focusEl = null;
+      var a = turn['await'], spec = a.input || {}, focusEl = null, note = null;
+
+      // The question's information note, shown above the answer while it is being answered.
+      if (a.note && a.note.text) {
+        var nst = a.note.style in NOTE_ICONS ? a.note.style : 'info';
+        note = h('div', 'note ' + nst); note.id = 'fc-note'; note.setAttribute('role', 'note');
+        var ic = h('span'); ic.innerHTML = NOTE_ICONS[nst]; ic.setAttribute('aria-hidden', 'true');
+        note.append(ic.firstChild, h('span', null, a.note.text));
+        c.append(note);
+      }
 
       if (a.type === 'summary') {
         var ok = h('button', 'btn primary', a.confirmLabel || 'Confirm'); ok.type = 'button';
@@ -1061,6 +1080,7 @@
         tools.append(h('span', 'hint', 'Step ' + Math.min(turn.progress.done + 1, turn.progress.total) + ' of ~' + turn.progress.total));
       }
       c.append(tools);
+      if (focusEl && note) focusEl.setAttribute('aria-describedby', 'fc-note');   // screen readers read the note with the field
       if (focusEl) setTimeout(function () { focusEl.focus({ preventScroll: true }); }, 30);
     }
   }
@@ -1071,7 +1091,7 @@
   FlowChatElement.DomAdapter = DomAdapter;
   FlowChatElement.ApexAdapter = ApexAdapter;
   FlowChatElement.NoneAdapter = NoneAdapter;
-  FlowChatElement.version = '1.3.0';   // 1.2.0: floating mode (display="floating")
+  FlowChatElement.version = '1.4.0';   // 1.4.0: information notes; 1.2.0: floating mode (display="floating")
   // Only one copy can define <flow-chat>. If an older one got there first (for example
   // #APP_FILES#flowchat.js next to the region plugin), say so instead of failing silently.
   var existing = customElements.get('flow-chat');
