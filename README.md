@@ -10,6 +10,7 @@ flows/      loan_application.json    sample "create" flow (collect answers, subm
             update_application.json  sample "search and update" flow (find, change, review, save)
             update_application_public.json  same, for public pages: verifies a one-time code first
             expense_claim.json       Phase E sample: line items (Repeat), a file answer, a PII answer, debug logging
+            trip_booking.json        sample: new trip, change a saved one, or cancel one; contacts and destinations (Repeat), export/clearance questions, save, approval workflow
             flow.schema.json         JSON Schema for flow definitions
 designer/   index.html               visual flow designer (no dependencies)
 apex/       region_type_plugin_com_flowchat_designer.sql  APEX region plugin "FlowChat Designer" (import in App Builder)
@@ -40,6 +41,7 @@ db/         install.sql              first-time install: runs 01..07, 09..12 in 
             15_ai_tables.sql         FC_AI_PROVIDERS, FC_AI_TOOLS, FC_AI_SKILLS (Agent node registries)
             16_seed_agent_demo.sql   Agent demo: FC_DEMO_LEAVE tables and connectors, 3 tools, a skill, flow leave_agent_demo
             17_rest_endpoints.sql    FC_REST_ENDPOINTS (the APIs a REST call node may call)
+            18_seed_trip_flow.sql    Trip booking sample: TRIPS tables, FYyy-n itinerary numbers, 5 connectors, approval/cancel emails, flow trip_booking
 demo/       index.html               create demo (runs in the browser using the JS engine)
             update.html              search and update demo, with a live table and a conflict button
             verify.html              public-page demo: one-time code first, with an in-page outbox
@@ -58,6 +60,7 @@ tests/      engine.test.js           node tests/engine.test.js
             email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
             rest.test.js             node tests/rest.test.js (REST call node: URL building, body template, mapping, routing, refusals, replay)
             workflow.test.js         node tests/workflow.test.js (Workflow node: parameters, date masks, id, errors, replay)
+            trip.test.js             node tests/trip.test.js (trip_booking sample flow, end to end)
             agent.test.js            node tests/agent.test.js (Agent node, scripted model: questions, tools, confirm, finish, handoff, limits, JSON mode, pick_record, files, PII placeholders, set_field, REST tools)
             apex-embed-test.html     designer inside a page-wide form, like APEX
             apex-designer-db-test.html  designer in database mode against a fake FC_DESIGNER back end
@@ -635,6 +638,9 @@ defines in `FC_DATA_SOURCES` and `FC_DATA_SOURCE_FIELDS` (see `db/06_demo_data_s
   `editableWhen` to lock a field conditionally, for example the amount once the status isn't `NEW`.
   **Done** goes to `done`, or to `noChanges` if nothing changed.
 - **summary** with `"mode": "changes"` shows only the changed fields as old → new, each with Edit.
+- **Leaving a step out of the summary:** `"inSummary": false` on an Ask or Repeat (designer: Ask →
+  Advanced → **Show in the summary**) keeps it off the summary, for example a "which trip?" picker. It
+  still counts as answered. The trip_booking sample uses it.
 - **saveChanges**: re-validates every changed field and checks it's editable and updatable, then
   updates only those columns, guarded by the version. Its exits:
   - `saved`: the update succeeded.
@@ -1065,7 +1071,7 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 110 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/workflow.test.js`,
+- The JavaScript engine and widget are tested: 126 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
   `tests/email.test.js`, `tests/agent.test.js`, `tests/rest.test.js`), plus manual end-to-end runs of the demos.

@@ -3839,7 +3839,8 @@ create or replace package body fc_engine as
       l_nodes := c.flow.get_array('nodes');
       for i in 0 .. l_nodes.get_size - 1 loop
         l_n := treat(l_nodes.get(i) as json_object_t);
-        if str(l_n, 'type') in ('ask', 'repeat') and str(c.slots, str(l_n, 'slot')) is not null then
+        if str(l_n, 'type') in ('ask', 'repeat') and nvl(str(l_n, 'inSummary'), 'true') <> 'false'
+           and str(c.slots, str(l_n, 'slot')) is not null then
           add_item(str(l_n, 'slot'));
         elsif str(l_n, 'type') = 'agent' then
           l_outs := arr(l_n, 'outputs');

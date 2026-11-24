@@ -28,7 +28,8 @@
     { file: 'loan_application.json', label: 'Loan application', desc: 'Create: ask, branch, summary, submit' },
     { file: 'leave_agent_demo.json', label: 'Leave assistant (agent)', desc: 'Agent: gather then submit, book with a write tool, answer questions' },
     { file: 'update_application.json', label: 'Update application', desc: 'Search & update: find, change, save' },
-    { file: 'update_application_public.json', label: 'Update (public page)', desc: 'Verify a one-time code, then find and update' }
+    { file: 'update_application_public.json', label: 'Update (public page)', desc: 'Verify a one-time code, then find and update' },
+    { file: 'trip_booking.json', label: 'Trip booking', desc: 'Contacts and destinations (Repeat), export and clearance questions, save, approval workflow' }
   ];
   const STANDALONE = document.body.classList.contains('fcd-page');
 
@@ -1657,6 +1658,7 @@
 
     const adv = h('details', { class: 'adv' }, h('summary', { text: 'Advanced: messages & behaviour' }),
       checkbox('Skip if already filled (e.g. by a lookup or page context)', n.skipIfFilled, (c) => mutate(() => setOrDelete(n, 'skipIfFilled', c || null))),
+      checkbox('Show in the summary', n.inSummary !== false, (c) => mutate(() => { if (c) delete n.inSummary; else n.inSummary = false; })),
       F('Required message', bound(() => spec.requiredMessage, (v) => setIn('requiredMessage', v), { key: n.id + '.rm', placeholder: 'This one is required…' })),
       F('Unrecognised answer message', bound(() => spec.parseMessage, (v) => setIn('parseMessage', v), { key: n.id + '.pm' })),
       h('div', { class: 'grid2' },

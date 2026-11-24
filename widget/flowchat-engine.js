@@ -1610,7 +1610,8 @@
       var slots = node.fields || [];
       if (!node.fields) {
         ctx.flow.nodes.forEach(function (n) {
-          if ((n.type === 'ask' || n.type === 'repeat') && isFilled(ctx.st.slots[n.slot])) slots.push(n.slot);
+          // "inSummary": false leaves a step out (e.g. a "which record?" picker); it still counts as answered.
+          if ((n.type === 'ask' || n.type === 'repeat') && n.inSummary !== false && isFilled(ctx.st.slots[n.slot])) slots.push(n.slot);
           if (n.type === 'agent') agentOutputs(n).forEach(function (o) { if (isFilled(ctx.st.slots[o.name])) slots.push(o.name); });
         });
       }

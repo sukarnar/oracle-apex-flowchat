@@ -1,0 +1,1030 @@
+{
+  "flowId": "trip_booking",
+  "name": "Book a trip",
+  "version": 1,
+  "debug": true,
+  "start": "welcome",
+  "bindings": {
+    "travel_type": {
+      "dom": "#travel_type",
+      "apex": "P30_TRAVEL_TYPE"
+    },
+    "business_purpose": {
+      "dom": "#business_purpose",
+      "apex": "P30_BUSINESS_PURPOSE"
+    },
+    "trip_id": {
+      "dom": "#trip_id",
+      "apex": "P30_TRIP_ID"
+    },
+    "itinerary_no": {
+      "dom": "#itinerary_no",
+      "apex": "P30_ITINERARY_NO"
+    },
+    "trip_status": {
+      "dom": "#trip_status",
+      "apex": "P30_STATUS"
+    },
+    "trip_mode": {
+      "dom": "#trip_mode",
+      "apex": "P30_TRIP_MODE"
+    }
+  },
+  "nodes": [
+    {
+      "id": "welcome",
+      "type": "message",
+      "text": "Hi {{app_user}}, I can book a new trip, or change or cancel one you've booked.",
+      "next": "init"
+    },
+    {
+      "id": "init",
+      "type": "set",
+      "assign": [
+        {
+          "slot": "editable_trips",
+          "value": 0,
+          "onlyIfEmpty": true
+        },
+        {
+          "slot": "cancellable_trips",
+          "value": 0,
+          "onlyIfEmpty": true
+        },
+        {
+          "slot": "cancel_note",
+          "value": "",
+          "onlyIfEmpty": true
+        },
+        {
+          "slot": "approver_email",
+          "value": "",
+          "onlyIfEmpty": true
+        },
+        {
+          "slot": "approver_name",
+          "value": "",
+          "onlyIfEmpty": true
+        },
+        {
+          "slot": "trip_summary",
+          "value": "",
+          "onlyIfEmpty": true
+        },
+        {
+          "slot": "previous_status",
+          "value": "",
+          "onlyIfEmpty": true
+        },
+        {
+          "slot": "approval_task_note",
+          "value": "",
+          "onlyIfEmpty": true
+        },
+        {
+          "slot": "rejection_note",
+          "value": "",
+          "onlyIfEmpty": true
+        }
+      ],
+      "next": "load_profile"
+    },
+    {
+      "id": "load_profile",
+      "type": "lookup",
+      "connector": "trip_get_profile",
+      "next": "has_saved"
+    },
+    {
+      "id": "has_saved",
+      "type": "condition",
+      "branches": [
+        {
+          "when": {
+            "any": [
+              {
+                "slot": "editable_trips",
+                "op": ">",
+                "value": 0
+              },
+              {
+                "slot": "cancellable_trips",
+                "op": ">",
+                "value": 0
+              }
+            ]
+          },
+          "next": "choose_mode"
+        }
+      ],
+      "else": "start_new"
+    },
+    {
+      "id": "choose_mode",
+      "type": "menu",
+      "slot": "trip_mode",
+      "prompt": "What would you like to do?",
+      "options": [
+        {
+          "value": "NEW",
+          "label": "Book a new trip",
+          "next": "start_new"
+        },
+        {
+          "value": "EDIT",
+          "label": "Change a saved trip",
+          "next": "pick_trip",
+          "when": {
+            "slot": "editable_trips",
+            "op": ">",
+            "value": 0
+          }
+        },
+        {
+          "value": "CANCEL",
+          "label": "Cancel a trip",
+          "next": "pick_cancel",
+          "when": {
+            "slot": "cancellable_trips",
+            "op": ">",
+            "value": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "start_new",
+      "type": "set",
+      "assign": [
+        {
+          "slot": "trip_mode",
+          "value": "NEW",
+          "onlyIfEmpty": true
+        }
+      ],
+      "next": "new_intro"
+    },
+    {
+      "id": "new_intro",
+      "type": "message",
+      "text": "Let's book your trip. First your emergency contacts, then the trip, then a few export and clearance questions.",
+      "next": "contacts"
+    },
+    {
+      "id": "pick_trip",
+      "type": "ask",
+      "slot": "edit_trip_id",
+      "label": "Trip to change",
+      "inSummary": false,
+      "prompt": "Which trip do you want to change? You can change a trip that's saved or was rejected; trips waiting for approval or approved can't be changed here.",
+      "input": {
+        "kind": "choice",
+        "display": "buttons",
+        "optionsFrom": "trip_my_editable",
+        "emptyMessage": "You have no saved trips to change."
+      },
+      "next": "load_trip"
+    },
+    {
+      "id": "load_trip",
+      "type": "lookup",
+      "connector": "trip_load",
+      "next": "was_rejected",
+      "onNotFound": "load_failed"
+    },
+    {
+      "id": "was_rejected",
+      "type": "condition",
+      "branches": [
+        {
+          "when": {
+            "slot": "rejection_note",
+            "op": "notEmpty"
+          },
+          "next": "rejected_intro"
+        }
+      ],
+      "else": "edit_intro"
+    },
+    {
+      "id": "rejected_intro",
+      "type": "message",
+      "text": "I've opened trip {{itinerary_no}}. It was rejected: {{rejection_note}}. Check your emergency contacts first; then I'll show the whole trip so you can tap Edit on what needs to change, save it and send it for approval again.",
+      "next": "contacts"
+    },
+    {
+      "id": "load_failed",
+      "type": "end",
+      "text": "Sorry, I couldn't open that trip. It may have just been sent for approval. Please start again."
+    },
+    {
+      "id": "pick_cancel",
+      "type": "ask",
+      "slot": "cancel_trip_id",
+      "label": "Trip to cancel",
+      "inSummary": false,
+      "prompt": "Which trip do you want to cancel? (Trips that have already started can't be cancelled here.)",
+      "input": {
+        "kind": "choice",
+        "display": "buttons",
+        "optionsFrom": "trip_my_cancellable",
+        "emptyMessage": "You have no trips that can be cancelled."
+      },
+      "next": "cancel_reason"
+    },
+    {
+      "id": "cancel_reason",
+      "type": "ask",
+      "slot": "cancel_reason",
+      "label": "Reason for cancelling",
+      "inSummary": false,
+      "prompt": "Why are you cancelling it?",
+      "input": {
+        "kind": "text",
+        "minLength": 3,
+        "maxLength": 400
+      },
+      "next": "cancel_confirm"
+    },
+    {
+      "id": "cancel_confirm",
+      "type": "ask",
+      "slot": "cancel_confirm",
+      "label": "Confirm cancellation",
+      "inSummary": false,
+      "prompt": "Cancel this trip? A cancelled trip can't be reopened, and any approval in progress is withdrawn.",
+      "input": {
+        "kind": "yesno"
+      },
+      "next": "cancel_check"
+    },
+    {
+      "id": "cancel_check",
+      "type": "condition",
+      "branches": [
+        {
+          "when": {
+            "slot": "cancel_confirm",
+            "op": "=",
+            "value": "Y"
+          },
+          "next": "do_cancel"
+        }
+      ],
+      "else": "cancel_kept"
+    },
+    {
+      "id": "do_cancel",
+      "type": "lookup",
+      "connector": "trip_cancel",
+      "next": "cancelled_msg",
+      "onNotFound": "cancel_failed"
+    },
+    {
+      "id": "cancelled_msg",
+      "type": "message",
+      "text": "Trip {{itinerary_no}} is cancelled. {{cancel_note}}",
+      "next": "notify_check"
+    },
+    {
+      "id": "notify_check",
+      "type": "condition",
+      "branches": [
+        {
+          "when": {
+            "slot": "approver_email",
+            "op": "notEmpty"
+          },
+          "next": "notify_approver"
+        }
+      ],
+      "else": "cancelled_end"
+    },
+    {
+      "id": "notify_approver",
+      "type": "email",
+      "from": "travel-noreply@example.com",
+      "to": "{{approver_email}}",
+      "subject": "Trip {{itinerary_no}} cancelled by {{app_user}}",
+      "body": "Hello {{approver_name}},\n\n{{app_user}} has cancelled trip {{itinerary_no}}.\n\nTrip: {{trip_summary}}\nStatus before cancelling: {{previous_status}}\nReason: {{cancel_reason}}\n\n{{approval_task_note}}\n\nThis message was sent automatically by the travel assistant.",
+      "message": "I've emailed your approver, {{approver_name}}, to let them know.",
+      "errorMessage": "The trip is cancelled, but I couldn't email your approver. Please let {{approver_name}} know.",
+      "next": "cancelled_end"
+    },
+    {
+      "id": "cancelled_end",
+      "type": "end",
+      "text": "That's all done."
+    },
+    {
+      "id": "cancel_failed",
+      "type": "end",
+      "text": "The trip was not cancelled. If you still need to cancel it, please contact the travel desk."
+    },
+    {
+      "id": "cancel_kept",
+      "type": "end",
+      "text": "OK, I haven't cancelled anything."
+    },
+    {
+      "id": "edit_intro",
+      "type": "message",
+      "text": "I've opened trip {{itinerary_no}}. Check your emergency contacts first; then I'll show the whole trip, and you can tap Edit on anything you want to change.",
+      "next": "contacts"
+    },
+    {
+      "id": "export_gate",
+      "type": "condition",
+      "branches": [
+        {
+          "when": {
+            "slot": "trip_mode",
+            "op": "=",
+            "value": "EDIT"
+          },
+          "next": "exp_devices"
+        }
+      ],
+      "else": "export_intro"
+    },
+    {
+      "id": "clearance_gate",
+      "type": "condition",
+      "branches": [
+        {
+          "when": {
+            "slot": "trip_mode",
+            "op": "=",
+            "value": "EDIT"
+          },
+          "next": "clr_passport"
+        }
+      ],
+      "else": "clearance_intro"
+    },
+    {
+      "id": "contacts",
+      "type": "repeat",
+      "slot": "emergency_contacts",
+      "label": "Emergency contacts",
+      "itemLabel": "contact",
+      "min": 1,
+      "max": 3,
+      "prompt": "These are your emergency contacts. Remove any that are out of date and add new ones, then tap Done.",
+      "itemTitle": "{{name}} ({{relationship}}, {{phone}})",
+      "addLabel": "Add a contact",
+      "firstAddLabel": "Add a contact",
+      "doneLabel": "Contacts are up to date",
+      "prompts": {
+        "tooFew": "Please add at least one emergency contact."
+      },
+      "fields": [
+        {
+          "field": "name",
+          "label": "Name",
+          "prompt": "Contact {{n}}: what's their full name?",
+          "input": {
+            "kind": "text",
+            "minLength": 2,
+            "maxLength": 100
+          }
+        },
+        {
+          "field": "relationship",
+          "label": "Relationship",
+          "prompt": "How is {{name}} related to you?",
+          "input": {
+            "kind": "choice",
+            "display": "buttons",
+            "options": [
+              {
+                "value": "SPOUSE",
+                "label": "Spouse / partner"
+              },
+              {
+                "value": "PARENT",
+                "label": "Parent"
+              },
+              {
+                "value": "CHILD",
+                "label": "Child"
+              },
+              {
+                "value": "SIBLING",
+                "label": "Sibling"
+              },
+              {
+                "value": "FRIEND",
+                "label": "Friend"
+              },
+              {
+                "value": "OTHER",
+                "label": "Other"
+              }
+            ]
+          }
+        },
+        {
+          "field": "phone",
+          "label": "Phone",
+          "pii": "last4",
+          "prompt": "What's {{name}}'s phone number?",
+          "input": {
+            "kind": "text",
+            "inputMode": "tel",
+            "minLength": 7,
+            "maxLength": 20
+          },
+          "validators": [
+            {
+              "type": "regex",
+              "pattern": "^\\+?[0-9 ()-]{7,20}$",
+              "message": "Please enter a phone number, for example +1 555 123 4567."
+            }
+          ]
+        },
+        {
+          "field": "email",
+          "label": "Email",
+          "pii": true,
+          "prompt": "And {{name}}'s email? (Optional: tap send to skip.)",
+          "input": {
+            "kind": "email",
+            "required": false
+          }
+        }
+      ],
+      "next": "ask_travel_type"
+    },
+    {
+      "id": "ask_travel_type",
+      "type": "ask",
+      "slot": "travel_type",
+      "label": "Travel type",
+      "prompt": "What kind of trip is this?",
+      "input": {
+        "kind": "choice",
+        "display": "buttons",
+        "options": [
+          {
+            "value": "PERSONAL",
+            "label": "Personal vacation"
+          },
+          {
+            "value": "OFFICIAL",
+            "label": "Official (business) travel"
+          },
+          {
+            "value": "BOTH",
+            "label": "Both official and personal"
+          }
+        ]
+      },
+      "next": "is_official",
+      "skipIfFilled": true
+    },
+    {
+      "id": "is_official",
+      "type": "condition",
+      "branches": [
+        {
+          "when": {
+            "slot": "travel_type",
+            "op": "in",
+            "value": [
+              "OFFICIAL",
+              "BOTH"
+            ]
+          },
+          "next": "ask_purpose"
+        }
+      ],
+      "else": "clear_purpose"
+    },
+    {
+      "id": "ask_purpose",
+      "type": "ask",
+      "slot": "business_purpose",
+      "label": "Business purpose",
+      "prompt": "What's the business purpose of the trip?",
+      "input": {
+        "kind": "text",
+        "minLength": 5,
+        "maxLength": 400
+      },
+      "next": "destinations",
+      "skipIfFilled": true
+    },
+    {
+      "id": "clear_purpose",
+      "type": "set",
+      "assign": [
+        {
+          "slot": "business_purpose",
+          "clear": true
+        }
+      ],
+      "next": "destinations"
+    },
+    {
+      "id": "destinations",
+      "type": "repeat",
+      "slot": "destinations",
+      "label": "Destinations",
+      "itemLabel": "destination",
+      "min": 1,
+      "max": 10,
+      "prompt": "Now your destinations, one stop at a time. You need at least one to save the trip.",
+      "itemTitle": "{{city}}, {{country}} ({{departure_date}} → {{arrival_date}}, {{travel_medium}} {{transport_name}})",
+      "addLabel": "Add another destination",
+      "firstAddLabel": "Add a destination",
+      "doneLabel": "That's all my destinations",
+      "prompts": {
+        "tooFew": "Please add at least one destination: a trip can't be saved without one."
+      },
+      "fields": [
+        {
+          "field": "city",
+          "label": "City",
+          "prompt": "Destination {{n}}: which city?",
+          "input": {
+            "kind": "text",
+            "minLength": 2,
+            "maxLength": 100
+          }
+        },
+        {
+          "field": "country",
+          "label": "Country",
+          "prompt": "Which country is {{city}} in?",
+          "input": {
+            "kind": "text",
+            "minLength": 2,
+            "maxLength": 100
+          }
+        },
+        {
+          "field": "departure_date",
+          "label": "Departure date",
+          "prompt": "When do you leave for {{city}}?",
+          "input": {
+            "kind": "date",
+            "minDate": "today"
+          }
+        },
+        {
+          "field": "arrival_date",
+          "label": "Arrival date",
+          "prompt": "When do you arrive in {{city}}?",
+          "input": {
+            "kind": "date",
+            "minDate": "today"
+          }
+        },
+        {
+          "field": "travel_medium",
+          "label": "Travel medium",
+          "prompt": "How are you travelling to {{city}}?",
+          "input": {
+            "kind": "choice",
+            "display": "buttons",
+            "options": [
+              {
+                "value": "AIR",
+                "label": "Air"
+              },
+              {
+                "value": "SHIP",
+                "label": "Ship"
+              },
+              {
+                "value": "TRAIN",
+                "label": "Train"
+              },
+              {
+                "value": "BUS",
+                "label": "Bus"
+              },
+              {
+                "value": "CAR",
+                "label": "Car"
+              },
+              {
+                "value": "OTHER",
+                "label": "Other"
+              }
+            ]
+          }
+        },
+        {
+          "field": "transport_name",
+          "label": "Transportation name",
+          "prompt": "What's the airline, ship, train or company name (and number, if you have it)? For example: Lufthansa LH 401.",
+          "input": {
+            "kind": "text",
+            "minLength": 2,
+            "maxLength": 100
+          }
+        }
+      ],
+      "next": "export_gate",
+      "skipIfFilled": true
+    },
+    {
+      "id": "export_intro",
+      "type": "message",
+      "text": "Next, six export-control questions. Answer them for everything you'll carry or discuss on this trip.",
+      "next": "exp_devices"
+    },
+    {
+      "id": "exp_devices",
+      "type": "ask",
+      "slot": "exp_devices",
+      "label": "Export: company devices",
+      "prompt": "1/6: Will you take any company-issued devices (laptop, phone, tablet, storage)?",
+      "input": {
+        "kind": "yesno"
+      },
+      "next": "has_devices",
+      "skipIfFilled": true
+    },
+    {
+      "id": "has_devices",
+      "type": "condition",
+      "branches": [
+        {
+          "when": {
+            "slot": "exp_devices",
+            "op": "=",
+            "value": "Y"
+          },
+          "next": "exp_device_list"
+        }
+      ],
+      "else": "clear_devices"
+    },
+    {
+      "id": "exp_device_list",
+      "type": "ask",
+      "slot": "exp_device_list",
+      "label": "Export: devices taken",
+      "prompt": "Which devices? (For example: laptop SN-12345, phone.)",
+      "input": {
+        "kind": "text",
+        "minLength": 3,
+        "maxLength": 400
+      },
+      "next": "exp_tech_data",
+      "skipIfFilled": true
+    },
+    {
+      "id": "clear_devices",
+      "type": "set",
+      "assign": [
+        {
+          "slot": "exp_device_list",
+          "clear": true
+        }
+      ],
+      "next": "exp_tech_data"
+    },
+    {
+      "id": "exp_tech_data",
+      "type": "ask",
+      "slot": "exp_tech_data",
+      "label": "Export: technical data",
+      "prompt": "2/6: Will you carry, or access remotely, export-controlled technical data or source code?",
+      "input": {
+        "kind": "yesno"
+      },
+      "next": "exp_sanctioned",
+      "skipIfFilled": true
+    },
+    {
+      "id": "exp_sanctioned",
+      "type": "ask",
+      "slot": "exp_sanctioned",
+      "label": "Export: sanctioned country",
+      "prompt": "3/6: Does the trip include, or pass through, a sanctioned or embargoed country?",
+      "input": {
+        "kind": "yesno"
+      },
+      "next": "exp_foreign_officials",
+      "skipIfFilled": true
+    },
+    {
+      "id": "exp_foreign_officials",
+      "type": "ask",
+      "slot": "exp_foreign_officials",
+      "label": "Export: foreign officials",
+      "prompt": "4/6: Will you meet foreign government officials, or share technical information with foreign nationals?",
+      "input": {
+        "kind": "yesno"
+      },
+      "next": "exp_hardware",
+      "skipIfFilled": true
+    },
+    {
+      "id": "exp_hardware",
+      "type": "ask",
+      "slot": "exp_hardware",
+      "label": "Export: hardware or samples",
+      "prompt": "5/6: Will you take hardware, prototypes or product samples?",
+      "input": {
+        "kind": "yesno"
+      },
+      "next": "exp_encryption",
+      "skipIfFilled": true
+    },
+    {
+      "id": "exp_encryption",
+      "type": "ask",
+      "slot": "exp_encryption",
+      "label": "Export: encryption",
+      "prompt": "6/6: Will any device hold encryption software other than standard commercial tools (for example custom or military-grade encryption)?",
+      "input": {
+        "kind": "yesno"
+      },
+      "next": "needs_export_review",
+      "skipIfFilled": true
+    },
+    {
+      "id": "needs_export_review",
+      "type": "condition",
+      "branches": [
+        {
+          "when": {
+            "any": [
+              {
+                "slot": "exp_tech_data",
+                "op": "=",
+                "value": "Y"
+              },
+              {
+                "slot": "exp_sanctioned",
+                "op": "=",
+                "value": "Y"
+              },
+              {
+                "slot": "exp_foreign_officials",
+                "op": "=",
+                "value": "Y"
+              },
+              {
+                "slot": "exp_hardware",
+                "op": "=",
+                "value": "Y"
+              },
+              {
+                "slot": "exp_encryption",
+                "op": "=",
+                "value": "Y"
+              }
+            ]
+          },
+          "next": "flag_export"
+        }
+      ],
+      "else": "no_export_review"
+    },
+    {
+      "id": "flag_export",
+      "type": "set",
+      "assign": [
+        {
+          "slot": "export_review",
+          "value": "Y"
+        }
+      ],
+      "next": "export_note"
+    },
+    {
+      "id": "export_note",
+      "type": "message",
+      "text": "Thanks. Based on your answers, Export Compliance will review this trip before it's approved.",
+      "next": "clearance_gate"
+    },
+    {
+      "id": "no_export_review",
+      "type": "set",
+      "assign": [
+        {
+          "slot": "export_review",
+          "value": "N"
+        }
+      ],
+      "next": "clearance_gate"
+    },
+    {
+      "id": "clearance_intro",
+      "type": "message",
+      "text": "Almost done: a few clearance questions.",
+      "next": "clr_passport"
+    },
+    {
+      "id": "clr_passport",
+      "type": "ask",
+      "slot": "clr_passport",
+      "label": "Passport valid 6+ months",
+      "prompt": "Is your passport valid for at least six months after you return?",
+      "input": {
+        "kind": "yesno"
+      },
+      "next": "clr_visa",
+      "skipIfFilled": true
+    },
+    {
+      "id": "clr_visa",
+      "type": "ask",
+      "slot": "clr_visa",
+      "label": "Visa",
+      "prompt": "Do you need a visa for any destination?",
+      "input": {
+        "kind": "choice",
+        "display": "buttons",
+        "options": [
+          {
+            "value": "NOT_NEEDED",
+            "label": "Not needed"
+          },
+          {
+            "value": "HAVE",
+            "label": "I already have it"
+          },
+          {
+            "value": "APPLY",
+            "label": "I still need to apply"
+          }
+        ]
+      },
+      "next": "clr_briefing",
+      "skipIfFilled": true
+    },
+    {
+      "id": "clr_briefing",
+      "type": "ask",
+      "slot": "clr_briefing",
+      "label": "Travel security briefing",
+      "prompt": "Have you completed the travel security briefing in the last 12 months?",
+      "input": {
+        "kind": "yesno"
+      },
+      "next": "clr_level",
+      "skipIfFilled": true
+    },
+    {
+      "id": "clr_level",
+      "type": "ask",
+      "slot": "clr_level",
+      "label": "Security clearance",
+      "prompt": "Do you hold a government security clearance?",
+      "input": {
+        "kind": "choice",
+        "display": "buttons",
+        "options": [
+          {
+            "value": "NONE",
+            "label": "No"
+          },
+          {
+            "value": "CONFIDENTIAL",
+            "label": "Confidential"
+          },
+          {
+            "value": "SECRET",
+            "label": "Secret"
+          },
+          {
+            "value": "TOP_SECRET",
+            "label": "Top Secret"
+          }
+        ]
+      },
+      "next": "has_clearance",
+      "skipIfFilled": true
+    },
+    {
+      "id": "has_clearance",
+      "type": "condition",
+      "branches": [
+        {
+          "when": {
+            "slot": "clr_level",
+            "op": "!=",
+            "value": "NONE"
+          },
+          "next": "clr_fso"
+        }
+      ],
+      "else": "clear_fso"
+    },
+    {
+      "id": "clr_fso",
+      "type": "ask",
+      "slot": "clr_fso_notified",
+      "label": "Security officer notified",
+      "prompt": "Cleared staff must report foreign travel. Have you notified your Facility Security Officer?",
+      "input": {
+        "kind": "yesno"
+      },
+      "next": "fso_check",
+      "skipIfFilled": true
+    },
+    {
+      "id": "fso_check",
+      "type": "condition",
+      "branches": [
+        {
+          "when": {
+            "slot": "clr_fso_notified",
+            "op": "=",
+            "value": "N"
+          },
+          "next": "fso_reminder"
+        }
+      ],
+      "else": "review"
+    },
+    {
+      "id": "fso_reminder",
+      "type": "message",
+      "text": "Please notify your Facility Security Officer before you travel. You can still save the trip now.",
+      "next": "review"
+    },
+    {
+      "id": "clear_fso",
+      "type": "set",
+      "assign": [
+        {
+          "slot": "clr_fso_notified",
+          "clear": true
+        }
+      ],
+      "next": "review"
+    },
+    {
+      "id": "review",
+      "type": "summary",
+      "text": "Here's your trip. Please check it before saving:",
+      "confirmLabel": "Save trip",
+      "next": "save"
+    },
+    {
+      "id": "save",
+      "type": "submit",
+      "connector": "trip_save",
+      "onSuccess": "ask_submit",
+      "onError": "review"
+    },
+    {
+      "id": "ask_submit",
+      "type": "menu",
+      "slot": "next_action",
+      "prompt": "Trip {{itinerary_no}} is saved (status: Saved). Do you want to send it for approval now?",
+      "options": [
+        {
+          "value": "submit",
+          "label": "Send for approval",
+          "next": "start_approval"
+        },
+        {
+          "value": "later",
+          "label": "Not yet",
+          "next": "saved_end"
+        }
+      ]
+    },
+    {
+      "id": "start_approval",
+      "type": "workflow",
+      "workflow": "TRIP_APPROVAL",
+      "parameters": {
+        "P_TRIP_ID": "{{trip_id}}",
+        "P_ITINERARY_NO": "{{itinerary_no}}",
+        "P_TRAVEL_TYPE": "{{travel_type}}",
+        "P_EXPORT_REVIEW": "{{export_review}}"
+      },
+      "detailKey": "{{trip_id}}",
+      "resultSlot": "workflow_id",
+      "errorMessage": "Sorry, I couldn't send the trip for approval. It's saved as {{itinerary_no}}: you can send it later.",
+      "next": "mark_pending",
+      "onError": "saved_end"
+    },
+    {
+      "id": "mark_pending",
+      "type": "lookup",
+      "connector": "trip_mark_pending",
+      "next": "pending_end"
+    },
+    {
+      "id": "pending_end",
+      "type": "end",
+      "text": "Done. Trip {{itinerary_no}} is pending approval. You'll be notified when it's approved."
+    },
+    {
+      "id": "saved_end",
+      "type": "end",
+      "text": "Trip {{itinerary_no}} is saved. Open it from My Trips when you're ready to send it for approval."
+    }
+  ]
+}
