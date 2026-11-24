@@ -1,0 +1,104 @@
+/* ===== Pill-style breadcrumb for Universal Theme ===== */
+:root {
+  --pill-bg:          var(--ut-component-highlight-background-color, #f1f3f5);
+  --pill-fg:          var(--ut-body-text-color, #374151);
+  --pill-bg-hover:    var(--ut-palette-primary-shade, #e2e8f0);
+  --pill-active-bg:   var(--ut-palette-primary, #0572ce);
+  --pill-active-fg:   var(--ut-palette-primary-contrast, #ffffff);
+  --pill-border:      var(--ut-component-border-color, #dfe3e8);
+  --pill-radius:      999px;
+  --pill-gap:         .375rem;
+}
+
+.t-Breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--pill-gap);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.t-Breadcrumb-item {
+  display: inline-flex;
+  align-items: center;
+  margin: 0;
+  padding: 0;
+  font-size: .8125rem;
+  line-height: 1;
+}
+
+/* Remove UT's default separator */
+.t-Breadcrumb-item::after,
+.t-Breadcrumb-item:after {
+  display: none !important;
+  content: none !important;
+}
+
+/* The pill */
+.t-Breadcrumb-item .t-Breadcrumb-label {
+  display: inline-flex;
+  align-items: center;
+  gap: .375rem;
+  padding: .4375rem .875rem;
+  border: 1px solid var(--pill-border);
+  border-radius: var(--pill-radius);
+  background: var(--pill-bg);
+  color: var(--pill-fg);
+  font-size: inherit;
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background-color .15s ease, color .15s ease, border-color .15s ease;
+}
+
+.t-Breadcrumb-item a.t-Breadcrumb-label:hover {
+  background: var(--pill-bg-hover);
+  text-decoration: none;
+}
+
+.t-Breadcrumb-item a.t-Breadcrumb-label:focus-visible {
+  outline: 2px solid var(--pill-active-bg);
+  outline-offset: 2px;
+}
+
+/* Current page pill */
+.t-Breadcrumb-item.is-active .t-Breadcrumb-label {
+  background: var(--pill-active-bg);
+  border-color: var(--pill-active-bg);
+  color: var(--pill-active-fg);
+  font-weight: 600;
+  cursor: default;
+}
+
+/* UT renders the active entry as an <h1>, so reset heading styles */
+.t-Breadcrumb-item.is-active h1.t-Breadcrumb-label {
+  margin: 0;
+  font-size: inherit;
+  line-height: 1;
+}
+
+/* Optional: small chevron between pills */
+.t-Breadcrumb-item + .t-Breadcrumb-item::before {
+  content: "›";
+  margin-right: var(--pill-gap);
+  color: var(--pill-fg);
+  opacity: .5;
+  font-size: 1rem;
+}
+
+/* Optional: icon inside a pill (e.g. fa-home on the root entry) */
+.t-Breadcrumb-label .fa {
+  font-size: .875rem;
+}
+
+/* Small screens: scroll sideways instead of wrapping */
+@media (max-width: 640px) {
+  .t-Breadcrumb {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .t-Breadcrumb::-webkit-scrollbar { display: none; }
+}
