@@ -1852,8 +1852,66 @@
                items: items.map(function (it, i) { return { index: i, title: itemTitle(ctx, node, it, i) }; }) };
     }
     function repeatPromptField(ctx, node) {
-      var rs = ctx.st.repeat[node.id], f = node.fields[rs.field];
+      var rs = ctx.st.repeat[node.id];
+      if (rpEditing(rs)) {
+        if (rs.field === null || rs.field === undefined) {
+          say(ctx, 'text', interpolate((node.prompts || {}).editMenu || 'Pick a field of {{title}} to change, then tap {{save}}.',
+            repeatVals(ctx, node, { title: itemTitle(ctx, node, rs.draft, rs.edit), save: node.saveLabel || 'Save' })));
+        } else repeatPromptEdit(ctx, node);
+        return;
+      }
+      var f = node.fields[rs.field];
       say(ctx, 'text', interpolate(f.prompt || ((f.label || f.field) + ' for {{item}} {{n}}?'), repeatVals(ctx, node, rs.draft)));
+    }
+    // ---- changing an item already in the list: state {edit: index, draft, orig, field: null | field index}
+    function rpEditing(rs) { return !!rs && typeof rs.edit === 'number'; }
+    function repeatCanEdit(node) { return node.allowEdit !== false; }
+    function repeatStartEdit(ctx, node, i) {
+      var items = repeatItems(ctx, node);
+      ctx.st.repeat[node.id] = { edit: i, draft: clone(items[i]), orig: clone(items[i]), field: null };
+      say(ctx, 'text', interpolate((node.prompts || {}).editing || 'Changing {{title}}. Pick a field to change, then tap {{save}}.',
+        repeatVals(ctx, node, { title: itemTitle(ctx, node, items[i], i), save: node.saveLabel || 'Save' })));
+    }
+    function repeatPromptEdit(ctx, node) {
+      var rs = ctx.st.repeat[node.id], f = node.fields[rs.field];
+      var cur = displayFor(eff(ctx, f.input), rs.draft[f.field]);
+      say(ctx, 'text', interpolate(f.editPrompt || (fieldLabel(f) + (cur ? ' is currently ' + cur + '. What should it be?' : ' is empty. What should it be?')),
+        repeatVals(ctx, node, rs.draft)));
+    }
+    function repeatChanged(node, rs) {
+      return (node.fields || []).some(function (f) { return !same(rs.draft[f.field], rs.orig[f.field]); });
+    }
+    async function handleRepeatEdit(ctx, node, payload, cmd, rs, items) {
+      var st = ctx.st, pr = node.prompts || {};
+      if (rs.field !== null && rs.field !== undefined) {
+        var f = node.fields[rs.field];
+        var parsed = parseValue(eff(ctx, f.input), payload.value);
+        var err = parsed.error || await validate(ctx, repeatFieldNode(node, f), parsed.value);
+        if (err) { say(ctx, 'error', err); return; }
+        if (isFilled(parsed.value)) rs.draft[f.field] = parsed.value; else delete rs.draft[f.field];
+        rs.field = null;
+        say(ctx, 'text', interpolate(pr.editAgain || 'Got it. Anything else to change?', repeatVals(ctx, node)));
+        return;
+      }
+      var val = String(payload.value || '').trim().toLowerCase(), save = String(node.saveLabel || 'Save').toLowerCase();
+      if (cmd === 'done' || (!payload.field && (val === 'done' || val === 'save' || val === save))) {
+        var title = itemTitle(ctx, node, rs.draft, rs.edit);
+        if (repeatChanged(node, rs)) {
+          items[rs.edit] = rs.draft;
+          st.slots[node.slot] = items; touch(ctx, node.slot);
+          say(ctx, 'text', interpolate(pr.updated || 'Updated {{title}}.', { title: title }));
+        } else say(ctx, 'text', interpolate(pr.unchanged || 'No changes to {{title}}.', { title: title }));
+        delete st.repeat[node.id];
+        repeatShow(ctx, node);
+        return;
+      }
+      var fi = -1;
+      (node.fields || []).forEach(function (x, i) {
+        if (fi < 0 && (payload.field ? x.field === payload.field : (x.field === val || fieldLabel(x).toLowerCase() === val))) fi = i;
+      });
+      if (fi < 0) { say(ctx, 'error', 'Please choose a field to change, or ' + (node.saveLabel || 'Save') + '.'); return; }
+      rs.field = fi;
+      repeatPromptEdit(ctx, node);
     }
     // Shows the step as it stands: the question being answered, or the list with Add / Done.
     function repeatShow(ctx, node) {
@@ -1872,6 +1930,7 @@
     }
     async function handleRepeat(ctx, node, payload, cmd) {
       var st = ctx.st, pr = node.prompts || {}, rs = st.repeat[node.id], items = repeatItems(ctx, node).slice();
+      if (rpEditing(rs)) { await handleRepeatEdit(ctx, node, payload, cmd, rs, items); return; }
       if (rs) {
         var f = node.fields[rs.field];
         var parsed = parseValue(eff(ctx, f.input), payload.value);
@@ -1890,6 +1949,13 @@
       if (cmd === 'add' || val === 'add' || val === String(node.addLabel || 'add another').toLowerCase()) {
         if (items.length >= repeatMax(node)) { say(ctx, 'error', interpolate(pr.full || "That's the most I can take ({{max}}). Tap Done to continue.", repeatVals(ctx, node))); return; }
         repeatStartItem(ctx, node);
+        return;
+      }
+      if (cmd === 'edititem') {
+        var ei = parseInt(payload.index, 10);
+        if (!repeatCanEdit(node)) { say(ctx, 'error', "Items here can't be changed. Remove it and add it again."); return; }
+        if (!(ei >= 0 && ei < items.length)) { say(ctx, 'error', 'There is no such item.'); return; }
+        repeatStartEdit(ctx, node, ei);
         return;
       }
       if (cmd === 'remove') {
@@ -2368,17 +2434,27 @@
           }
         } else if (n.type === 'repeat') {
           var rs = st.repeat[n.id], items = repeatItems(ctx, n);
-          if (rs) {
-            var rf = n.fields[rs.field];
+          if (rpEditing(rs) && (rs.field === null || rs.field === undefined)) {
+            aw = { type: 'fieldMenu', nodeId: n.id, doneLabel: n.saveLabel || 'Save', item: rs.edit + 1,
+                   title: itemTitle(ctx, n, rs.draft, rs.edit),
+                   fields: (n.fields || []).map(function (fd) {
+                     return { field: fd.field, label: fieldLabel(fd), display: displayFor(eff(ctx, fd.input), rs.draft[fd.field]),
+                              changed: !same(rs.draft[fd.field], rs.orig[fd.field]), editable: true, reason: null };
+                   }) };
+          } else if (rs) {
+            var rf = n.fields[rs.field], ed = rpEditing(rs);
             aw = { type: 'ask', nodeId: n.id, slot: n.slot + '.' + rf.field, label: rf.label || rf.field,
-                   input: turnInput(ctx, rf.input), value: null, item: items.length + 1 };
+                   input: turnInput(ctx, rf.input), value: ed && isFilled(rs.draft[rf.field]) ? rs.draft[rf.field] : null,
+                   item: ed ? rs.edit + 1 : items.length + 1 };
+            if (ed) aw.sub = true;
             if (!aw.input.kind) aw.input.kind = 'text';
           } else {
             aw = { type: 'listMenu', nodeId: n.id, itemLabel: n.itemLabel || 'item',
                    items: items.map(function (it, i) { return { index: i, title: itemTitle(ctx, n, it, i) }; }),
                    canAdd: items.length < repeatMax(n), canDone: items.length >= repeatMin(n),
                    addLabel: items.length ? (n.addLabel || 'Add another') : (n.firstAddLabel || 'Add'),
-                   doneLabel: n.doneLabel || 'Done', removeLabel: n.removeLabel || 'Remove' };
+                   doneLabel: n.doneLabel || 'Done', removeLabel: n.removeLabel || 'Remove',
+                   canEdit: repeatCanEdit(n), editLabel: n.editLabel || 'Edit' };
           }
         } else if (n.type === 'bulkUpdate' && st.bulk[n.id]) {
           var bv = Object.assign({}, v, { count: st.bulk[n.id].count });
@@ -2467,6 +2543,15 @@
       } else if (cmd === 'back' && node && node.type === 'changeFields' && st.editingField) {
         st.editingField = null;
         say(ctx, 'text', 'No problem, I kept it as it was. Anything else to change?');
+      } else if (cmd === 'back' && node && node.type === 'repeat' && rpEditing(st.repeat[node.id])) {
+        // Changing an item: back from a field keeps its value; back from the field list drops the changes.
+        var es = st.repeat[node.id];
+        if (es.field !== null && es.field !== undefined) { es.field = null; say(ctx, 'text', 'No problem, I kept it as it was. Anything else to change?'); }
+        else {
+          delete st.repeat[node.id];
+          say(ctx, 'text', interpolate('Okay, I left {{title}} as it was.', { title: itemTitle(ctx, node, es.orig, es.edit) }));
+          repeatShow(ctx, node);
+        }
       } else if (cmd === 'back' && node && node.type === 'repeat' && st.repeat[node.id]
                  && (st.repeat[node.id].field > 0 || repeatItems(ctx, node).length > 0)) {
         // Inside a line item: back to its previous field, or drop the unfinished item.

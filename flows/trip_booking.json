@@ -540,7 +540,10 @@
       "firstAddLabel": "Add a destination",
       "doneLabel": "That's all my destinations",
       "prompts": {
-        "tooFew": "Please add at least one destination: a trip can't be saved without one."
+        "tooFew": "Please add at least one destination: a trip can't be saved without one.",
+        "editing": "Changing {{title}}. Tap what you want to change, then {{save}}.",
+        "updated": "Updated: {{title}}.",
+        "unchanged": "Nothing changed for {{title}}."
       },
       "fields": [
         {
@@ -626,11 +629,15 @@
             "maxLength": 100
           },
           "note": "For a flight, the airline and flight number (e.g. LH 401); for a train, the operator and train number.",
-          "noteStyle": "tip"
+          "noteStyle": "tip",
+          "editPrompt": "The transport to {{city}} is {{transport_name}}. What should it be?"
         }
       ],
       "next": "export_gate",
-      "skipIfFilled": true
+      "skipIfFilled": true,
+      "allowEdit": true,
+      "editLabel": "Change",
+      "saveLabel": "Save destination"
     },
     {
       "id": "export_intro",

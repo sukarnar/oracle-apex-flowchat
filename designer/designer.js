@@ -2686,6 +2686,10 @@
         'Shown in the list and the summary. Uses the item\'s fields.'),
       F('Minimum items', bound(() => n.min, (v) => setOrDelete(n, 'min', numOrNull(v)), { type: 'number', key: n.id + '.min', placeholder: '1' })),
       F('Maximum items', bound(() => n.max, (v) => setOrDelete(n, 'max', numOrNull(v)), { type: 'number', key: n.id + '.max', placeholder: '20' }))));
+    wrap.append(checkbox('Let the user change an item in the list (Edit)', n.allowEdit !== false,
+      (c) => mutate(() => { if (c) delete n.allowEdit; else n.allowEdit = false; })),
+      h('p', { class: 'hint', text: 'Edit opens the item\'s fields with their values; the user changes any of them and taps Save. ' +
+        'Rows loaded by a lookup keep any extra keys (e.g. a row id), so your Submit connector can update those rows and insert the new ones.' }));
 
     wrap.append(h('h4', { class: 'sub', text: 'Questions for each item' }),
       h('p', { class: 'hint', text: 'Asked in order for every item. In a question, {{n}} is the item number and earlier fields of the same item can be used, e.g. {{description}}.' }));
@@ -2704,6 +2708,8 @@
         F('Field', bound(() => fd.field, (v) => { fd.field = v.trim(); }, { mono: true, key: kp + '.fn', onChange: true, panel: true })),
         F('Label', bound(() => fd.label, (v) => setOrDelete(fd, 'label', v), { key: kp + '.lb' }))));
       det.append(F('Question', bound(() => fd.prompt, (v) => setOrDelete(fd, 'prompt', v), { key: kp + '.pq', placeholder: (fd.label || 'Field') + ' for {{item}} {{n}}?' })));
+      if (n.allowEdit !== false) det.append(F('Question when changing it (optional)', bound(() => fd.editPrompt, (v) => setOrDelete(fd, 'editPrompt', v),
+        { key: kp + '.ep', placeholder: (fd.label || 'Field') + ' is currently …. What should it be?' })));
       det.append(noteEditor(fd, kp), answerEditor(fd, kp), validatorsEditor(fd, kp));
       wrap.append(det);
     });
@@ -2720,11 +2726,16 @@
     wrap.append(h('details', { class: 'adv' }, h('summary', { text: 'Advanced: buttons & messages' }),
       h('div', { class: 'grid2' },
         F('Add button', bound(() => n.addLabel, (v) => setOrDelete(n, 'addLabel', v), { key: n.id + '.al', placeholder: 'Add another' })),
-        F('Done button', bound(() => n.doneLabel, (v) => setOrDelete(n, 'doneLabel', v), { key: n.id + '.dl', placeholder: 'Done' }))),
+        F('Done button', bound(() => n.doneLabel, (v) => setOrDelete(n, 'doneLabel', v), { key: n.id + '.dl', placeholder: 'Done' })),
+        F('Edit button', bound(() => n.editLabel, (v) => setOrDelete(n, 'editLabel', v), { key: n.id + '.el', placeholder: 'Edit' })),
+        F('Save button (when changing an item)', bound(() => n.saveLabel, (v) => setOrDelete(n, 'saveLabel', v), { key: n.id + '.sl', placeholder: 'Save' }))),
       msg('added', 'After adding an item', 'Added {{title}}.'),
       msg('menu', 'Between items', 'Add another {{item}}, or tap Done.'),
       msg('tooFew', 'Too few items', 'Please add at least {{min}}.'),
       msg('full', 'Maximum reached', "That's the most I can take ({{max}}). Tap Done to continue."),
+      msg('editing', 'When Edit is tapped', 'Changing {{title}}. Pick a field to change, then tap {{save}}.'),
+      msg('updated', 'After saving a changed item', 'Updated {{title}}.'),
+      msg('unchanged', 'Saved with no change', 'No changes to {{title}}.'),
       checkbox('Skip if the list already has items (e.g. from a lookup)', n.skipIfFilled, (c) => mutate(() => setOrDelete(n, 'skipIfFilled', c || null)))));
     wrap.append(bindingEditor(n.slot));
     return wrap;

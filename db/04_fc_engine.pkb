@@ -991,10 +991,64 @@ create or replace package body fc_engine as
     c.out_msgs.append(l_msg);
   end rp_card;
 
+  -- Changing an item already in the list: state.repeat[nodeId] = {edit: index, draft, orig, field: null | n}.
+  function rp_editing (p_rs in json_object_t) return boolean is
+  begin
+    return p_rs is not null and p_rs.has('edit') and p_rs.get('edit').is_number;
+  end rp_editing;
+
+  -- The field being answered now (adding an item, or changing one field of an item); null otherwise.
+  function rp_cur_field (p_node in json_object_t, p_rs in json_object_t) return json_object_t is
+  begin
+    if p_rs is null then return null; end if;
+    if rp_editing(p_rs) and to_num(str(p_rs, 'field')) is null then return null; end if;
+    return treat(arr(p_node, 'fields').get(nvl(to_num(str(p_rs, 'field')), 0)) as json_object_t);
+  end rp_cur_field;
+
+  function rp_can_edit (p_node in json_object_t) return boolean is
+  begin
+    return nvl(str(p_node, 'allowEdit'), 'true') <> 'false';
+  end rp_can_edit;
+
+  function rp_changed (p_node in json_object_t, p_rs in json_object_t) return boolean is
+    l_flds json_array_t := arr(p_node, 'fields');
+    l_f    varchar2(200);
+  begin
+    for i in 0 .. l_flds.get_size - 1 loop
+      l_f := str(treat(l_flds.get(i) as json_object_t), 'field');
+      if not same(str(obj(p_rs, 'draft'), l_f), str(obj(p_rs, 'orig'), l_f)) then return true; end if;
+    end loop;
+    return false;
+  end rp_changed;
+
+  procedure rp_prompt_edit (c in out nocopy t_ctx, p_node in json_object_t) is
+    l_rs  json_object_t  := rp_state(c, str(p_node, 'id'));
+    l_f   json_object_t  := rp_cur_field(p_node, l_rs);
+    l_cur varchar2(4000) := display_for(eff_spec(c, input_spec(l_f)), str(obj(l_rs, 'draft'), str(l_f, 'field')));
+  begin
+    add_msg(c, 'text', interpolate(nvl(str(l_f, 'editPrompt'),
+      field_label(l_f) || case when l_cur is not null then ' is currently ' || l_cur || '. What should it be?'
+                               else ' is empty. What should it be?' end),
+      rp_vals(c, p_node, obj(l_rs, 'draft'))));
+  end rp_prompt_edit;
+
   procedure rp_prompt_field (c in out nocopy t_ctx, p_node in json_object_t) is
     l_rs json_object_t := rp_state(c, str(p_node, 'id'));
-    l_f  json_object_t := treat(arr(p_node, 'fields').get(nvl(to_num(str(l_rs, 'field')), 0)) as json_object_t);
+    l_f  json_object_t;
+    l_x  json_object_t := json_object_t();
   begin
+    if rp_editing(l_rs) then
+      if to_num(str(l_rs, 'field')) is null then
+        l_x.put('title', item_title(c, p_node, obj(l_rs, 'draft'), to_num(str(l_rs, 'edit'))));
+        l_x.put('save', nvl(str(p_node, 'saveLabel'), 'Save'));
+        add_msg(c, 'text', interpolate(nvl(str(obj(p_node, 'prompts'), 'editMenu'), 'Pick a field of {{title}} to change, then tap {{save}}.'),
+                                       rp_vals(c, p_node, l_x)));
+      else
+        rp_prompt_edit(c, p_node);
+      end if;
+      return;
+    end if;
+    l_f := treat(arr(p_node, 'fields').get(nvl(to_num(str(l_rs, 'field')), 0)) as json_object_t);
     add_msg(c, 'text', interpolate(nvl(str(l_f, 'prompt'), nvl(str(l_f, 'label'), str(l_f, 'field')) || ' for {{item}} {{n}}?'),
                                    rp_vals(c, p_node, obj(l_rs, 'draft'))));
   end rp_prompt_field;
@@ -1026,6 +1080,22 @@ create or replace package body fc_engine as
     rp_put(c, str(p_node, 'id'), l_rs);
     rp_prompt_field(c, p_node);
   end rp_start;
+
+  procedure rp_start_edit (c in out nocopy t_ctx, p_node in json_object_t, p_idx in pls_integer) is
+    l_rs   json_object_t := json_object_t();
+    l_item json_object_t := treat(rp_items(c, p_node).get(p_idx) as json_object_t);
+    l_x    json_object_t := json_object_t();
+  begin
+    l_rs.put('edit', p_idx);
+    l_rs.put('draft', copy(l_item));
+    l_rs.put('orig', copy(l_item));
+    l_rs.put_null('field');
+    rp_put(c, str(p_node, 'id'), l_rs);
+    l_x.put('title', item_title(c, p_node, l_item, p_idx));
+    l_x.put('save', nvl(str(p_node, 'saveLabel'), 'Save'));
+    add_msg(c, 'text', interpolate(nvl(str(obj(p_node, 'prompts'), 'editing'), 'Changing {{title}}. Pick a field to change, then tap {{save}}.'),
+                                   rp_vals(c, p_node, l_x)));
+  end rp_start_edit;
 
   -- Input spec for a slot or "alias.field" (used for display formatting).
   function spec_for (c in out nocopy t_ctx, p_name in varchar2) return json_object_t is
@@ -4241,7 +4311,7 @@ create or replace package body fc_engine as
       when 'repeat' then
         l_rs := rp_state(c, l_cur);
         if l_rs is not null then
-          return treat(arr(l_node, 'fields').get(nvl(to_num(str(l_rs, 'field')), 0)) as json_object_t);
+          return rp_cur_field(l_node, l_rs);
         end if;
       else null;
     end case;
@@ -4264,7 +4334,7 @@ create or replace package body fc_engine as
       when 'repeat' then
         l_rs := rp_state(c, l_cur);
         if l_rs is not null then
-          l_fd := treat(arr(l_node, 'fields').get(nvl(to_num(str(l_rs, 'field')), 0)) as json_object_t);
+          l_fd := rp_cur_field(l_node, l_rs);
         end if;
       when 'agent' then
         l_w := obj(ag_get(c, l_cur), 'waiting');
@@ -4469,14 +4539,44 @@ create or replace package body fc_engine as
       elsif l_type = 'repeat' then
         l_rs     := rp_state(c, l_cur);
         l_ritems := rp_items(c, l_node);
-        if l_rs is not null then
-          l_fd := treat(arr(l_node, 'fields').get(nvl(to_num(str(l_rs, 'field')), 0)) as json_object_t);
+        if rp_editing(l_rs) and to_num(str(l_rs, 'field')) is null then
+          -- changing an item: its fields, each with its value and whether it changed, and Save
+          l_aw.put('type', 'fieldMenu');
+          l_aw.put('doneLabel', nvl(str(l_node, 'saveLabel'), 'Save'));
+          l_aw.put('item', to_num(str(l_rs, 'edit')) + 1);
+          l_aw.put('title', item_title(c, l_node, obj(l_rs, 'draft'), to_num(str(l_rs, 'edit'))));
+          l_items := json_array_t();
+          for i in 0 .. arr(l_node, 'fields').get_size - 1 loop
+            l_fd := treat(arr(l_node, 'fields').get(i) as json_object_t);
+            l_item := json_object_t();
+            l_item.put('field', str(l_fd, 'field'));
+            l_item.put('label', field_label(l_fd));
+            l_item.put('display', display_for(eff_spec(c, input_spec(l_fd)), str(obj(l_rs, 'draft'), str(l_fd, 'field'))));
+            l_item.put('changed', not same(str(obj(l_rs, 'draft'), str(l_fd, 'field')), str(obj(l_rs, 'orig'), str(l_fd, 'field'))));
+            l_item.put('editable', true);
+            l_item.put_null('reason');
+            l_items.append(l_item);
+          end loop;
+          l_aw.put('fields', l_items);
+        elsif l_rs is not null then
+          l_fd := rp_cur_field(l_node, l_rs);
           l_aw.put('type', 'ask');
           l_aw.put('slot', str(l_node, 'slot') || '.' || str(l_fd, 'field'));
           l_aw.put('label', field_label(l_fd));
           l_aw.put('input', turn_input(c, input_spec(l_fd)));
-          l_aw.put_null('value');
-          l_aw.put('item', l_ritems.get_size + 1);
+          if rp_editing(l_rs) then
+            -- the current value is pre-filled; "Keep current" leaves it as it is
+            if str(obj(l_rs, 'draft'), str(l_fd, 'field')) is not null then
+              l_aw.put('value', obj(l_rs, 'draft').get(str(l_fd, 'field')));
+            else
+              l_aw.put_null('value');
+            end if;
+            l_aw.put('item', to_num(str(l_rs, 'edit')) + 1);
+            l_aw.put('sub', true);
+          else
+            l_aw.put_null('value');
+            l_aw.put('item', l_ritems.get_size + 1);
+          end if;
         else
           l_aw.put('type', 'listMenu');
           l_aw.put('itemLabel', nvl(str(l_node, 'itemLabel'), 'item'));
@@ -4494,6 +4594,8 @@ create or replace package body fc_engine as
                                     else nvl(str(l_node, 'firstAddLabel'), 'Add') end);
           l_aw.put('doneLabel', nvl(str(l_node, 'doneLabel'), 'Done'));
           l_aw.put('removeLabel', nvl(str(l_node, 'removeLabel'), 'Remove'));
+          l_aw.put('canEdit', rp_can_edit(l_node));
+          l_aw.put('editLabel', nvl(str(l_node, 'editLabel'), 'Edit'));
         end if;
 
       elsif l_type = 'bulkUpdate' and bulk_state(c, l_cur) is not null then
@@ -4895,6 +4997,82 @@ create or replace package body fc_engine as
     end if;
   end handle_change;
 
+  procedure rp_handle_edit (c in out nocopy t_ctx, p_node in json_object_t, p_in in json_object_t, p_cmd in varchar2,
+                            p_rs in json_object_t, p_items in json_array_t) is
+    l_id     varchar2(200)  := str(p_node, 'id');
+    l_pr     json_object_t  := obj(p_node, 'prompts');
+    l_flds   json_array_t   := arr(p_node, 'fields');
+    l_rs     json_object_t  := p_rs;
+    l_draft  json_object_t  := obj(p_rs, 'draft');
+    l_f      json_object_t;
+    l_parsed json_object_t;
+    l_err    varchar2(4000);
+    l_val    varchar2(4000) := lower(trim(str(p_in, 'value')));
+    l_pick   varchar2(200)  := str(p_in, 'field');
+    l_save   varchar2(200)  := nvl(str(p_node, 'saveLabel'), 'Save');
+    l_idx    pls_integer    := to_num(str(p_rs, 'edit'));
+    l_fi     pls_integer;
+    l_new    json_array_t;
+    l_x      json_object_t  := json_object_t();
+  begin
+    if l_draft is null then l_draft := json_object_t(); end if;
+    l_f := rp_cur_field(p_node, l_rs);
+    if l_f is not null then
+      -- the new value of the field being changed
+      l_parsed := parse_value(eff_spec(c, input_spec(l_f)), str(p_in, 'value'));
+      l_err := str(l_parsed, 'error');
+      if l_err is null then l_err := validate(c, rp_field_node(p_node, l_f), l_parsed); end if;
+      if l_err is not null then
+        add_msg(c, 'error', l_err);
+        return;
+      end if;
+      if str(l_parsed, 'value') is not null then
+        l_draft.put(str(l_f, 'field'), l_parsed.get('value'));
+      elsif l_draft.has(str(l_f, 'field')) then
+        l_draft.remove(str(l_f, 'field'));
+      end if;
+      l_rs.put('draft', l_draft);
+      l_rs.put_null('field');
+      rp_put(c, l_id, l_rs);
+      add_msg(c, 'text', interpolate(nvl(str(l_pr, 'editAgain'), 'Got it. Anything else to change?'), rp_vals(c, p_node)));
+      return;
+    end if;
+
+    if p_cmd = 'done' or (l_pick is null and l_val in ('done', 'save', lower(l_save))) then
+      l_x.put('title', item_title(c, p_node, l_draft, l_idx));
+      if rp_changed(p_node, l_rs) then
+        l_new := json_array_t();
+        for i in 0 .. p_items.get_size - 1 loop
+          if i = l_idx then l_new.append(l_draft); else l_new.append(p_items.get(i)); end if;
+        end loop;
+        c.slots.put(str(p_node, 'slot'), l_new);
+        touch(c, str(p_node, 'slot'));
+        add_msg(c, 'text', interpolate(nvl(str(l_pr, 'updated'), 'Updated {{title}}.'), l_x));
+      else
+        add_msg(c, 'text', interpolate(nvl(str(l_pr, 'unchanged'), 'No changes to {{title}}.'), l_x));
+      end if;
+      rp_put(c, l_id, null);
+      rp_show(c, p_node);
+      return;
+    end if;
+
+    for i in 0 .. l_flds.get_size - 1 loop
+      l_f := treat(l_flds.get(i) as json_object_t);
+      if (l_pick is not null and str(l_f, 'field') = l_pick)
+         or (l_pick is null and (lower(str(l_f, 'field')) = l_val or lower(field_label(l_f)) = l_val)) then
+        l_fi := i;
+        exit;
+      end if;
+    end loop;
+    if l_fi is null then
+      add_msg(c, 'error', 'Please choose a field to change, or ' || l_save || '.');
+      return;
+    end if;
+    l_rs.put('field', l_fi);
+    rp_put(c, l_id, l_rs);
+    rp_prompt_edit(c, p_node);
+  end rp_handle_edit;
+
   procedure handle_repeat (c in out nocopy t_ctx, p_node in json_object_t, p_in in json_object_t, p_cmd in varchar2) is
     l_id     varchar2(200) := str(p_node, 'id');
     l_slot   varchar2(200) := str(p_node, 'slot');
@@ -4912,6 +5090,10 @@ create or replace package body fc_engine as
     l_idx    pls_integer;
     l_x      json_object_t := json_object_t();
   begin
+    if rp_editing(l_rs) then
+      rp_handle_edit(c, p_node, p_in, p_cmd, l_rs, l_items);
+      return;
+    end if;
     if l_rs is not null then
       -- answering a field of the item being added
       l_fi := nvl(to_num(str(l_rs, 'field')), 0);
@@ -4948,6 +5130,18 @@ create or replace package body fc_engine as
         add_msg(c, 'error', interpolate(nvl(str(l_pr, 'full'), 'That''s the most I can take ({{max}}). Tap Done to continue.'), rp_vals(c, p_node)));
       else
         rp_start(c, p_node);
+      end if;
+      return;
+    end if;
+
+    if p_cmd = 'edititem' then
+      l_idx := trunc(to_num(str(p_in, 'index')));
+      if not rp_can_edit(p_node) then
+        add_msg(c, 'error', 'Items here can''t be changed. Remove it and add it again.');
+      elsif l_idx is null or l_idx < 0 or l_idx >= l_items.get_size then
+        add_msg(c, 'error', 'There is no such item.');
+      else
+        rp_start_edit(c, p_node, l_idx);
       end if;
       return;
     end if;
@@ -5255,8 +5449,8 @@ create or replace package body fc_engine as
       when 'repeat' then
         l_rs := rp_state(c, l_cur);
         if l_rs is not null then
-          l_fd := treat(arr(l_node, 'fields').get(nvl(to_num(str(l_rs, 'field')), 0)) as json_object_t);
-          return pii_mode(l_fd) is not null;
+          l_fd := rp_cur_field(l_node, l_rs);
+          return l_fd is not null and pii_mode(l_fd) is not null;
         end if;
       when 'agent' then
         return get_bool(obj(ag_get(c, l_cur), 'waiting'), 'pii');
@@ -5666,6 +5860,19 @@ create or replace package body fc_engine as
     elsif l_cmd = 'back' and l_type = 'changeFields' and str(c.state, 'editingField') is not null then
       c.state.put_null('editingField');
       add_msg(c, 'text', 'No problem, I kept it as it was. Anything else to change?');
+
+    elsif l_cmd = 'back' and l_type = 'repeat' and rp_editing(rp_state(c, l_cur)) then
+      -- changing an item: back from a field keeps its value; back from the field list drops the changes
+      l_rs := rp_state(c, l_cur);
+      if to_num(str(l_rs, 'field')) is not null then
+        l_rs.put_null('field');
+        rp_put(c, l_cur, l_rs);
+        add_msg(c, 'text', 'No problem, I kept it as it was. Anything else to change?');
+      else
+        rp_put(c, l_cur, null);
+        add_msg(c, 'text', 'Okay, I left ' || item_title(c, l_node, obj(l_rs, 'orig'), to_num(str(l_rs, 'edit'))) || ' as it was.');
+        rp_show(c, l_node);
+      end if;
 
     elsif l_cmd = 'back' and l_type = 'repeat' and rp_state(c, l_cur) is not null
           and (nvl(to_num(str(rp_state(c, l_cur), 'field')), 0) > 0 or rp_items(c, l_node).get_size > 0) then

@@ -172,6 +172,42 @@ async function answer(eng, sid, list) {
     assert.strictEqual(s.exp_device_list, undefined);
   });
 
+  await test('a destination of a saved trip is changed in place (Change → field → Save destination) and saved', async () => {
+    const twoStops = Object.assign({}, savedTrip, { destinations: savedTrip.destinations.concat([
+      { city: 'Paris', country: 'France', departure_date: '2027-03-03', arrival_date: '2027-03-05', travel_medium: 'TRAIN', transport_name: 'Eurostar 9012' }]) });
+    const { eng, saved } = setup({ trips: { 101: twoStops } });
+    let t = await eng.start('trip_booking', {});
+    t = await answer(eng, t.sessionId, ['EDIT', '101', { command: 'done' }]);
+    assert.strictEqual(t.await.type, 'summary');
+    t = await eng.input(t.sessionId, { command: 'edit', slot: 'destinations' });
+    assert.strictEqual(t.await.type, 'listMenu');
+    assert.strictEqual(t.await.canEdit, true);
+    assert.strictEqual(t.await.editLabel, 'Change');
+    t = await eng.input(t.sessionId, { command: 'editItem', index: 1 });
+    assert.match(texts(t), /Changing Paris, France .* then Save destination\./);
+    assert.strictEqual(t.await.type, 'fieldMenu');
+    assert.strictEqual(t.await.doneLabel, 'Save destination');
+    t = await eng.input(t.sessionId, { field: 'transport_name' });
+    assert.match(texts(t), /The transport to Paris is Eurostar 9012\. What should it be\?/);
+    assert.strictEqual(t.await.value, 'Eurostar 9012');
+    t = await eng.input(t.sessionId, { value: 'TGV 6201' });
+    t = await eng.input(t.sessionId, { field: 'arrival_date' });
+    assert.match(texts(t), /Arrival date is currently .*2027.*What should it be\?/);
+    t = await eng.input(t.sessionId, { value: '2027-03-06' });
+    t = await eng.input(t.sessionId, { command: 'done' });
+    assert.match(texts(t), /Updated: Paris, France .*TGV 6201/);
+    t = await eng.input(t.sessionId, { command: 'done' });
+    assert.strictEqual(t.await.type, 'summary', 'back to the summary after the list');
+    t = await eng.input(t.sessionId, { value: 'confirm' });
+    assert.match(texts(t), /Trip FY26-7 is saved/);
+    const d = saved[0].destinations;
+    assert.strictEqual(d.length, 2, 'no destination added or lost');
+    assert.strictEqual(d[0].city, 'Berlin');
+    assert.strictEqual(d[1].transport_name, 'TGV 6201');
+    assert.strictEqual(d[1].arrival_date, '2027-03-06');
+    assert.strictEqual(d[1].departure_date, '2027-03-03');
+  });
+
   await test('a rejected trip opens with the approver\'s reason, is fixed, saved and sent for approval again', async () => {
     const rejected = Object.assign({}, savedTrip, { trip_status: 'REJECTED', rejection_note: 'Please fly economy' });
     const { eng, saved, started } = setup({ trips: { 101: rejected } });

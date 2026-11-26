@@ -325,7 +325,7 @@ create or replace package body fc_demo_trips as
       l_dep := iso_date(l_d.get_string('departure_date'));
       l_arr := iso_date(l_d.get_string('arrival_date'));
       if l_arr < l_dep then
-        return result(false, 'Destination ' || (i + 1) || ' (' || l_d.get_string('city') || '): the arrival date is before the departure date. Tap Edit on Destinations to fix it.');
+        return result(false, 'Destination ' || (i + 1) || ' (' || l_d.get_string('city') || '): the arrival date is before the departure date. Tap Edit on Destinations, then Change on that destination to fix it.');
       end if;
     end loop;
 
@@ -1209,7 +1209,10 @@ begin
       "firstAddLabel": "Add a destination",
       "doneLabel": "That's all my destinations",
       "prompts": {
-        "tooFew": "Please add at least one destination: a trip can't be saved without one."
+        "tooFew": "Please add at least one destination: a trip can't be saved without one.",
+        "editing": "Changing {{title}}. Tap what you want to change, then {{save}}.",
+        "updated": "Updated: {{title}}.",
+        "unchanged": "Nothing changed for {{title}}."
       },
       "fields": [
         {
@@ -1295,11 +1298,15 @@ begin
             "maxLength": 100
           },
           "note": "For a flight, the airline and flight number (e.g. LH 401); for a train, the operator and train number.",
-          "noteStyle": "tip"
+          "noteStyle": "tip",
+          "editPrompt": "The transport to {{city}} is {{transport_name}}. What should it be?"
         }
       ],
       "next": "export_gate",
-      "skipIfFilled": true
+      "skipIfFilled": true,
+      "allowEdit": true,
+      "editLabel": "Change",
+      "saveLabel": "Save destination"
     },
     {
       "id": "export_intro",

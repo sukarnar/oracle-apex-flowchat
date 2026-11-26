@@ -57,6 +57,7 @@ tests/      engine.test.js           node tests/engine.test.js
             set.test.js              node tests/set.test.js (Set values node, context variables)
             redact.test.js           node tests/redact.test.js (hidden answers: masked input, chat and logs)
             note.test.js             node tests/note.test.js (information notes on questions)
+            repeat-edit.test.js      node tests/repeat-edit.test.js (Repeat: Edit an item already in the list)
             menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
             email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
             rest.test.js             node tests/rest.test.js (REST call node: URL building, body template, mapping, routing, refusals, replay)
@@ -817,11 +818,35 @@ For values nobody should see over the user's shoulder: SSN, card or account numb
   ], "next": "review" }
 ```
 - The questions are asked in order for each item, validated like Ask nodes (validators included).
-  Then the widget shows the items with **Remove**, **Add another** and **Done**.
+  Then the widget shows the items with **Edit**, **Remove**, **Add another** and **Done**.
+- **Changing an item (Edit):** shows the item's fields with their values. The user taps a field, its
+  current value is pre-filled (**Keep current** leaves it), the new value is validated like a new one,
+  and changed fields are marked. **Save** puts the item back in place; Back from the field list drops
+  the changes. `"allowEdit": false` turns Edit off. Labels: `editLabel`, `saveLabel`; per field
+  `editPrompt`; messages `prompts.editing`, `prompts.updated`, `prompts.unchanged`, `prompts.editAgain`.
 - The slot holds `[{"description": "Taxi", "amount": 42.5}, …]`, which is what the Submit connector
   receives. `{{lines}}` shows the number of items and `{{lines.count}}` works in conditions.
 - Back inside an item returns to its previous question, or drops the unfinished item. The summary lists
   the items with Edit, which reopens the list. `min` items are re-checked before submit.
+- **Updating existing child rows:** let a lookup connector return the current rows into the slot, each
+  with its key, e.g. `{"stops": [{"stop_id": 11, "city": "Berlin", "nights": 2}, …]}`. Keys that
+  aren't fields of the Repeat (`stop_id`) stay on the row through Edit, so the Submit connector can
+  update rows that have a key, insert rows without one (added in the chat), and delete keys that are
+  gone (removed in the chat):
+  ```sql
+  for i in 0 .. l_rows.get_size - 1 loop
+    l_r := treat(l_rows.get(i) as json_object_t);
+    if l_r.has('stop_id') then
+      update trip_stops set city = l_r.get_string('city'), nights = l_r.get_number('nights')
+       where stop_id = l_r.get_number('stop_id') and trip_id = l_trip_id;
+    else
+      insert into trip_stops (trip_id, city, nights) values (l_trip_id, l_r.get_string('city'), l_r.get_number('nights'));
+    end if;
+  end loop;
+  -- then delete this trip's stops whose stop_id is not in l_rows
+  ```
+  Always check in the connector that each key belongs to the record being saved (`trip_id` above), since
+  the rows come back from the browser.
 
 ### Bulk update
 
@@ -1080,7 +1105,7 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 132 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
+- The JavaScript engine and widget are tested: 141 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/repeat-edit.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
   `tests/email.test.js`, `tests/agent.test.js`, `tests/rest.test.js`), plus manual end-to-end runs of the demos.

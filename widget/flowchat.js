@@ -260,6 +260,7 @@
     '.opt.cur{font-weight:600}.optnone{padding:8px 12px;font-size:13px;color:var(--fc-muted)}',
     '.items{display:flex;flex-direction:column;gap:4px;max-height:180px;overflow-y:auto}',
     '.item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;border:1px solid var(--fc-border);border-radius:10px;font-size:13.5px}',
+    '.item-acts{display:flex;gap:10px;flex:none}',
     '.item span{overflow-wrap:anywhere}.li{padding:5px 0;border-top:1px dashed var(--fc-border)}.li:first-of-type{border-top:0}',
     '.li small{display:block;color:var(--fc-muted);font-size:12px}',
     '.btns{display:flex;gap:8px;flex-wrap:wrap}',
@@ -933,15 +934,23 @@
         done.addEventListener('click', () => this.send({ command: 'done' }, a.doneLabel || 'Done'));
         c.append(fchips, done);
       } else if (a.type === 'listMenu') {
-        // Repeat step: the items so far (each removable), Add and Done.
+        // Repeat step: the items so far (each changeable and removable), Add and Done.
         if ((a.items || []).length) {
           var items = h('div', 'items');
           a.items.forEach((it) => {
-            var row = h('div', 'item'); row.append(h('span', null, it.title));
+            var row = h('div', 'item'), acts = h('span', 'item-acts');
+            row.append(h('span', null, it.title));
+            if (a.canEdit) {
+              var ed = h('button', 'edit', a.editLabel || 'Edit'); ed.type = 'button';
+              ed.setAttribute('aria-label', (a.editLabel || 'Edit') + ' ' + it.title);
+              ed.addEventListener('click', () => this.send({ command: 'editItem', index: it.index }, (a.editLabel || 'Edit') + ' ' + it.title));
+              acts.append(ed);
+            }
             var rm = h('button', 'edit', a.removeLabel || 'Remove'); rm.type = 'button';
             rm.setAttribute('aria-label', (a.removeLabel || 'Remove') + ' ' + it.title);
             rm.addEventListener('click', () => this.send({ command: 'remove', index: it.index }, (a.removeLabel || 'Remove') + ' ' + it.title));
-            row.append(rm);
+            acts.append(rm);
+            row.append(acts);
             items.append(row);
           });
           c.append(items);
@@ -1091,7 +1100,7 @@
   FlowChatElement.DomAdapter = DomAdapter;
   FlowChatElement.ApexAdapter = ApexAdapter;
   FlowChatElement.NoneAdapter = NoneAdapter;
-  FlowChatElement.version = '1.4.0';   // 1.4.0: information notes; 1.2.0: floating mode (display="floating")
+  FlowChatElement.version = '1.5.0';   // 1.5.0: Edit on list items; 1.4.0: information notes; 1.2.0: floating mode (display="floating")
   // Only one copy can define <flow-chat>. If an older one got there first (for example
   // #APP_FILES#flowchat.js next to the region plugin), say so instead of failing silently.
   var existing = customElements.get('flow-chat');
