@@ -29,6 +29,10 @@ create or replace package fc_data authid definer as
   -- PLSQL sources receive it as "verified" in their payload.
   procedure set_verified (p_value in varchar2);
 
+  -- Batch mode (FC_CLIENT): the user a flow runs as when there is no APEX session, e.g. in a job.
+  -- Used for :APP_USER in row filters and lookup lists, and appUser in PL/SQL sources. null = unset.
+  procedure set_app_user (p_user in varchar2) accessible by (package fc_engine);
+
   -- First rows of a TABLE source (row_filter applied, nothing masked) for the designer's Test tab:
   --   [{ "key": "...", "version": "...", "values": {...} }]. PLSQL sources return [].
   function sample_rows (p_source in varchar2, p_limit in pls_integer default 20) return json_array_t;
@@ -45,6 +49,7 @@ create or replace package body fc_data as
   c_nls constant varchar2(40) := 'NLS_NUMERIC_CHARACTERS=''.,''';
   c_max_options constant pls_integer := 500;
   g_verified varchar2(4000);
+  g_app_user varchar2(255);
 
   type t_field is record (
     field       fc_data_source_fields.field%type,
@@ -81,9 +86,14 @@ create or replace package body fc_data as
     g_verified := p_value;
   end set_verified;
 
+  procedure set_app_user (p_user in varchar2) accessible by (package fc_engine) is
+  begin
+    g_app_user := p_user;
+  end set_app_user;
+
   function app_user return varchar2 is
   begin
-    return coalesce(sys_context('APEX$SESSION', 'APP_USER'), user);
+    return coalesce(g_app_user, sys_context('APEX$SESSION', 'APP_USER'), user);
   end app_user;
 
   procedure load_source (p_source in varchar2, p_src out fc_data_sources%rowtype, p_fields out t_fields) is

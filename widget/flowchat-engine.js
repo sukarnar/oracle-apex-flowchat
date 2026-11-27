@@ -2454,7 +2454,7 @@
                    canAdd: items.length < repeatMax(n), canDone: items.length >= repeatMin(n),
                    addLabel: items.length ? (n.addLabel || 'Add another') : (n.firstAddLabel || 'Add'),
                    doneLabel: n.doneLabel || 'Done', removeLabel: n.removeLabel || 'Remove',
-                   canEdit: repeatCanEdit(n), editLabel: n.editLabel || 'Edit' };
+                   canEdit: repeatCanEdit(n), editLabel: n.editLabel || 'Edit', slot: n.slot };
           }
         } else if (n.type === 'bulkUpdate' && st.bulk[n.id]) {
           var bv = Object.assign({}, v, { count: st.bulk[n.id].count });
@@ -2706,7 +2706,109 @@
     };
   }
 
+  // ---------------------------------------------------------------- batch mode
+  // Runs a flow with every answer given up front, the way FC_CLIENT.RUN does in the database.
+  // answers: { slot: value, nodeId: value (menus, record picks, bulk confirm), list: [ {field: value}, … ],
+  //            changeFieldsNodeId: {field: value} }.
+  // opts: { context, version, confirm (default true: confirm summaries and bulk updates),
+  //         lists: 'replace' (default: a list given in answers replaces items already there) | 'append',
+  //         maxTurns (default 200) }.
+  // Returns { status: completed | failed | refused | needs_input, sessionId, nodeId, slot, question, error,
+  //           slots, transcript: [{from: bot|user, type, text}], turns }.
+  async function runBatch(engine, flowId, answers, opts) {
+    answers = answers || {}; opts = opts || {};
+    var maxTurns = opts.maxTurns || 200, confirm = opts.confirm !== false, append = opts.lists === 'append';
+    var transcript = [], turns = 0, t, sid = null, pendingKey = null;
+    var listPos = {}, listDone = {}, changed = {}, pendingChange;
+    var has = function (k) { return k !== undefined && k !== null && Object.prototype.hasOwnProperty.call(answers, k); };
+    var keyOf = function (a) { return a ? a.type + '|' + a.nodeId + '|' + (a.slot || '') : ''; };
+    function log(turn) { (turn.messages || []).forEach(function (m) { transcript.push({ from: 'bot', type: m.type, text: m.text || '' }); }); }
+    function lastOf(turn, type) {
+      var ms = (turn && turn.messages) || [];
+      for (var i = ms.length - 1; i >= 0; i--) if (ms[i].type === type && ms[i].text) return ms[i].text;
+      return null;
+    }
+    function result(status, extra) {
+      var aw = t && t['await'];
+      return Object.assign({ status: status, sessionId: sid, nodeId: aw ? aw.nodeId : null, slot: aw ? aw.slot || null : null,
+        question: status === 'needs_input' ? lastOf(t, 'text') : null, error: null,
+        slots: sid && engine.getState(sid) ? clone(engine.getState(sid).slots || {}) : {}, transcript: transcript, turns: turns }, extra || {});
+    }
+    async function send(payload, shown) {
+      transcript.push({ from: 'user', type: 'answer', text: shown });
+      turns++;
+      t = await engine.input(sid, payload);
+      log(t);
+    }
+    function shownOf(v) { return v === null || v === undefined ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v); }
+
+    t = await engine.start(flowId, opts.context || {}, { version: opts.version });
+    sid = t.sessionId; log(t);
+    for (;;) {
+      if (t.status !== 'in_progress') {
+        return t.status === 'completed' ? result('completed') : result('failed', { error: lastOf(t, 'error') || 'The flow failed.' });
+      }
+      var aw = t['await'];
+      if (!aw) return result('failed', { error: 'The flow is waiting but asks nothing.' });
+      // The same question again, with an error, right after an answer: the answer was refused.
+      if (pendingKey && keyOf(aw) === pendingKey && (t.messages || []).some(function (m) { return m.type === 'error'; })) {
+        return result('refused', { error: lastOf(t, 'error') });
+      }
+      if (turns >= maxTurns) return result('failed', { error: 'Stopped after ' + maxTurns + ' turns.' });
+      pendingKey = keyOf(aw);
+      var v, dot = aw.slot ? String(aw.slot).indexOf('.') : -1, list = dot > 0 ? aw.slot.slice(0, dot) : null;
+
+      if (aw.type === 'ask') {
+        if (aw.slot === '#code' || (aw.input && aw.input.kind === 'file')) return result('needs_input', { error: 'This step can\'t be answered in batch mode.' });
+        if (aw.sub && pendingChange !== undefined) {                       // a field of a Change fields step
+          v = pendingChange; pendingChange = undefined;
+        } else if (list && Array.isArray(answers[list])) {                 // a field of a list item
+          if (listPos[list] === undefined) listPos[list] = 0;              // a required list starts its first item by itself
+          var item = answers[list][listPos[list]] || {}, field = aw.slot.slice(dot + 1);
+          if (Object.prototype.hasOwnProperty.call(item, field)) v = item[field];
+          else if (aw.input && aw.input.required === false) v = '';
+          else return result('needs_input', { error: 'Item ' + (listPos[list] + 1) + ' of "' + list + '" has no "' + field + '".' });
+        } else if (has(aw.slot) && aw.slot.charAt(0) !== '#') v = answers[aw.slot];
+        else if (has(aw.nodeId)) v = answers[aw.nodeId];
+        else if (aw.input && aw.input.required === false && !aw.menu) v = '';
+        else return result('needs_input');
+        await send({ value: typeof v === 'object' && v !== null ? JSON.stringify(v) : v }, shownOf(v));
+      } else if (aw.type === 'summary') {
+        if (!confirm) return result('needs_input');
+        await send({ value: 'confirm' }, aw.confirmLabel || 'Confirm');
+      } else if (aw.type === 'listMenu') {
+        var given = aw.slot && Array.isArray(answers[aw.slot]) ? answers[aw.slot] : null;
+        if (!given || listDone[aw.slot]) {
+          if (!aw.canDone) return result('needs_input', { error: 'The list needs more items.' });
+          await send({ command: 'done' }, aw.doneLabel || 'Done');
+        } else if (listPos[aw.slot] === undefined && !append && (aw.items || []).length) {
+          await send({ command: 'remove', index: 0 }, 'Remove ' + aw.items[0].title);  // replace: clear what is there first
+        } else {
+          listPos[aw.slot] = listPos[aw.slot] === undefined ? 0 : listPos[aw.slot] + 1;
+          if (listPos[aw.slot] < given.length) await send({ command: 'add' }, aw.addLabel || 'Add');
+          else { listDone[aw.slot] = true; await send({ command: 'done' }, aw.doneLabel || 'Done'); }
+        }
+      } else if (aw.type === 'fieldMenu') {
+        var ch = answers[aw.nodeId] && typeof answers[aw.nodeId] === 'object' ? answers[aw.nodeId] : {};
+        changed[aw.nodeId] = changed[aw.nodeId] || {};
+        var next = Object.keys(ch).find(function (f) { return !changed[aw.nodeId][f]; });
+        if (next === undefined) await send({ command: 'done' }, aw.doneLabel || 'Done');
+        else { changed[aw.nodeId][next] = true; pendingChange = ch[next]; await send({ field: next }, 'Change ' + next); }
+      } else if (aw.type === 'pick') {
+        if (!has(aw.nodeId)) return result('needs_input');
+        await send({ value: String(answers[aw.nodeId]) }, String(answers[aw.nodeId]));
+      } else if (aw.type === 'confirm') {
+        if (has(aw.nodeId) && String(answers[aw.nodeId]).toLowerCase() === 'cancel') await send({ command: 'cancel' }, 'Cancel');
+        else if (confirm || has(aw.nodeId)) await send({ command: 'confirm' }, aw.confirmLabel || 'Confirm');
+        else return result('needs_input');
+      } else {
+        return result('needs_input', { error: 'Batch mode can\'t answer a "' + aw.type + '" step.' });
+      }
+    }
+  }
+
   var api = { createEngine: createEngine, createMemorySource: createMemorySource, parseValue: parseValue, openAIProvider: openAIProvider,
+              runBatch: runBatch,
               evalCond: evalCond, interpolate: interpolate, parseFile: parseFile, maskJsonText: maskJsonText };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else global.FlowChatEngine = api;

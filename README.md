@@ -42,6 +42,7 @@ db/         install.sql              first-time install: runs 01..07, 09..12 in 
             16_seed_agent_demo.sql   Agent demo: FC_DEMO_LEAVE tables and connectors, 3 tools, a skill, flow leave_agent_demo
             17_rest_endpoints.sql    FC_REST_ENDPOINTS (the APIs a REST call node may call)
             18_seed_trip_flow.sql    Trip booking sample: TRIPS tables, FYyy-n itinerary numbers, 5 connectors, approval/cancel emails, flow trip_booking
+            19_fc_client.sql         FC_CLIENT: batch mode, run a flow from PL/SQL with every answer given up front
 demo/       index.html               create demo (runs in the browser using the JS engine)
             update.html              search and update demo, with a live table and a conflict button
             verify.html              public-page demo: one-time code first, with an in-page outbox
@@ -58,6 +59,7 @@ tests/      engine.test.js           node tests/engine.test.js
             redact.test.js           node tests/redact.test.js (hidden answers: masked input, chat and logs)
             note.test.js             node tests/note.test.js (information notes on questions)
             repeat-edit.test.js      node tests/repeat-edit.test.js (Repeat: Edit an item already in the list)
+            batch.test.js            node tests/batch.test.js (batch mode: runBatch, the reference for FC_CLIENT.RUN)
             menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
             email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
             rest.test.js             node tests/rest.test.js (REST call node: URL building, body template, mapping, routing, refusals, replay)
@@ -1088,6 +1090,71 @@ Samples in the designer). It uses a provider registered as `corp_llm`.
   `upgrade_phase_f.sql`). It creates `FC_REST_ENDPOINTS`, adds `FC_AI_TOOLS.REQUEST` and the `REST`
   tool type, and recompiles the packages. `install.sql` includes it.
 
+## Run a flow from PL/SQL (batch mode)
+
+`FC_CLIENT.RUN` runs a flow with every answer given up front: for scheduler jobs, imports from other
+systems and regression tests. It drives `FC_ENGINE` exactly as the widget does, so the flow's checks,
+lookups, connectors, emails and workflows all run as in a conversation.
+
+```sql
+declare
+  r fc_client.t_result;
+begin
+  r := fc_client.run(
+         p_flow_id  => 'trip_booking',
+         p_answers  => q'~{
+           "trip_mode": "NEW",
+           "travel_type": "Official", "business_purpose": "Customer workshop",
+           "destinations": [
+             {"city": "Berlin", "country": "Germany", "departure_date": "2027-03-01",
+              "arrival_date": "2027-03-02", "travel_medium": "AIR", "transport_name": "LH 401"}],
+           "exp_devices": "N", "exp_tech_data": "N", "exp_sanctioned": "N",
+           "exp_foreign_officials": "N", "exp_hardware": "N", "exp_encryption": "N",
+           "clr_passport": "Y", "clr_visa": "HAVE", "clr_briefing": "Y", "clr_level": "NONE",
+           "next_action": "later" }~',
+         p_app_user => 'JDOE');
+  fc_client.put_result(r);          -- status, where it stopped, and the whole transcript
+  if r.status = 'completed' then
+    dbms_output.put_line('Saved ' || json_value(r.slots, '$.itinerary_no'));
+    commit;                         -- RUN never commits
+  end if;
+end;
+```
+
+- **Answers** (`p_answers`, JSON):
+  - `"slot": value` answers an Ask or a Menu with that slot. A choice can be given by its value or its
+    label (`"Official"`), yes/no as `Y`/`N`, `yes`/`no` or `true`/`false`, a date as `YYYY-MM-DD`.
+  - `"nodeId": value` answers a Menu without a slot, a record pick (title text or 1-based number),
+    or a bulk update (`"confirm"` / `"cancel"`).
+  - `"list": [{...}, ...]` fills a Repeat, one object per item keyed by its fields. By default it
+    replaces items already there (e.g. loaded by a lookup); `p_lists => 'append'` adds to them. A list
+    that isn't given keeps what it has.
+  - `"changeNodeId": {"field": value}` changes fields in a Change fields step.
+  - Summaries are confirmed (`p_confirm => false` stops there instead). Optional questions without an
+    answer are skipped. Steps already answered or skipped by the flow (`skipIfFilled`) aren't asked.
+- **Result** (`t_result`): `status` is
+  - `completed`;
+  - `needs_input`: a question had no answer (`slot`, `node_id` and `question` say which), or the step
+    can't be answered in batch mode (a one-time code or a file);
+  - `refused`: the flow refused an answer; `error` has its message, e.g. "Please answer yes or no.";
+  - `failed`: the flow failed, or `p_max_turns` (200) was reached.
+
+  `slots` holds every answer plus the values connectors returned (e.g. `itinerary_no`), and
+  `transcript` the whole conversation as JSON. `fc_client.to_json(r)` gives the result as one JSON
+  document.
+- **Transactions:** `RUN` never commits. A run that doesn't complete is rolled back to where it started
+  (`p_undo_incomplete => true`, the default), so it leaves nothing behind, its `FC_SESSIONS` and
+  `FC_EVENTS` rows included. Pass `false` to keep them for debugging. A connector that commits on its
+  own can't be undone.
+- **The user:** `p_app_user` is who the flow runs as when there is no APEX session, as in a
+  scheduler job. It's the `appUser` connectors get, `{{app_user}}`, and `:APP_USER` in row filters and
+  lookup lists. Without it, the APEX session's user (or the database user) is used. Connectors trust
+  `appUser`, so **grant EXECUTE on FC_CLIENT only to schemas allowed to act as any user**. The two
+  engine calls it uses (`FC_ENGINE.set_app_user`, `session_slots`) are `ACCESSIBLE BY (package
+  fc_client)`.
+- **JavaScript:** `FlowChatEngine.runBatch(engine, flowId, answers, {context, version, confirm, lists,
+  maxTurns})` does the same with the JavaScript engine and is what `tests/batch.test.js` tests.
+
 ## Turn protocol
 
 The server and the widget exchange exactly one JSON shape. Any backend that produces it works with the widget.
@@ -1105,13 +1172,16 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 141 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/repeat-edit.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
+- The JavaScript engine and widget are tested: 150 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/repeat-edit.test.js`, `tests/batch.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
   `tests/email.test.js`, `tests/agent.test.js`, `tests/rest.test.js`), plus manual end-to-end runs of the demos.
 - **The REST call node's and REST tools' PL/SQL (`run_rest`, `rest_call`, `rest_tool` and the other `rest_*` helpers in `FC_ENGINE`,
   `17_rest_endpoints.sql`, `list_rest` in `FC_DESIGNER`) has not been compiled or called a real API
   yet.** It mirrors the tested JavaScript engine.
+- **`FC_CLIENT` (batch mode) and its engine hooks (`set_app_user`, `session_slots`, `FC_DATA.set_app_user`)
+  have not been compiled or run yet.** `FC_CLIENT.RUN` is a line-by-line port of `runBatch`, which the
+  JavaScript tests cover.
 - **Hidden answers in PL/SQL (`redact_mode`, `mask_display`, `current_redact` in `FC_ENGINE`) have
   not been compiled yet.** They mirror the tested JavaScript engine.
 - **The database-error handling in Save changes and Bulk update (`db_error_text`, `undo_to` and the

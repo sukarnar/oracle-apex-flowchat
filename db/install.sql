@@ -31,6 +31,9 @@ prompt == Sample flows (loan_application, update_application)
 prompt == Designer back end (FC_DESIGNER Ajax Callback)
 @@09_fc_designer.sql
 show errors package body fc_designer
+prompt == Batch mode (FC_CLIENT.RUN: run a flow from PL/SQL)
+@@19_fc_client.sql
+show errors package body fc_client
 prompt == Verify step demo (send_code connector, loan_apps_public)
 @@10_verify_demo.sql
 prompt == Sample flow update_application_public

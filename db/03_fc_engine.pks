@@ -38,6 +38,14 @@ create or replace package fc_engine authid definer as
   -- Debug rows for every conversation handled by this database session (for example in a test script).
   procedure set_debug (p_on in boolean default true);
 
+  -- Batch mode (FC_CLIENT.RUN) only ---------------------------------------
+  -- The signed-in user for conversations started or continued in this database session when there is
+  -- no APEX session (e.g. a scheduler job). Connectors trust appUser, so only FC_CLIENT may set it;
+  -- grant FC_CLIENT only to schemas allowed to act as any user. null = back to the APEX session / USER.
+  procedure set_app_user (p_user in varchar2) accessible by (package fc_client);
+  -- The conversation's answers and the values connectors returned, unmasked: {slot: value, ...}.
+  function session_slots (p_session_id in varchar2) return clob accessible by (package fc_client);
+
   -- HTTP entry points -------------------------------------------------------
   -- APEX Ajax Callback processes: FC_START -> fc_engine.apex_start; FC_INPUT -> fc_engine.apex_input
   --   apex_start: x01 = flow id, x02 = context JSON, x03 = version (optional)

@@ -34,6 +34,7 @@ create or replace package body fc_engine as
   -- Debug logging: set_debug(true) logs every conversation of this database session;
   -- a flow with "debug": true logs its own. g_dbg_sid = the conversation being logged in this request.
   g_debug   boolean := false;
+  g_app_user varchar2(255);   -- batch mode (FC_CLIENT): the user to run as; null = APEX session / USER
   g_dbg_sid varchar2(32);
 
   function field_def (p_change_node in json_object_t, p_field in varchar2) return json_object_t;   -- forward
@@ -71,6 +72,12 @@ create or replace package body fc_engine as
   end fmt_num;
 
   -- Any JSON scalar member as text (numbers in canonical '.' format), null if absent.
+  -- The signed-in user: set by FC_CLIENT in batch mode, else the APEX session's user, else the database user.
+  function app_user_name return varchar2 is
+  begin
+    return coalesce(g_app_user, sys_context('APEX$SESSION', 'APP_USER'), user);
+  end app_user_name;
+
   function str (p_obj in json_object_t, p_key in varchar2) return varchar2 is
     l_el json_element_t;
   begin
@@ -239,7 +246,7 @@ create or replace package body fc_engine as
         end loop;
       end if;
     end if;
-    l_v.put('app_user', coalesce(sys_context('APEX$SESSION', 'APP_USER'), user));
+    l_v.put('app_user', app_user_name);
     return l_v;
   end vals;
 
@@ -426,7 +433,7 @@ create or replace package body fc_engine as
     l.put('nodeId', p_node_id);
     l.put('slots', c.slots);
     -- The signed-in user, from the APEX session (not from the browser), for REST and PL/SQL connectors.
-    l.put('appUser', coalesce(sys_context('APEX$SESSION', 'APP_USER'), user));
+    l.put('appUser', app_user_name);
     if c.state.has('context') then l.put('context', c.state.get_object('context')); end if;
     if p_slot is not null then l.put('slot', p_slot); end if;
     if p_value is not null then l.put('value', p_value); end if;
@@ -2013,7 +2020,7 @@ create or replace package body fc_engine as
         if l_v.get(l_keys(i)).is_object then l_v.put(l_keys(i), l_v.get(l_keys(i)).to_string); end if;
       end loop;
     end if;
-    l_v.put('app_user', coalesce(sys_context('APEX$SESSION', 'APP_USER'), user));
+    l_v.put('app_user', app_user_name);
     rest_call(c, l_spec, p_endpoint, l_v, l_method, l_path, l_status, l_root, l_problem, l_ms);
 
     if dbg_enabled(c) then
@@ -4594,6 +4601,7 @@ create or replace package body fc_engine as
                                     else nvl(str(l_node, 'firstAddLabel'), 'Add') end);
           l_aw.put('doneLabel', nvl(str(l_node, 'doneLabel'), 'Done'));
           l_aw.put('removeLabel', nvl(str(l_node, 'removeLabel'), 'Remove'));
+          l_aw.put('slot', str(l_node, 'slot'));
           l_aw.put('canEdit', rp_can_edit(l_node));
           l_aw.put('editLabel', nvl(str(l_node, 'editLabel'), 'Edit'));
         end if;
@@ -5778,7 +5786,7 @@ create or replace package body fc_engine as
 
     insert into fc_sessions (session_id, flow_id, version, status, state, app_user, apex_session, expires_at)
     values (l_sid, p_flow_id, l_version, 'in_progress', '{}',
-            coalesce(sys_context('APEX$SESSION', 'APP_USER'), user),
+            app_user_name,
             sys_context('APEX$SESSION', 'APP_SESSION'),
             systimestamp + c_ttl);
     log_ev(c, 'IN', null, nvl(p_context, '{}'));
@@ -6078,6 +6086,23 @@ create or replace package body fc_engine as
   begin
     g_debug := nvl(p_on, false);
   end set_debug;
+
+  procedure set_app_user (p_user in varchar2) accessible by (package fc_client) is
+  begin
+    g_app_user := p_user;
+    fc_data.set_app_user(p_user);   -- row filters, lookup lists and PL/SQL sources see the same user
+  end set_app_user;
+
+  function session_slots (p_session_id in varchar2) return clob accessible by (package fc_client) is
+    l_state clob;
+    l_slots json_object_t;
+  begin
+    select state into l_state from fc_sessions where session_id = p_session_id;
+    l_slots := obj(json_object_t.parse(l_state), 'slots');
+    return case when l_slots is null then to_clob('{}') else l_slots.to_clob end;
+  exception when no_data_found then
+    return to_clob('{}');
+  end session_slots;
 
   procedure apex_start is
   begin
