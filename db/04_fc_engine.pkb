@@ -5739,6 +5739,7 @@ create or replace package body fc_engine as
     l_ctx     json_object_t;
     l_turn    clob;
     l_sid     varchar2(32);
+    l_user    varchar2(255) := app_user_name;   -- a private function can't be called inside SQL
   begin
     g_dbg_sid := null;
     if p_version is not null then
@@ -5786,7 +5787,7 @@ create or replace package body fc_engine as
 
     insert into fc_sessions (session_id, flow_id, version, status, state, app_user, apex_session, expires_at)
     values (l_sid, p_flow_id, l_version, 'in_progress', '{}',
-            app_user_name,
+            l_user,
             sys_context('APEX$SESSION', 'APP_SESSION'),
             systimestamp + c_ttl);
     log_ev(c, 'IN', null, nvl(p_context, '{}'));
