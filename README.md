@@ -42,7 +42,7 @@ db/         install.sql              first-time install: runs 01..07, 09..12 in 
             16_seed_agent_demo.sql   Agent demo: FC_DEMO_LEAVE tables and connectors, 3 tools, a skill, flow leave_agent_demo
             17_rest_endpoints.sql    FC_REST_ENDPOINTS (the APIs a REST call node may call)
             18_seed_trip_flow.sql    Trip booking sample: TRIPS tables, FYyy-n itinerary numbers, 5 connectors, approval/cancel emails, flow trip_booking
-            19_fc_client.sql         FC_CLIENT: batch mode, run a flow from PL/SQL with every answer given up front
+            19_fc_client.sql         FC_CLIENT: run a flow from PL/SQL, in batch mode or turn by turn (chat channels)
 demo/       index.html               create demo (runs in the browser using the JS engine)
             update.html              search and update demo, with a live table and a conflict button
             verify.html              public-page demo: one-time code first, with an in-page outbox
@@ -60,6 +60,7 @@ tests/      engine.test.js           node tests/engine.test.js
             note.test.js             node tests/note.test.js (information notes on questions)
             repeat-edit.test.js      node tests/repeat-edit.test.js (Repeat: Edit an item already in the list)
             batch.test.js            node tests/batch.test.js (batch mode: runBatch, the reference for FC_CLIENT.RUN)
+            turns.test.js            node tests/turns.test.js (turn by turn: the reference for FC_CLIENT.REPLY / RENDER)
             menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
             email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
             rest.test.js             node tests/rest.test.js (REST call node: URL building, body template, mapping, routing, refusals, replay)
@@ -1155,6 +1156,66 @@ end;
 - **JavaScript:** `FlowChatEngine.runBatch(engine, flowId, answers, {context, version, confirm, lists,
   maxTurns})` does the same with the JavaScript engine and is what `tests/batch.test.js` tests.
 
+## Drive a flow turn by turn from PL/SQL (chat channels, Forms, tests)
+
+The other half of `FC_CLIENT` runs one answer at a time without the widget: a Teams, Slack, SMS or
+email bot, an Oracle Forms screen, or a test that checks every question. You never parse JSON: each
+call returns a `t_turn` record, `render` writes it as plain text, and `reply` reads what the person
+typed back.
+
+```sql
+declare
+  t fc_client.t_turn;
+begin
+  t := fc_client.start_flow('trip_booking', p_app_user => 'JDOE');
+  fc_client.put_turn(t);                       -- or send fc_client.render(t) to the channel
+  t := fc_client.reply(t, 'Ana Doe');          -- the emergency contact's name
+  t := fc_client.reply(t, '1');                -- option 1: Spouse / partner
+  fc_client.put_turn(t);
+  commit;                                      -- keeps the conversation for the next request
+end;
+```
+
+What `render` gives a channel, for a list:
+
+```
+Added Berlin, Germany (2027-03-01 → 2027-03-02, Air LH 401).
+Destinations (1)
+1. Berlin, Germany (2027-03-01 → 2027-03-02, Air LH 401)
+Add another destination, or tap Done.
+Reply ADD, EDIT n, REMOVE n, DONE. BACK goes back.
+```
+
+- **`t_turn`:**
+  - `kind`: what is asked: `text`, `number`, `date`, `choice`, `yesno`, `file`, `code`, `pick` (a
+    record), `list` (a Repeat), `fields` (change a record or an item), `summary`, `confirm` (a bulk
+    update), or `none` once the flow has finished (`status` then says `completed` or `failed`).
+  - `question`, `label`, `slot`, `node_id`, `value` (the current answer when asked again),
+    `required` / `can_skip`, `secret` (a hidden answer or a code: don't echo or log it), `item`.
+  - `options`: numbered from 1 as rendered, each with `value`, `label`, `detail`, `enabled`, `reason`
+    and `changed`: a choice's options, the records to pick, a list's items, the fields to change, or
+    the summary's answers that can be changed.
+  - `messages` (`msg_type`, `text`, and `body`, the items of a summary, record or list as text),
+    `note` / `note_style`, `error` (why the last answer was refused), `can_go_back`, the list flags
+    `can_add` / `can_done` / `can_edit`, button labels, `progress_done` / `progress_total`, and
+    `turn_json`, the engine's turn unchanged.
+- **`reply(t, text)`** reads a reply the way a person means it: `back` and `restart` anywhere; an
+  option's number, value or label; `none` for a record pick; `add`, `done`, `edit 2`, `remove 2` in a
+  list; a field's number or `done` when changing fields; `confirm` or `edit 3` at a summary; `resend`
+  for a code; `skip` for an optional question; anything else is the answer. `reply(session_id, text)`
+  does the same when you only kept the session id (it reads `current_turn` first).
+- **Explicit steps:** `answer`, `pick` (a token, or null for none), `back`, `restart`, `edit` (a
+  slot), `add_item`, `edit_item` / `remove_item` (numbered from 1), `change_field`, `done`,
+  `confirm`, `cancel`, `resend_code`, and `send` for any input of the turn protocol as JSON.
+  `current_turn` shows where a conversation stands ("Welcome back...") after a pause.
+- **The user:** `start_flow(p_app_user => ...)` stores the user on the session, and later calls run
+  as that user. A call with a different `p_app_user` is refused (ORA-20060). The same grant rule as
+  batch mode applies.
+- **Transactions:** like `FC_ENGINE`, the calls never commit. Commit after each one when the next may
+  come from another database session (a REST handler, the next request).
+- **JavaScript:** `FlowChatEngine.describeTurn`, `renderTurn` and `replyInput` are the same logic for
+  the JavaScript engine, and `tests/turns.test.js` tests them.
+
 ## Turn protocol
 
 The server and the widget exchange exactly one JSON shape. Any backend that produces it works with the widget.
@@ -1172,16 +1233,16 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 150 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/repeat-edit.test.js`, `tests/batch.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
+- The JavaScript engine and widget are tested: 158 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/repeat-edit.test.js`, `tests/batch.test.js`, `tests/turns.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
   `tests/email.test.js`, `tests/agent.test.js`, `tests/rest.test.js`), plus manual end-to-end runs of the demos.
 - **The REST call node's and REST tools' PL/SQL (`run_rest`, `rest_call`, `rest_tool` and the other `rest_*` helpers in `FC_ENGINE`,
   `17_rest_endpoints.sql`, `list_rest` in `FC_DESIGNER`) has not been compiled or called a real API
   yet.** It mirrors the tested JavaScript engine.
-- **`FC_CLIENT` (batch mode) and its engine hooks (`set_app_user`, `session_slots`, `FC_DATA.set_app_user`)
-  have not been compiled or run yet.** `FC_CLIENT.RUN` is a line-by-line port of `runBatch`, which the
-  JavaScript tests cover.
+- **`FC_CLIENT` turn by turn (`start_flow`, `reply`, `render` ...) has not been compiled or run yet.**
+  It is a port of `describeTurn` / `renderTurn` / `replyInput`, which `tests/turns.test.js` covers.
+  Batch mode (`RUN`) and its engine hooks compile.
 - **Hidden answers in PL/SQL (`redact_mode`, `mask_display`, `current_redact` in `FC_ENGINE`) have
   not been compiled yet.** They mirror the tested JavaScript engine.
 - **The database-error handling in Save changes and Bulk update (`db_error_text`, `undo_to` and the

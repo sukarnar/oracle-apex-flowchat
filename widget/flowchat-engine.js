@@ -2807,8 +2807,173 @@
     }
   }
 
+  // ---- Turn by turn without the widget (the reference for FC_CLIENT.T_TURN, RENDER and REPLY):
+  // a chat channel (Teams, Slack, SMS, email), a Forms screen or a test drives a conversation itself.
+  // describeTurn flattens a turn into one shape whatever the step; renderTurn writes it as plain text;
+  // replyInput turns a typed reply ("2", "back", "edit 1", "done") into the input the engine expects.
+  function asText(v) {
+    if (v === null || v === undefined) return null;
+    return typeof v === 'object' ? JSON.stringify(v) : String(v);
+  }
+  function messageBody(m) {
+    var items = Array.isArray(m.items) ? m.items : [];
+    if (!items.length) return null;
+    return items.map(function (it, i) {
+      if (m.type === 'list') return (i + 1) + '. ' + (it.title || '');
+      if (m.type === 'changes') return '- ' + (it.label || it.slot) + ': ' + (asText(it.before) || '(empty)') + ' -> ' + (asText(it.after) || '(empty)');
+      return '- ' + (it.label || it.slot) + ': ' + (asText(it.display) || '');
+    }).join('\n');
+  }
+  function describeTurn(turn) {
+    turn = turn || {};
+    var aw = turn['await'] || null, pr = turn.progress || {};
+    var t = { sessionId: turn.sessionId || null, flowId: turn.flowId || null, version: turn.version || null,
+              status: turn.status || null, kind: 'none', nodeId: null, slot: null, label: null, question: null,
+              value: null, required: false, secret: false, canSkip: false, item: null, note: null, noteStyle: null,
+              options: [], messages: [], error: null, canGoBack: !!turn.canGoBack, canAdd: false, canDone: false,
+              canEdit: false, addLabel: null, doneLabel: null, editLabel: null, removeLabel: null,
+              confirmLabel: null, cancelLabel: null, noneLabel: null,
+              progressDone: pr.done === undefined ? null : pr.done, progressTotal: pr.total === undefined ? null : pr.total };
+    (turn.messages || []).forEach(function (m) {
+      t.messages.push({ type: m.type || 'text', text: m.text || '', body: messageBody(m) });
+      if (m.type === 'error' && m.text) t.error = m.text;
+      if (m.type === 'text' && m.text) t.question = m.text;
+    });
+    function opt(value, label, extra) {
+      t.options.push(Object.assign({ value: asText(value), label: label === null || label === undefined ? asText(value) : String(label),
+                                     detail: null, enabled: true, reason: null, changed: false }, extra || {}));
+    }
+    if (!aw) return t;
+    t.nodeId = aw.nodeId || null; t.slot = aw.slot || null; t.item = aw.item || null;
+    if (aw.type === 'ask') {
+      var inp = aw.input || {};
+      t.kind = aw.slot === '#code' ? 'code' : aw.menu ? 'choice' : (inp.kind || 'text');
+      t.label = aw.label || aw.slot || null;
+      t.value = asText(aw.value);
+      t.required = aw.menu || inp.required !== false;
+      t.canSkip = !t.required;
+      t.secret = !!(aw.redact || aw.secret);
+      if (aw.note) { t.note = aw.note.text || null; t.noteStyle = aw.note.style || 'info'; }
+      if (t.kind === 'yesno') { opt('Y', 'Yes'); opt('N', 'No'); }
+      else (inp.options || []).forEach(function (o) { opt(o.value, o.label); });
+    } else if (aw.type === 'pick') {
+      t.kind = 'pick'; t.canSkip = aw.allowNone !== false; t.noneLabel = aw.noneLabel || 'None of these';
+      (aw.items || []).forEach(function (it) { opt(it.token, it.title, { detail: it.subtitle || null }); });
+    } else if (aw.type === 'listMenu') {
+      t.kind = 'list'; t.slot = aw.slot || null;
+      t.canAdd = !!aw.canAdd; t.canDone = !!aw.canDone; t.canEdit = !!aw.canEdit;
+      t.addLabel = aw.addLabel || 'Add'; t.doneLabel = aw.doneLabel || 'Done';
+      t.editLabel = aw.editLabel || 'Edit'; t.removeLabel = aw.removeLabel || 'Remove';
+      (aw.items || []).forEach(function (it) { opt(it.index, it.title); });
+    } else if (aw.type === 'fieldMenu') {
+      t.kind = 'fields'; t.doneLabel = aw.doneLabel || 'Done'; t.label = aw.title || null;
+      (aw.fields || []).forEach(function (f) {
+        opt(f.field, f.label, { detail: asText(f.display), enabled: f.editable !== false, reason: f.reason || null, changed: !!f.changed });
+      });
+    } else if (aw.type === 'summary') {
+      t.kind = 'summary'; t.confirmLabel = aw.confirmLabel || 'Confirm';
+      // The answers it shows that can be changed (from its summary or changes message), in order.
+      (turn.messages || []).forEach(function (m) {
+        if (m.type !== 'summary' && m.type !== 'changes') return;
+        t.options = [];
+        (m.items || []).forEach(function (it) {
+          if (it.editable === false) return;
+          opt(it.slot, it.label || it.slot, { detail: m.type === 'changes' ? asText(it.after) : asText(it.display) });
+        });
+      });
+    } else if (aw.type === 'confirm') {
+      t.kind = 'confirm'; t.confirmLabel = aw.confirmLabel || 'Confirm'; t.cancelLabel = aw.cancelLabel || 'Cancel';
+    } else {
+      t.kind = String(aw.type);
+    }
+    if (!t.question) t.question = t.label;
+    return t;
+  }
+
+  var NOTE_PREFIX = { info: 'Note: ', tip: 'Tip: ', warning: 'Warning: ' };
+  function renderTurn(t, opts) {
+    opts = opts || {};
+    var out = [], hints = opts.hints !== false, listShown = false;
+    t.messages.forEach(function (m) {
+      if (m.text) out.push(m.text);
+      if (m.body) out.push(m.body);
+      if (m.type === 'list') listShown = true;
+    });
+    if (t.note) out.push((NOTE_PREFIX[t.noteStyle] || NOTE_PREFIX.info) + t.note);
+    var numbered = ['choice', 'yesno', 'pick', 'fields', 'summary'].indexOf(t.kind) >= 0 || (t.kind === 'list' && !listShown);
+    if (numbered && t.kind !== 'summary') {
+      out.push(t.options.map(function (o, i) {
+        return (i + 1) + '. ' + o.label + (o.detail ? ' (' + o.detail + ')' : '') + (o.enabled ? '' : ' [locked]');
+      }).join('\n'));
+    }
+    if (hints && t.status === 'in_progress') {
+      var h = '';
+      switch (t.kind) {
+        case 'text': case 'number': h = t.canSkip ? 'Reply SKIP to leave it empty.' : ''; break;
+        case 'date': h = 'Reply with a date (YYYY-MM-DD).' + (t.canSkip ? ' SKIP leaves it empty.' : ''); break;
+        case 'choice': case 'yesno': h = 'Reply with a number.'; break;
+        case 'code': h = 'Reply with the code, or RESEND for a new one.'; break;
+        case 'pick': h = 'Reply with a number' + (t.canSkip ? ', or NONE.' : '.'); break;
+        case 'list':
+          h = 'Reply ' + [t.canAdd ? 'ADD' : null, t.canEdit && t.options.length ? 'EDIT n' : null,
+                         t.options.length ? 'REMOVE n' : null, t.canDone ? 'DONE' : null].filter(Boolean).join(', ') + '.';
+          break;
+        case 'fields': h = 'Reply with a number to change it, or DONE.'; break;
+        case 'summary':
+          h = 'Reply CONFIRM' + (t.options.length ? ', or EDIT n to change ' +
+            t.options.map(function (o, i) { return (i + 1) + '. ' + o.label; }).join(', ') : '') + '.';
+          break;
+        case 'confirm': h = 'Reply CONFIRM or CANCEL.'; break;
+        case 'file': h = "A file can't be sent here."; break;
+      }
+      if (t.canGoBack) h = (h ? h + ' ' : '') + 'BACK goes back.';
+      if (h) out.push(h);
+    }
+    return out.join('\n');
+  }
+
+  function replyInput(t, text) {
+    var s = String(text === null || text === undefined ? '' : text).trim(), l = s.toLowerCase();
+    var num = /^\d+$/.test(l) ? parseInt(l, 10) : null, m;
+    function nth(n) { return n !== null && n >= 1 && n <= t.options.length ? t.options[n - 1] : null; }
+    function is(label) { return !!label && l === String(label).toLowerCase(); }
+    if (l === 'back') return { command: 'back' };
+    if (l === 'restart' || l === 'start over') return { command: 'restart' };
+    switch (t.kind) {
+      case 'code':
+        return l === 'resend' ? { command: 'resend' } : { value: s };
+      case 'choice': case 'yesno':
+        if (t.options.some(function (o) { return is(o.value) || is(o.label); })) return { value: s };
+        return nth(num) ? { value: nth(num).value } : { value: s };
+      case 'pick':
+        if (t.canSkip && (l === 'none' || is(t.noneLabel))) return { pick: null };
+        return nth(num) ? { pick: nth(num).value } : { value: s };
+      case 'list':
+        if (l === 'add' || is(t.addLabel)) return { command: 'add' };
+        if (l === 'done' || is(t.doneLabel)) return { command: 'done' };
+        if ((m = /^(\S+)\s+(\d+)$/.exec(l))) {
+          var i = parseInt(m[2], 10) - 1;
+          if (m[1] === 'edit' || m[1] === 'change' || m[1] === String(t.editLabel).toLowerCase()) return { command: 'editItem', index: i };
+          if (m[1] === 'remove' || m[1] === 'delete' || m[1] === String(t.removeLabel).toLowerCase()) return { command: 'remove', index: i };
+        }
+        return { value: s };
+      case 'fields':
+        if (l === 'done' || l === 'save' || is(t.doneLabel)) return { command: 'done' };
+        return nth(num) ? { field: nth(num).value } : { value: s };
+      case 'summary':
+        if ((m = /^(edit|change)\s+(\d+)$/.exec(l)) && nth(parseInt(m[2], 10))) return { command: 'edit', slot: nth(parseInt(m[2], 10)).value };
+        return { value: s };
+      case 'confirm':
+        if (/^(confirm|yes|y|ok)$/.test(l) || is(t.confirmLabel)) return { command: 'confirm' };
+        if (/^(cancel|no|n)$/.test(l) || is(t.cancelLabel)) return { command: 'cancel' };
+        return { value: s };
+      default:
+        return t.canSkip && l === 'skip' ? { value: '' } : { value: s };
+    }
+  }
+
   var api = { createEngine: createEngine, createMemorySource: createMemorySource, parseValue: parseValue, openAIProvider: openAIProvider,
-              runBatch: runBatch,
+              runBatch: runBatch, describeTurn: describeTurn, renderTurn: renderTurn, replyInput: replyInput,
               evalCond: evalCond, interpolate: interpolate, parseFile: parseFile, maskJsonText: maskJsonText };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else global.FlowChatEngine = api;
