@@ -95,7 +95,7 @@ create or replace package fc_client authid definer as
     flow_id        varchar2(200),
     version        number,
     status         varchar2(30),     -- in_progress | completed | failed | ...
-    kind           varchar2(30),     -- what is asked: text | number | date | choice | yesno | file | code |
+    kind           varchar2(30),     -- what is asked: text | email | number | date | choice | yesno | file | code |
                                      -- pick | list | fields | summary | confirm | none (finished)
     node_id        varchar2(200),
     slot           varchar2(200),    -- e.g. "travel_type" or "destinations.city"
@@ -834,7 +834,7 @@ create or replace package body fc_client as
     end if;
 
     if nvl(p_hints, true) and p_turn.status = 'in_progress' then
-      if l_kind in ('text', 'number') then
+      if l_kind in ('text', 'email', 'number') then
         if p_turn.can_skip then l_h := 'Reply SKIP to leave it empty.'; end if;
       elsif l_kind = 'date' then
         l_h := 'Reply with a date (YYYY-MM-DD).' || case when p_turn.can_skip then ' SKIP leaves it empty.' end;

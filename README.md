@@ -46,6 +46,8 @@ db/         install.sql              first-time install: runs 01..07, 09..12 in 
             20_fc_teams.sql          FC_TEAMS (optional): Microsoft Teams outgoing webhooks, their users and conversations
             21_fc_teams_ords.sql     REST endpoint Teams posts to: {schema}/flowchat/teams/:webhook (optional)
             22_seed_helpdesk_flow.sql  IT help desk sample for Teams: IT_TICKETS, 3 connectors, a lookup list, flow it_helpdesk
+            23_fc_automate.sql       FC_AUTOMATE (optional): Power Automate + Adaptive Cards in Teams, API keys, users
+            24_fc_automate_ords.sql  REST endpoint Power Automate calls: {schema}/flowchat/automate/turn (optional)
 demo/       index.html               create demo (runs in the browser using the JS engine)
             update.html              search and update demo, with a live table and a conflict button
             verify.html              public-page demo: one-time code first, with an in-page outbox
@@ -66,6 +68,7 @@ tests/      engine.test.js           node tests/engine.test.js
             turns.test.js            node tests/turns.test.js (turn by turn: the reference for FC_CLIENT.REPLY / RENDER)
             teams.test.js            node tests/teams.test.js (Teams outgoing webhook: the reference for FC_TEAMS)
             helpdesk.test.js         node tests/helpdesk.test.js (it_helpdesk sample flow, through the Teams handler)
+            cards.test.js            node tests/cards.test.js (Power Automate + Adaptive Cards: the reference for FC_AUTOMATE)
             menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
             email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
             rest.test.js             node tests/rest.test.js (REST call node: URL building, body template, mapping, routing, refusals, replay)
@@ -81,6 +84,7 @@ tools/      build-seed.js            flow JSON -> SQL publish script
             build-apex-plugin.js     rebuilds both apex/ plugin exports from the source files
             flowchat-teams.js        Teams outgoing-webhook handler for Node (the reference for FC_TEAMS)
             teams-send.js            sends signed Teams messages to your endpoint, to test it without Teams
+            flowchat-cards.js        Adaptive Cards and the Power Automate endpoint for Node (the reference for FC_AUTOMATE)
 ```
 
 ## 1. Try the demos (no database needed)
@@ -1312,6 +1316,145 @@ end;
 
 It also works on an APEX page with the chat region (flow id `it_helpdesk`).
 
+## Microsoft Teams with Power Automate (Adaptive Cards)
+
+The other way into Teams needs no outgoing webhook and no team owner: a Power Automate flow chats
+with the person privately through the **Flow bot**, one Adaptive Card per question. Choices are
+buttons, dates have a date picker, a summary is a table with **Change** and **Confirm**, and nobody
+has to @mention anything. Because the chat is private, flows that ask for personal answers are fine.
+
+The Power Automate flow is a loop: it sends the person's last answer to FlowChat, posts the card it
+gets back, waits for the person to press a button, and repeats until FlowChat says `done`.
+
+```
+Power Automate                         FlowChat (ORDS)                         Teams
+--------------                         ---------------                         -----
+HTTP POST {flowId, user, sessionId,  ->  FC_AUTOMATE.HANDLE
+           reply}                        start or answer the flow
+                                     <-  {sessionId, done, card}
+Post adaptive card and wait          ------------------------------------->  the card, as Flow bot
+                                     <-------------------------------------  the button pressed (data)
+reply = data, loop until done
+```
+
+**Licence:** the **HTTP** action is a premium Power Automate connector. The flow's owner needs a
+premium licence, and for a shared flow that people start themselves, usually so does each person who
+runs it, unless the flow has its own Process licence. Check with your Power Platform admin.
+
+### 1. Install and create a key
+
+```sql
+@23_fc_automate.sql
+@24_fc_automate_ords.sql
+@22_seed_helpdesk_flow.sql            -- the sample, if not installed yet
+
+set serveroutput on
+declare
+  l_key varchar2(100);
+begin
+  l_key := fc_automate.add_client(p_client_id    => 'helpdesk',
+                                  p_flows        => 'it_helpdesk',     -- the flows this key may run
+                                  p_default_flow => 'it_helpdesk',
+                                  p_user_mode    => 'TABLE');
+  dbms_output.put_line('API key: ' || l_key);     -- shown only now; only its SHA-256 is stored
+  commit;
+end;
+/
+```
+
+**People:** Power Automate knows each person by their Microsoft 365 sign-in name (UPN, usually their
+email). `p_user_mode` decides which APEX user that is:
+
+| `p_user_mode` | `jane.doe@example.com` runs as | Use it when |
+|---|---|---|
+| `TABLE` (default) | the user you link with `fc_automate.map_user('jane.doe@example.com', 'JDOE')` | APEX usernames differ from emails |
+| `UPN` | `JANE.DOE@EXAMPLE.COM` | APEX usernames are the email (e.g. Entra ID / SSO sign-in) |
+| `LOCAL` | `JANE.DOE` | APEX usernames are the part before the @ |
+
+Or set `FC_AUTOMATE_CLIENTS.USER_RESOLVER` to a function `(p_upn) return varchar2`. Someone who
+can't be matched gets a card saying their account isn't linked yet.
+
+Run `add_client` again to replace a lost or leaked key; the old key stops working at once.
+
+### 2. Test the endpoint (PowerShell)
+
+```powershell
+$h = @{ 'X-FlowChat-Key' = '<the key>' }
+$b = @{ flowId = 'it_helpdesk'; user = 'jane.doe@example.com'; sessionId = '' } | ConvertTo-Json
+$r = Invoke-RestMethod -Method Post -Uri 'https://<host>/ords/<alias>/flowchat/automate/turn' -Headers $h -ContentType 'application/json' -Body $b
+$r.text
+$r.card | ConvertTo-Json -Depth 20
+```
+
+`$r.text` is the question as text. Paste the card JSON into the Adaptive Cards Designer
+(adaptivecards.io/designer, host app "Microsoft Teams") to see it as Teams will. To answer, send
+`sessionId = $r.sessionId` and `reply = @{ action = 'answer'; value = 'PRINTER' }`.
+
+### 3. Build the Power Automate flow
+
+In Power Automate (make.powerautomate.com), **Create > Instant cloud flow**, name it
+"IT help desk", trigger **Manually trigger a flow**, then add these steps in order:
+
+1. **Initialize variable** `upn`, type String, value: `triggerOutputs()?['headers']?['x-ms-user-email']`
+   (in the dynamic content list: "User email").
+2. **Initialize variable** `sessionId`, type String, value empty.
+3. **Initialize variable** `done`, type Boolean, value `false`.
+4. **Initialize variable** `reply`, type Object, value `{}`.
+5. **Do until**, condition `done` is equal to `true`. Under **Change limits**: Count `200`,
+   Timeout `PT8H`. Inside it:
+   1. **HTTP**: Method `POST`, URI `https://<host>/ords/<alias>/flowchat/automate/turn`.
+      Headers: `Content-Type` = `application/json`, `X-FlowChat-Key` = the key.
+      Body:
+      ```
+      {
+        "flowId": "it_helpdesk",
+        "user": "@{variables('upn')}",
+        "sessionId": "@{variables('sessionId')}",
+        "reply": @{variables('reply')}
+      }
+      ```
+      In **Settings**, turn on **Secure inputs** and **Secure outputs**, so run history doesn't
+      show the key or the answers.
+   2. **Set variable** `sessionId` = `coalesce(body('HTTP')?['sessionId'], '')`
+   3. **Set variable** `done` = `body('HTTP')?['done']`
+   4. **Condition**: `variables('done')` is equal to `true`.
+      - **If yes:** Microsoft Teams **Post card in a chat or channel**. Post as `Flow bot`, Post in
+        `Chat with Flow bot`, Recipient `upn`, Adaptive Card `body('HTTP')?['card']`.
+      - **If no:** Microsoft Teams **Post adaptive card and wait for a response**. Post as
+        `Flow bot`, Post in `Chat with Flow bot`, Recipient `upn`, Message
+        `body('HTTP')?['card']`, Update message `Got it.`, Should update card `Yes`. Then
+        **Set variable** `reply` = `body('Post_adaptive_card_and_wait_for_a_response')?['data']`.
+
+If the card fields reject the expression, wrap it in `string(...)`. If you rename the "Post
+adaptive card and wait" step, use its new name (spaces become `_`) in the last expression.
+
+**Share it:** on the flow's page, **Run only users** > add the people or a group, and set the HTTP
+and Teams connections to the flow's own connections (see the licence note above). People start it from the Power Automate app in Teams,
+the mobile app or the web, and the Flow bot opens a private chat with the first question.
+
+**Start it from a channel instead (optional):** use the Teams trigger **When keywords are
+mentioned** (for example `#helpdesk`), add **Get user profile (V2)** with the message sender's id,
+and set `upn` to its **User Principal Name**. The rest is the same, and the questions still go to
+the person privately.
+
+### How it behaves
+
+- **Each run is one conversation.** The card for each answer replaces the one before ("Got it."),
+  and the last card shows the result. Someone who doesn't answer within the wait action's timeout
+  (30 days by default; set it under **Settings > Timeout**, e.g. `PT8H`) ends the run.
+- **Buttons:** choices with up to 5 options are buttons, longer ones a list with **Next**. Optional
+  questions can be left empty. **Back** goes to the previous question. Lists (Repeat) show their
+  items with **Add**, **Change**, **Remove** and **Done**; the summary has **Change** (pick an answer)
+  and the confirm button.
+- **Security:** the endpoint has no ORDS privilege; every request needs the client's API key, or it
+  gets 401. A key only runs the flows in its `flows` list (403 otherwise), and only the person who
+  started a conversation can continue it. **The key can act as anyone it names in `user`**, so keep it
+  in secure inputs and let only trusted people edit the flow. Errors are stored in
+  `FC_AUTOMATE_CLIENTS.LAST_ERROR`.
+- **Not supported in cards:** file answers (the card says to finish on the web page).
+- **JavaScript:** `tools/flowchat-cards.js` builds the same cards, and `tests/cards.test.js` drives the
+  help desk and trip flows through them.
+
 **How it behaves**
 
 - **Conversations:** each thread and each person is one conversation (`FC_TEAMS_CONVERSATIONS`). The
@@ -1352,13 +1495,16 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 175 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/repeat-edit.test.js`, `tests/batch.test.js`, `tests/turns.test.js`, `tests/teams.test.js`, `tests/helpdesk.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
+- The JavaScript engine and widget are tested: 183 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/repeat-edit.test.js`, `tests/batch.test.js`, `tests/turns.test.js`, `tests/teams.test.js`, `tests/helpdesk.test.js`, `tests/cards.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
   `tests/email.test.js`, `tests/agent.test.js`, `tests/rest.test.js`), plus manual end-to-end runs of the demos.
 - **The REST call node's and REST tools' PL/SQL (`run_rest`, `rest_call`, `rest_tool` and the other `rest_*` helpers in `FC_ENGINE`,
   `17_rest_endpoints.sql`, `list_rest` in `FC_DESIGNER`) has not been compiled or called a real API
   yet.** It mirrors the tested JavaScript engine.
+- **`FC_AUTOMATE` (Power Automate + Adaptive Cards) and its ORDS endpoint have not been compiled or
+  called by Power Automate yet.** They mirror `tools/flowchat-cards.js`, which `tests/cards.test.js`
+  covers.
 - **The `it_helpdesk` sample (`22_seed_helpdesk_flow.sql`) and the engine change that keeps skipped
   optional questions skipped after an Edit (`FC_ENGINE`, ask nodes) have not been compiled yet.** The
   flow is tested through the JavaScript Teams handler (`tests/helpdesk.test.js`).

@@ -95,9 +95,15 @@ create or replace package body fc_demo_helpdesk as
     l_p     json_object_t := json_object_t.parse(p_payload);
     l_user  varchar2(255) := l_p.get_string('appUser');
     l_s     json_object_t := l_p.get_object('slots');
-    l_imp   varchar2(10)  := s(l_s, 'impact');
-    l_urg   varchar2(10)  := s(l_s, 'urgency');
-    l_pri   varchar2(2)   := priority_of(s(l_s, 'impact'), s(l_s, 'urgency'));
+    -- read into variables first: a private function (s) can't be called inside SQL
+    l_cat   varchar2(20)   := substr(s(l_s, 'category'), 1, 20);
+    l_title varchar2(80)   := substr(s(l_s, 'title'), 1, 80);
+    l_det   varchar2(1000) := substr(s(l_s, 'details'), 1, 1000);
+    l_tag   varchar2(20)   := substr(upper(s(l_s, 'asset_tag')), 1, 20);
+    l_imp   varchar2(10)   := substr(s(l_s, 'impact'), 1, 10);
+    l_urg   varchar2(10)   := substr(s(l_s, 'urgency'), 1, 10);
+    l_rem   varchar2(1)    := case when s(l_s, 'remote_ok') = 'Y' then 'Y' else 'N' end;
+    l_pri   varchar2(2)    := priority_of(s(l_s, 'impact'), s(l_s, 'urgency'));
     l_no    varchar2(20);
     l_slots json_object_t := json_object_t();
     l_res   json_object_t := json_object_t();
@@ -108,9 +114,8 @@ create or replace package body fc_demo_helpdesk as
       return l_res.to_clob;
     end if;
     insert into it_tickets (reporter, category, title, details, asset_tag, impact, urgency, priority, remote_ok)
-    values (l_user, s(l_s, 'category'), substr(s(l_s, 'title'), 1, 80), substr(s(l_s, 'details'), 1, 1000),
-            case when s(l_s, 'category') = 'HARDWARE' then substr(upper(s(l_s, 'asset_tag')), 1, 20) end,
-            l_imp, l_urg, l_pri, case when s(l_s, 'remote_ok') = 'Y' then 'Y' else 'N' end)
+    values (l_user, l_cat, l_title, l_det, case when l_cat = 'HARDWARE' then l_tag end,
+            l_imp, l_urg, l_pri, l_rem)
     returning ticket_no into l_no;
     l_slots.put('ticket_no', l_no);
     l_slots.put('priority', l_pri);
@@ -129,13 +134,18 @@ create or replace package body fc_demo_helpdesk as
     l_user  varchar2(255) := l_p.get_string('appUser');
     l_s     json_object_t := l_p.get_object('slots');
     l_id    number;
+    l_note  varchar2(400)  := substr(s(l_s, 'close_note'), 1, 400);   -- s can't be called inside SQL
     l_no    varchar2(20);
     l_slots json_object_t := json_object_t();
     l_res   json_object_t := json_object_t();
   begin
-    l_id := to_number(s(l_s, 'close_ticket_id') default null on conversion error);
+    begin
+      l_id := to_number(s(l_s, 'close_ticket_id'));
+    exception when value_error then
+      l_id := null;
+    end;
     update it_tickets
-       set status = 'CLOSED', closed_at = systimestamp, close_note = substr(s(l_s, 'close_note'), 1, 400)
+       set status = 'CLOSED', closed_at = systimestamp, close_note = l_note
      where ticket_id = l_id and reporter = l_user and status = 'OPEN'
     returning ticket_no into l_no;
     if sql%rowcount = 0 then

@@ -2916,7 +2916,7 @@
     if (hints && t.status === 'in_progress') {
       var h = '';
       switch (t.kind) {
-        case 'text': case 'number': h = t.canSkip ? 'Reply SKIP to leave it empty.' : ''; break;
+        case 'text': case 'email': case 'number': h = t.canSkip ? 'Reply SKIP to leave it empty.' : ''; break;
         case 'date': h = 'Reply with a date (YYYY-MM-DD).' + (t.canSkip ? ' SKIP leaves it empty.' : ''); break;
         case 'choice': case 'yesno': h = 'Reply with a number.'; break;
         case 'code': h = 'Reply with the code, or RESEND for a new one.'; break;
