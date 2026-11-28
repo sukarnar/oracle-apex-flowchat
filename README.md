@@ -43,6 +43,8 @@ db/         install.sql              first-time install: runs 01..07, 09..12 in 
             17_rest_endpoints.sql    FC_REST_ENDPOINTS (the APIs a REST call node may call)
             18_seed_trip_flow.sql    Trip booking sample: TRIPS tables, FYyy-n itinerary numbers, 5 connectors, approval/cancel emails, flow trip_booking
             19_fc_client.sql         FC_CLIENT: run a flow from PL/SQL, in batch mode or turn by turn (chat channels)
+            20_fc_teams.sql          FC_TEAMS (optional): Microsoft Teams outgoing webhooks, their users and conversations
+            21_fc_teams_ords.sql     REST endpoint Teams posts to: {schema}/flowchat/teams/:webhook (optional)
 demo/       index.html               create demo (runs in the browser using the JS engine)
             update.html              search and update demo, with a live table and a conflict button
             verify.html              public-page demo: one-time code first, with an in-page outbox
@@ -61,6 +63,7 @@ tests/      engine.test.js           node tests/engine.test.js
             repeat-edit.test.js      node tests/repeat-edit.test.js (Repeat: Edit an item already in the list)
             batch.test.js            node tests/batch.test.js (batch mode: runBatch, the reference for FC_CLIENT.RUN)
             turns.test.js            node tests/turns.test.js (turn by turn: the reference for FC_CLIENT.REPLY / RENDER)
+            teams.test.js            node tests/teams.test.js (Teams outgoing webhook: the reference for FC_TEAMS)
             menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
             email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
             rest.test.js             node tests/rest.test.js (REST call node: URL building, body template, mapping, routing, refusals, replay)
@@ -74,6 +77,8 @@ tests/      engine.test.js           node tests/engine.test.js
             fake-apex-backend.js     emulates the FC_DESIGNER Ajax protocol in the browser (testing only)
 tools/      build-seed.js            flow JSON -> SQL publish script
             build-apex-plugin.js     rebuilds both apex/ plugin exports from the source files
+            flowchat-teams.js        Teams outgoing-webhook handler for Node (the reference for FC_TEAMS)
+            teams-send.js            sends signed Teams messages to your endpoint, to test it without Teams
 ```
 
 ## 1. Try the demos (no database needed)
@@ -1216,6 +1221,81 @@ Reply ADD, EDIT n, REMOVE n, DONE. BACK goes back.
 - **JavaScript:** `FlowChatEngine.describeTurn`, `renderTurn` and `replyInput` are the same logic for
   the JavaScript engine, and `tests/turns.test.js` tests them.
 
+## Microsoft Teams (outgoing webhook)
+
+People run a flow in a Teams channel: they @mention the webhook in a thread and answer its questions
+there. It needs no Azure registration: Teams posts each message to an ORDS endpoint, `FC_TEAMS`
+checks its signature and answers with the next question (`FC_CLIENT.reply` and `render`).
+
+```
+@Travel Bot hi
+  Hi JDOE, I can book a new trip, or change or cancel one you've booked. ...
+  Contact 1: what's their full name?
+@Travel Bot Ana Doe
+  How is Ana Doe related to you?
+  1. Spouse / partner
+  2. Parent ...
+@Travel Bot 1
+```
+
+**Set it up**
+
+1. Install the package and the endpoint (they're optional, so `install.sql` doesn't run them):
+   ```sql
+   @20_fc_teams.sql
+   @21_fc_teams_ords.sql
+   ```
+   The schema must be REST-enabled, and Teams must reach the ORDS URL over public HTTPS.
+2. In Teams, a team owner opens **Manage team > Apps > Create an outgoing webhook**. The callback URL
+   is `https://<host>/ords/<schema alias>/flowchat/teams/travel`, where `travel` is the webhook id you
+   pick. Teams then shows a **security token** once: copy it.
+3. Register the webhook and the flow it runs:
+   ```sql
+   begin
+     fc_teams.add_webhook(p_webhook_id     => 'travel',
+                          p_security_token => '<the token Teams showed>',
+                          p_flow_id        => 'trip_booking',
+                          p_tenant_id      => '<your Microsoft Entra tenant id>');   -- optional, recommended
+     commit;
+   end;
+   ```
+4. Link Teams accounts to APEX users. Teams only sends a person's Microsoft Entra object id and
+   display name, so FlowChat needs to know which APEX user that is. Someone who isn't linked yet gets
+   a reply with their account id, which an administrator then links:
+   ```sql
+   exec fc_teams.map_user('6b1f3c1e-2a4d-4f2b-9b1a-0a1b2c3d4e5f', 'JDOE', 'Jane Doe');
+   commit;
+   ```
+   If you already store the object id (an HR table, say), set `FC_TEAMS_WEBHOOKS.USER_RESOLVER` to a
+   function `(p_aad_object_id, p_display_name) return varchar2` that returns the APEX user instead.
+5. Test it before using Teams. `tools/teams-send.js` signs messages the same way Teams does:
+   ```
+   node tools/teams-send.js --url https://<host>/ords/<alias>/flowchat/teams/travel --token <token> --user <object id>
+   ```
+
+**How it behaves**
+
+- **Conversations:** each thread and each person is one conversation (`FC_TEAMS_CONVERSATIONS`). The
+  first mention starts the flow, and later ones answer it. When the flow finishes, the next mention
+  starts it again. The flow runs as the linked user, so `{{app_user}}`, connectors' `appUser` and
+  row filters work as on an APEX page.
+- **What people can type:** answers, an option's number, `back`, `restart`, `add`, `done`, `edit 2`,
+  `remove 2`, `confirm`, plus `help` and `stop` (see `FC_CLIENT.reply`).
+- **Security:** the endpoint has no ORDS privilege, because Teams can't sign in. Instead each message
+  must carry Teams' HMAC-SHA256 signature made with the webhook's security token (otherwise 401). It
+  must come from `tenant_id` when that's set (otherwise 403) and be under `max_age_secs` old (300
+  seconds by default, against replays). A message Teams sends twice is answered once. Keep the
+  security token secret: anyone who has it can post as any linked user.
+- **Privacy:** everyone in the channel sees the questions and the answers. Don't use a flow that asks
+  for personal or hidden answers. Before a hidden answer, the bot warns that the channel can read it.
+- **Limits:** Teams waits 5 seconds for a reply, so steps that call slow connectors or REST APIs may
+  time out. People must @mention the webhook every time. It works in channels, not in 1:1 chats or
+  group chats.
+- **Errors:** the person gets "Sorry, something went wrong", and the error is stored in
+  `FC_TEAMS_WEBHOOKS.LAST_ERROR` / `LAST_ERROR_AT`.
+- **JavaScript:** `tools/flowchat-teams.js` is the same handler for Node, and `tests/teams.test.js`
+  tests it.
+
 ## Turn protocol
 
 The server and the widget exchange exactly one JSON shape. Any backend that produces it works with the widget.
@@ -1233,16 +1313,16 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 158 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/repeat-edit.test.js`, `tests/batch.test.js`, `tests/turns.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
+- The JavaScript engine and widget are tested: 168 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/repeat-edit.test.js`, `tests/batch.test.js`, `tests/turns.test.js`, `tests/teams.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
   `tests/email.test.js`, `tests/agent.test.js`, `tests/rest.test.js`), plus manual end-to-end runs of the demos.
 - **The REST call node's and REST tools' PL/SQL (`run_rest`, `rest_call`, `rest_tool` and the other `rest_*` helpers in `FC_ENGINE`,
   `17_rest_endpoints.sql`, `list_rest` in `FC_DESIGNER`) has not been compiled or called a real API
   yet.** It mirrors the tested JavaScript engine.
-- **`FC_CLIENT` turn by turn (`start_flow`, `reply`, `render` ...) has not been compiled or run yet.**
-  It is a port of `describeTurn` / `renderTurn` / `replyInput`, which `tests/turns.test.js` covers.
-  Batch mode (`RUN`) and its engine hooks compile.
+- **`FC_TEAMS` and its ORDS endpoint have not been compiled or called by Teams yet.** They mirror
+  `tools/flowchat-teams.js`, which `tests/teams.test.js` covers. `FC_CLIENT` (batch and turn by turn)
+  compiles.
 - **Hidden answers in PL/SQL (`redact_mode`, `mask_display`, `current_redact` in `FC_ENGINE`) have
   not been compiled yet.** They mirror the tested JavaScript engine.
 - **The database-error handling in Save changes and Bulk update (`db_error_text`, `undo_to` and the

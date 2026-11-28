@@ -46,6 +46,9 @@ prompt == Phase E demo: expense_claim (line items, file answer, PII, debug)
 @@14_seed_expense_flow.sql
 -- Optional REST API for non-APEX pages:
 -- @@08_ords_module.sql
+-- Optional Microsoft Teams outgoing webhooks (FC_TEAMS and its REST endpoint):
+-- @@20_fc_teams.sql
+-- @@21_fc_teams_ords.sql
 prompt == Done
 
 exit

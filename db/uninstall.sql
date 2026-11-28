@@ -1,6 +1,17 @@
 -- Removes all FlowChat objects (including demo data). Irreversible.
 begin ords.delete_module(p_module_name => 'flowchat'); exception when others then null; end;
 /
+begin ords.delete_module(p_module_name => 'flowchat_teams'); exception when others then null; end;
+/
+-- Optional Teams objects (20_fc_teams.sql): skipped when not installed.
+begin
+  for o in (select 'package fc_teams' stmt from user_objects where object_name = 'FC_TEAMS' and object_type = 'PACKAGE'
+            union all select 'table ' || lower(table_name) || ' cascade constraints purge' from user_tables
+             where table_name in ('FC_TEAMS_CONVERSATIONS', 'FC_TEAMS_USERS', 'FC_TEAMS_WEBHOOKS')) loop
+    execute immediate 'drop ' || o.stmt;
+  end loop;
+end;
+/
 drop package fc_client;
 drop package fc_designer;
 drop package fc_demo_connectors;
