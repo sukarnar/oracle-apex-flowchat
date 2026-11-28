@@ -1,0 +1,254 @@
+{
+  "flowId": "it_helpdesk",
+  "name": "IT help desk",
+  "version": 1,
+  "debug": true,
+  "start": "welcome",
+  "bindings": {
+    "ticket_no": { "dom": "#ticket_no", "apex": "P40_TICKET_NO" },
+    "priority": { "dom": "#priority", "apex": "P40_PRIORITY" }
+  },
+  "nodes": [
+    {
+      "id": "welcome",
+      "type": "message",
+      "text": "Hi {{app_user}}, I'm the IT help desk. I can log a problem for you, show your open tickets, or close one that's fixed.",
+      "next": "init"
+    },
+    {
+      "id": "init",
+      "type": "set",
+      "assign": [
+        { "slot": "open_tickets", "value": 0, "onlyIfEmpty": true },
+        { "slot": "ticket_list", "value": "", "onlyIfEmpty": true },
+        { "slot": "close_ticket_no", "value": "", "onlyIfEmpty": true }
+      ],
+      "next": "load_summary"
+    },
+    {
+      "id": "load_summary",
+      "type": "lookup",
+      "connector": "it_my_tickets",
+      "next": "has_open"
+    },
+    {
+      "id": "has_open",
+      "type": "condition",
+      "branches": [
+        { "when": { "slot": "open_tickets", "op": ">", "value": 0 }, "next": "choose" }
+      ],
+      "else": "new_intro"
+    },
+    {
+      "id": "choose",
+      "type": "menu",
+      "slot": "action",
+      "prompt": "You have {{open_tickets}} open ticket(s). What would you like to do?",
+      "options": [
+        { "value": "NEW", "label": "Report a new problem", "next": "new_intro" },
+        { "value": "LIST", "label": "Show my open tickets", "next": "show_list" },
+        { "value": "CLOSE", "label": "Close a ticket that's fixed", "next": "pick_close" }
+      ]
+    },
+    {
+      "id": "show_list",
+      "type": "end",
+      "text": "Your open tickets:\n{{ticket_list}}"
+    },
+    {
+      "id": "pick_close",
+      "type": "ask",
+      "slot": "close_ticket_id",
+      "label": "Ticket to close",
+      "inSummary": false,
+      "prompt": "Which ticket is fixed?",
+      "input": {
+        "kind": "choice",
+        "display": "buttons",
+        "optionsFrom": "it_my_open_tickets",
+        "emptyMessage": "You have no open tickets."
+      },
+      "next": "close_note"
+    },
+    {
+      "id": "close_note",
+      "type": "ask",
+      "slot": "close_note",
+      "label": "What fixed it",
+      "inSummary": false,
+      "prompt": "What fixed it? It helps the next person with the same problem. (SKIP if you'd rather not say.)",
+      "input": { "kind": "text", "required": false, "maxLength": 400 },
+      "next": "do_close"
+    },
+    {
+      "id": "do_close",
+      "type": "lookup",
+      "connector": "it_close_ticket",
+      "next": "closed",
+      "onNotFound": "close_failed"
+    },
+    {
+      "id": "closed",
+      "type": "end",
+      "text": "Ticket {{close_ticket_no}} is closed. Thanks for letting us know."
+    },
+    {
+      "id": "close_failed",
+      "type": "end",
+      "text": "I couldn't close that ticket. It may already be closed."
+    },
+    {
+      "id": "new_intro",
+      "type": "message",
+      "text": "Let's log it. A few quick questions.",
+      "next": "category"
+    },
+    {
+      "id": "category",
+      "type": "ask",
+      "slot": "category",
+      "label": "Area",
+      "prompt": "What's the problem with?",
+      "input": {
+        "kind": "choice",
+        "display": "buttons",
+        "options": [
+          { "value": "HARDWARE", "label": "Laptop or desktop" },
+          { "value": "SOFTWARE", "label": "An app or software" },
+          { "value": "NETWORK", "label": "Network, Wi-Fi or VPN" },
+          { "value": "ACCOUNT", "label": "Sign-in or access" },
+          { "value": "PRINTER", "label": "Printer" },
+          { "value": "OTHER", "label": "Something else" }
+        ]
+      },
+      "next": "title"
+    },
+    {
+      "id": "title",
+      "type": "ask",
+      "slot": "title",
+      "label": "Problem",
+      "prompt": "In one line, what's wrong?",
+      "input": { "kind": "text", "minLength": 5, "maxLength": 80 },
+      "next": "details"
+    },
+    {
+      "id": "details",
+      "type": "ask",
+      "slot": "details",
+      "label": "Details",
+      "prompt": "Anything else we should know, like an error message or when it started? (SKIP if not.)",
+      "note": "Everyone in this channel can read your answers. Never post a password or a one-time code here.",
+      "noteStyle": "warning",
+      "input": { "kind": "text", "required": false, "maxLength": 1000 },
+      "next": "is_hardware"
+    },
+    {
+      "id": "is_hardware",
+      "type": "condition",
+      "branches": [
+        { "when": { "slot": "category", "op": "=", "value": "HARDWARE" }, "next": "asset_tag" }
+      ],
+      "else": "clear_asset"
+    },
+    {
+      "id": "asset_tag",
+      "type": "ask",
+      "slot": "asset_tag",
+      "label": "Asset tag",
+      "prompt": "What's the computer's asset tag? (SKIP if you can't find it.)",
+      "note": "It's on a sticker under the laptop or on the back of the desktop, and starts with AT-.",
+      "noteStyle": "tip",
+      "input": { "kind": "text", "required": false, "maxLength": 20 },
+      "next": "impact"
+    },
+    {
+      "id": "clear_asset",
+      "type": "set",
+      "assign": [ { "slot": "asset_tag", "clear": true } ],
+      "next": "impact"
+    },
+    {
+      "id": "impact",
+      "type": "ask",
+      "slot": "impact",
+      "label": "Who's affected",
+      "prompt": "Who does it affect?",
+      "input": {
+        "kind": "choice",
+        "display": "buttons",
+        "options": [
+          { "value": "ME", "label": "Just me" },
+          { "value": "TEAM", "label": "My team" },
+          { "value": "SITE", "label": "Everyone in the office" }
+        ]
+      },
+      "next": "urgency"
+    },
+    {
+      "id": "urgency",
+      "type": "ask",
+      "slot": "urgency",
+      "label": "Urgency",
+      "prompt": "How much is it getting in the way?",
+      "input": {
+        "kind": "choice",
+        "display": "buttons",
+        "options": [
+          { "value": "LOW", "label": "A little: it's annoying" },
+          { "value": "NORMAL", "label": "Some: I can work around it" },
+          { "value": "HIGH", "label": "A lot: I can't do my job" }
+        ]
+      },
+      "next": "is_major"
+    },
+    {
+      "id": "is_major",
+      "type": "condition",
+      "branches": [
+        {
+          "when": { "any": [
+            { "slot": "impact", "op": "=", "value": "SITE" },
+            { "slot": "urgency", "op": "=", "value": "HIGH" }
+          ] },
+          "next": "major_note"
+        }
+      ],
+      "else": "remote_ok"
+    },
+    {
+      "id": "major_note",
+      "type": "message",
+      "text": "Understood. I'll mark this as a priority so the on-call engineer sees it straight away.",
+      "next": "remote_ok"
+    },
+    {
+      "id": "remote_ok",
+      "type": "ask",
+      "slot": "remote_ok",
+      "label": "Remote access OK",
+      "prompt": "If it helps, may an engineer connect to your computer remotely? They'll always ask you first.",
+      "input": { "kind": "yesno" },
+      "next": "review"
+    },
+    {
+      "id": "review",
+      "type": "summary",
+      "text": "Here's the ticket I'll log:",
+      "confirmLabel": "Log ticket",
+      "next": "save"
+    },
+    {
+      "id": "save",
+      "type": "submit",
+      "connector": "it_create_ticket",
+      "onSuccess": "created",
+      "onError": "review"
+    },
+    {
+      "id": "created",
+      "type": "end",
+      "text": "Logged {{ticket_no}} with priority {{priority}}. An engineer will reply to you in Teams. To check on it later, mention me and choose Show my open tickets."
+    }
+  ]
+}

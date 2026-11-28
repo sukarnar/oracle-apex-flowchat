@@ -28,7 +28,8 @@ const DESIGNER = {
     ['flows/leave_agent_demo.json', 'leave_agent_demo.json', 'application/json'],
     ['flows/update_application.json', 'update_application.json', 'application/json'],
     ['flows/update_application_public.json', 'update_application_public.json', 'application/json'],
-    ['flows/trip_booking.json', 'trip_booking.json', 'application/json']
+    ['flows/trip_booking.json', 'trip_booking.json', 'application/json'],
+    ['flows/it_helpdesk.json', 'it_helpdesk.json', 'application/json']
   ],
   help: [
     'Hosts the FlowChat flow designer. In Database mode it opens, saves and publishes flows in FC_FLOW_VERSIONS',

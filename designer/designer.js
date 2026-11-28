@@ -29,7 +29,8 @@
     { file: 'leave_agent_demo.json', label: 'Leave assistant (agent)', desc: 'Agent: gather then submit, book with a write tool, answer questions' },
     { file: 'update_application.json', label: 'Update application', desc: 'Search & update: find, change, save' },
     { file: 'update_application_public.json', label: 'Update (public page)', desc: 'Verify a one-time code, then find and update' },
-    { file: 'trip_booking.json', label: 'Trip booking', desc: 'Contacts and destinations (Repeat), export and clearance questions, save, approval workflow' }
+    { file: 'trip_booking.json', label: 'Trip booking', desc: 'Contacts and destinations (Repeat), export and clearance questions, save, approval workflow' },
+    { file: 'it_helpdesk.json', label: 'IT help desk (Teams)', desc: 'Made for a Teams channel: log, list and close tickets with short, numbered questions' }
   ];
   const STANDALONE = document.body.classList.contains('fcd-page');
 

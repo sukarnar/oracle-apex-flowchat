@@ -594,7 +594,8 @@
       var fn = lovs[spec.optionsFrom];
       if (!fn) throw new Error('Unknown lookup list "' + spec.optionsFrom + '"');
       var res = await Promise.resolve(fn({ lov: spec.optionsFrom, params: params, context: clone(ctx.st.context),
-                                           verified: verifiedValue(ctx), sessionId: ctx.sid, flowId: ctx.flow.flowId }));
+                                           verified: verifiedValue(ctx), sessionId: ctx.sid, flowId: ctx.flow.flowId,
+                                           appUser: appUserOf(ctx) }));   // :APP_USER in the database
       var list = Array.isArray(res) ? res : (res && res.options) || [];
       ctx.lovCache[key] = list.slice(0, MAX_OPTIONS).filter(function (o) { return o && isFilled(o.value); })
         .map(function (o) { return { value: String(o.value), label: isFilled(o.label) ? String(o.label) : String(o.value) }; });
@@ -2293,6 +2294,12 @@
             break;
           case 'ask': {
             var stale = false;
+            // Replaying an edit: an optional question the person already skipped (SKIP) isn't asked again.
+            if (ctx.replay && ctx.forceAsk !== id && !isFilled(st.slots[node.slot])
+                && (eff(ctx, node.input) || {}).required === false && st.history.indexOf(id) >= 0) {
+              dbg(ctx, { event: 'skip', node: id, reason: 'skipped' });
+              id = node.next; break;
+            }
             if ((ctx.replay || node.skipIfFilled) && isFilled(st.slots[node.slot]) && ctx.forceAsk !== id) {
               // A lookup answer the list no longer offers (an answer it depends on changed) is asked again.
               if (!(node.input && node.input.optionsFrom) || await stillOffered(ctx, node)) {

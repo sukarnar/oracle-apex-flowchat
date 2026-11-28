@@ -4207,7 +4207,12 @@ create or replace package body fc_engine as
               l_stale := true;
             end if;
           end if;
-          if l_skip then
+          -- Replaying an edit: an optional question the person already skipped (SKIP) isn't asked again.
+          if not l_skip and c.replay and nvl(c.force_ask, '~') <> l_id and str(c.slots, l_slot) is null
+             and str(eff_spec(c, input_spec(l_node)), 'required') = 'false' and in_history(c, l_id) then
+            dbg_kv(c, 'skip', l_id, 'reason', 'skipped');
+            l_id := str(l_node, 'next');
+          elsif l_skip then
             dbg_kv(c, 'skip', l_id, 'reason', 'answered');
             l_id := str(l_node, 'next');
           else

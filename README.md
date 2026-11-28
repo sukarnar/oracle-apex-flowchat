@@ -45,6 +45,7 @@ db/         install.sql              first-time install: runs 01..07, 09..12 in 
             19_fc_client.sql         FC_CLIENT: run a flow from PL/SQL, in batch mode or turn by turn (chat channels)
             20_fc_teams.sql          FC_TEAMS (optional): Microsoft Teams outgoing webhooks, their users and conversations
             21_fc_teams_ords.sql     REST endpoint Teams posts to: {schema}/flowchat/teams/:webhook (optional)
+            22_seed_helpdesk_flow.sql  IT help desk sample for Teams: IT_TICKETS, 3 connectors, a lookup list, flow it_helpdesk
 demo/       index.html               create demo (runs in the browser using the JS engine)
             update.html              search and update demo, with a live table and a conflict button
             verify.html              public-page demo: one-time code first, with an in-page outbox
@@ -64,6 +65,7 @@ tests/      engine.test.js           node tests/engine.test.js
             batch.test.js            node tests/batch.test.js (batch mode: runBatch, the reference for FC_CLIENT.RUN)
             turns.test.js            node tests/turns.test.js (turn by turn: the reference for FC_CLIENT.REPLY / RENDER)
             teams.test.js            node tests/teams.test.js (Teams outgoing webhook: the reference for FC_TEAMS)
+            helpdesk.test.js         node tests/helpdesk.test.js (it_helpdesk sample flow, through the Teams handler)
             menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
             email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
             rest.test.js             node tests/rest.test.js (REST call node: URL building, body template, mapping, routing, refusals, replay)
@@ -605,7 +607,8 @@ Built-in conversation behaviour:
 - **Back:** returns to the previous question.
 - **Start over:** clears everything and starts again.
 - **Edit from the summary:** after the change, the flow is replayed. Branches are re-evaluated,
-  any newly required question is asked, and questions you've already answered are skipped.
+  any newly required question is asked, and questions you've already answered are skipped. So are
+  optional questions you skipped: they aren't asked again.
 
 ## 6. Search and update flows
 
@@ -1273,6 +1276,42 @@ checks its signature and answers with the next question (`FC_CLIENT.reply` and `
    node tools/teams-send.js --url https://<host>/ords/<alias>/flowchat/teams/travel --token <token> --user <object id>
    ```
 
+**The sample: an IT help desk**
+
+`22_seed_helpdesk_flow.sql` installs a flow made for a channel, `it_helpdesk`. People log a problem
+(area, a one-line description, optional details, the asset tag for a laptop, who it affects, how
+urgent it is, remote access), check the summary and log it as `IT-1001`, `IT-1002` ... with a
+priority (P1 to P3). Someone who already has open tickets is first asked whether to report a new
+problem, list their open tickets or close one that's fixed. The questions are short, the choices are
+numbered, it asks for nothing personal, and the details question carries a note warning that the
+channel can read it. Its tickets are in `IT_TICKETS`, and each person only sees their own.
+
+```sql
+@22_seed_helpdesk_flow.sql
+begin
+  fc_teams.add_webhook('helpdesk', '<the token Teams showed>', 'it_helpdesk');
+  fc_teams.map_user('<Entra object id>', 'JDOE');
+  commit;
+end;
+/
+```
+
+```
+@IT Help Desk hi
+  Hi JDOE, I'm the IT help desk. ...
+  What's the problem with?
+  1. Laptop or desktop
+  ...
+  5. Printer
+@IT Help Desk 5
+  In one line, what's wrong?
+@IT Help Desk Paper jams on the 3rd floor printer
+  Anything else we should know, like an error message or when it started? (SKIP if not.)
+  Warning: Everyone in this channel can read your answers. Never post a password or a one-time code here.
+```
+
+It also works on an APEX page with the chat region (flow id `it_helpdesk`).
+
 **How it behaves**
 
 - **Conversations:** each thread and each person is one conversation (`FC_TEAMS_CONVERSATIONS`). The
@@ -1313,13 +1352,16 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 168 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/repeat-edit.test.js`, `tests/batch.test.js`, `tests/turns.test.js`, `tests/teams.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
+- The JavaScript engine and widget are tested: 175 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/repeat-edit.test.js`, `tests/batch.test.js`, `tests/turns.test.js`, `tests/teams.test.js`, `tests/helpdesk.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
   `tests/email.test.js`, `tests/agent.test.js`, `tests/rest.test.js`), plus manual end-to-end runs of the demos.
 - **The REST call node's and REST tools' PL/SQL (`run_rest`, `rest_call`, `rest_tool` and the other `rest_*` helpers in `FC_ENGINE`,
   `17_rest_endpoints.sql`, `list_rest` in `FC_DESIGNER`) has not been compiled or called a real API
   yet.** It mirrors the tested JavaScript engine.
+- **The `it_helpdesk` sample (`22_seed_helpdesk_flow.sql`) and the engine change that keeps skipped
+  optional questions skipped after an Edit (`FC_ENGINE`, ask nodes) have not been compiled yet.** The
+  flow is tested through the JavaScript Teams handler (`tests/helpdesk.test.js`).
 - **`FC_TEAMS` and its ORDS endpoint have not been compiled or called by Teams yet.** They mirror
   `tools/flowchat-teams.js`, which `tests/teams.test.js` covers. `FC_CLIENT` (batch and turn by turn)
   compiles.

@@ -49,6 +49,7 @@ prompt == Phase E demo: expense_claim (line items, file answer, PII, debug)
 -- Optional Microsoft Teams outgoing webhooks (FC_TEAMS and its REST endpoint):
 -- @@20_fc_teams.sql
 -- @@21_fc_teams_ords.sql
+-- @@22_seed_helpdesk_flow.sql     (the Teams sample flow it_helpdesk; it runs on APEX pages too)
 prompt == Done
 
 exit
