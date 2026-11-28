@@ -49,6 +49,7 @@
         { "$ref": "#/$defs/findRecord" }, { "$ref": "#/$defs/changeFields" }, { "$ref": "#/$defs/saveChanges" },
         { "$ref": "#/$defs/repeat" }, { "$ref": "#/$defs/bulkUpdate" }, { "$ref": "#/$defs/set" }, { "$ref": "#/$defs/menu" },
         { "$ref": "#/$defs/email" },
+        { "$ref": "#/$defs/teams" },
         { "$ref": "#/$defs/agent" },
         { "$ref": "#/$defs/rest" }
       ]
@@ -130,6 +131,89 @@
         "onError": { "$ref": "#/$defs/id", "description": "Where to go when sending fails (default: next)" }
       },
       "required": ["to", "subject"]
+    },
+
+    "teams": {
+      "description": "Post a card to a Microsoft Teams channel: a Teams Workflows webhook registered in FC_TEAMS_CHANNELS (PL/SQL engine, via FC_CHANNEL) or options.postToTeams (JS engine). One way: the card can open a link but nobody answers it. Not posted again when an Edit replays the flow.",
+      "properties": {
+        "type": {
+          "const": "teams"
+        },
+        "channel": {
+          "type": "string",
+          "description": "A channel name in FC_TEAMS_CHANNELS (the workflow URL stays in the database)"
+        },
+        "title": {
+          "type": "string",
+          "description": "One line; may use {{placeholders}}"
+        },
+        "text": {
+          "type": "string",
+          "description": "Simple Markdown with {{placeholders}}; links typed in answers are not made clickable"
+        },
+        "style": {
+          "enum": [
+            "default",
+            "emphasis",
+            "good",
+            "attention",
+            "warning",
+            "accent"
+          ],
+          "default": "default",
+          "description": "Background of the title"
+        },
+        "facts": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "required": [
+              "title",
+              "value"
+            ],
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "Label/value rows; rows whose value is empty are left out"
+        },
+        "link": {
+          "type": "string",
+          "description": "Optional https:// URL for an Open button"
+        },
+        "linkLabel": {
+          "type": "string",
+          "default": "Open"
+        },
+        "connector": {
+          "type": "string",
+          "description": "Optional. Receives the payload plus {channel, title, text, facts, link, linkLabel, style}; returns {ok, message?}"
+        },
+        "message": {
+          "type": "string",
+          "description": "Shown in the chat after posting"
+        },
+        "errorMessage": {
+          "type": "string",
+          "description": "Shown when posting fails"
+        },
+        "next": {
+          "$ref": "#/$defs/id"
+        },
+        "onError": {
+          "$ref": "#/$defs/id",
+          "description": "Where to go when posting fails (default: next)"
+        }
+      },
+      "required": [
+        "channel"
+      ]
     },
 
     "rest": {

@@ -53,6 +53,8 @@ prompt == Phase E demo: expense_claim (line items, file answer, PII, debug)
 -- Optional Power Automate + Adaptive Cards in Teams (FC_AUTOMATE and its REST endpoint):
 -- @@23_fc_automate.sql
 -- @@24_fc_automate_ords.sql
+-- Optional posts to Teams channels (FC_CHANNEL, the "Post to Teams" step; needs a network ACL):
+-- @@25_fc_channel.sql
 prompt == Done
 
 exit

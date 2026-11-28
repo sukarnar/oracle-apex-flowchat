@@ -68,6 +68,10 @@
  * node names no connector. Attachments are file answers ({slot, id, name, size, mimeType}); read their
  * content with engine.getFile(sessionId, id) (or from your own options.files store).
  *
+ * Post to Teams node ("teams"): builds {channel, title, text, facts: [{title, value}], link, linkLabel, style}
+ * from templates and hands it to the node's connector, or to options.postToTeams(msg) -> {ok, message?}
+ * (tools/flowchat-cards.js createTeamsPoster posts it to a Teams Workflows webhook). Not sent again on replay.
+ *
  * REST call node: calls a registered endpoint. options.restEndpoints = { id: {baseUrl, methods: ['GET'],
  * headers (secrets go here, never in a flow), timeoutMs, maxBytes} } is used with fetch() (or options.fetch);
  * or pass options.rest(req) -> {status, body} to make the call yourself, where
@@ -789,6 +793,54 @@
                  attachments: msg.attachments.length || undefined, sent: !problem, error: problem || undefined });
       if (problem) {
         say(ctx, 'error', interpolate(node.errorMessage || (r && r.message) || "Sorry, I couldn't send the email.", view(ctx)));
+        return node.onError || node.next;
+      }
+      if (node.message) say(ctx, 'text', interpolate(node.message, view(ctx)));
+      return node.next;
+    }
+
+    // ---- teams: post a card to a Teams channel, via a connector or options.postToTeams
+    var TEAMS_STYLES = ['default', 'emphasis', 'good', 'attention', 'warning', 'accent'];
+    var MAX_FACTS = 20;
+    function buildTeams(ctx, node) {
+      var v = view(ctx);
+      var msg = { channel: oneLine(interpolate(node.channel || '', v)),
+                  title: oneLine(interpolate(node.title || '', v)),
+                  text: interpolate(node.text || '', v).trim(),
+                  facts: [],
+                  link: oneLine(interpolate(node.link || '', v)) || null,
+                  linkLabel: oneLine(interpolate(node.linkLabel || '', v)) || 'Open',
+                  style: TEAMS_STYLES.indexOf(node.style) >= 0 ? node.style : 'default' };
+      (node.facts || []).forEach(function (f) {
+        var t = oneLine(interpolate(f && f.title || '', v)), val = interpolate(f && f.value || '', v).trim();
+        if (t && val) msg.facts.push({ title: t, value: val });   // empty answers are left out
+      });
+      return msg;
+    }
+    function teamsProblem(msg) {
+      if (!msg.channel) return 'no channel';
+      if (!msg.title && !msg.text) return 'no title or text';
+      if (msg.facts.length > MAX_FACTS) return 'more than ' + MAX_FACTS + ' facts';
+      if (msg.link && !/^https:\/\/\S+$/i.test(msg.link)) return 'the link must be an https:// URL';
+      return null;
+    }
+    // Posts the card; returns the next node (onError, else next, when posting fails).
+    async function runTeams(ctx, node) {
+      var msg = buildTeams(ctx, node), problem = teamsProblem(msg), r = null;
+      if (!problem) {
+        try {
+          if (node.connector) r = await callConnector(ctx, node.connector, Object.assign({ nodeId: node.id }, msg));
+          else if (typeof options.postToTeams === 'function') {
+            r = await Promise.resolve(options.postToTeams(Object.assign({ sessionId: ctx.sid, flowId: ctx.flow.flowId, nodeId: node.id,
+                                                                          appUser: appUserOf(ctx) }, msg)));
+          } else problem = 'no Teams sender (give the node a connector, or pass options.postToTeams)';
+        } catch (e) { problem = (e && e.message) || String(e); }
+        if (!problem && r && r.ok === false) problem = r.message || 'the sender reported a failure';
+      }
+      dbg(ctx, { event: 'teams', node: node.id, channel: msg.channel, title: msg.title, facts: msg.facts.length || undefined,
+                 sent: !problem, error: problem || undefined });
+      if (problem) {
+        say(ctx, 'error', interpolate(node.errorMessage || "Sorry, I couldn't post to Teams.", view(ctx)));
         return node.onError || node.next;
       }
       if (node.message) say(ctx, 'text', interpolate(node.message, view(ctx)));
@@ -1675,7 +1727,7 @@
         else if (n.type === 'agent') { total++; var ag = (ctx.st.agent || {})[n.id]; if (!ag || !ag.done) break; done++; id = ag.next; }
         else if (n.type === 'verify') id = n.verified;
         else if (n.type === 'bulkUpdate') id = n.done;
-        else if (n.type === 'message' || n.type === 'lookup' || n.type === 'set' || n.type === 'email' || n.type === 'rest' || n.type === 'workflow') id = n.next;
+        else if (n.type === 'message' || n.type === 'lookup' || n.type === 'set' || n.type === 'email' || n.type === 'teams' || n.type === 'rest' || n.type === 'workflow') id = n.next;
         else break;
       }
       if (ctx.st.status === 'completed') done = total;
@@ -2275,6 +2327,11 @@
             // Replaying an edit never sends the email again.
             if (ctx.replay) { id = node.next; break; }
             id = await runEmail(ctx, node);
+            break;
+          case 'teams':
+            // Replaying an edit never posts again.
+            if (ctx.replay) { id = node.next; break; }
+            id = await runTeams(ctx, node);
             break;
           case 'rest': {
             // Replaying an edit calls a GET again (answers it uses may have changed), quietly; other methods never repeat.

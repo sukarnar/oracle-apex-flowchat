@@ -48,6 +48,7 @@ db/         install.sql              first-time install: runs 01..07, 09..12 in 
             22_seed_helpdesk_flow.sql  IT help desk sample for Teams: IT_TICKETS, 3 connectors, a lookup list, flow it_helpdesk
             23_fc_automate.sql       FC_AUTOMATE (optional): Power Automate + Adaptive Cards in Teams, API keys, users
             24_fc_automate_ords.sql  REST endpoint Power Automate calls: {schema}/flowchat/automate/turn (optional)
+            25_fc_channel.sql        FC_CHANNEL (optional): post cards to Teams channels (Workflows webhook), the Post to Teams step
 demo/       index.html               create demo (runs in the browser using the JS engine)
             update.html              search and update demo, with a live table and a conflict button
             verify.html              public-page demo: one-time code first, with an in-page outbox
@@ -69,6 +70,8 @@ tests/      engine.test.js           node tests/engine.test.js
             teams.test.js            node tests/teams.test.js (Teams outgoing webhook: the reference for FC_TEAMS)
             helpdesk.test.js         node tests/helpdesk.test.js (it_helpdesk sample flow, through the Teams handler)
             cards.test.js            node tests/cards.test.js (Power Automate + Adaptive Cards: the reference for FC_AUTOMATE)
+            channel.test.js          node tests/channel.test.js (Post to Teams node and channel cards: the reference for FC_CHANNEL)
+            windows_client_test.py   py tests/windows_client_test.py (Windows client against automate-dev-server.js; needs Node)
             menu.test.js             node tests/menu.test.js (Menu node: pills, routing, loops, back/edit)
             email.test.js            node tests/email.test.js (Email node: templates, connector, attachments, failures)
             rest.test.js             node tests/rest.test.js (REST call node: URL building, body template, mapping, routing, refusals, replay)
@@ -84,7 +87,9 @@ tools/      build-seed.js            flow JSON -> SQL publish script
             build-apex-plugin.js     rebuilds both apex/ plugin exports from the source files
             flowchat-teams.js        Teams outgoing-webhook handler for Node (the reference for FC_TEAMS)
             teams-send.js            sends signed Teams messages to your endpoint, to test it without Teams
-            flowchat-cards.js        Adaptive Cards and the Power Automate endpoint for Node (the reference for FC_AUTOMATE)
+            flowchat-cards.js        Adaptive Cards, the Power Automate endpoint and channel posts for Node (the reference for FC_AUTOMATE and FC_CHANNEL)
+            automate-dev-server.js   local stand-in for the FC_AUTOMATE endpoints (turn, flows), for trying clients without a database
+            windows-client/flowchat_client.py  Windows desktop client: your flows (window or console), run them in a console
 ```
 
 ## 1. Try the demos (no database needed)
@@ -468,6 +473,31 @@ HR team",
   - **Edits:** an Edit that replays the flow doesn't send the email again.
   - **Spam:** a `to` filled from an answer lets anyone using the flow send that email to any address,
     so send to addresses typed by users only where that's fine (for example after a Verify step).
+- **Post to Teams node:** posts a card to a Teams channel. See
+  [Post to a Teams channel](#post-to-a-teams-channel-workflows-webhook) for the setup.
+  ```json
+  { "id": "alert_it", "type": "teams", "channel": "it_alerts", "style": "attention",
+    "title": "P1 ticket {{ticket_no}}: {{title}}", "text": "Logged by {{app_user}}.",
+    "facts": [ { "title": "Ticket", "value": "{{ticket_no}}" }, { "title": "Asset tag", "value": "{{asset_tag}}" } ],
+    "link": "https://<host>/ords/r/<app>/tickets?no={{ticket_no}}", "linkLabel": "Open the ticket",
+    "message": "I've alerted the IT channel.", "errorMessage": "I couldn't alert the IT channel.",
+    "next": "created", "onError": "created" }
+  ```
+  - `channel` is a name in `FC_TEAMS_CHANNELS`; the workflow URL stays in the database. `style`
+    colours the title: `default`, `attention` (red), `warning`, `good`, `accent` or `emphasis`.
+  - Facts whose value is empty are left out (at most 20). `link` must be `https://`. A Markdown link
+    typed in an answer (`[text](url)`) isn't made clickable.
+  - **Connector:** with `"connector"`, the connector gets the usual payload plus `channel`, `title`,
+    `text`, `facts`, `link`, `linkLabel` and `style`, and returns `{"ok": true}` or
+    `{"ok": false, "message": "..."}`. Without one, FC_ENGINE calls `fc_channel.post_message`.
+  - **JavaScript engine:** pass `createEngine({ postToTeams: (msg) => ({ ok: true }) })`;
+    `createTeamsPoster({ channels: { it_alerts: url } })` in `tools/flowchat-cards.js` posts for real.
+    The designer's Test tab posts nothing; it shows the card instead.
+  - **On failure:** the user sees `errorMessage` and the flow goes to `onError`, or carries on to
+    `next`. The error is in the debug log (event `teams`) and in `FC_TEAMS_CHANNELS.LAST_ERROR`.
+  - **Edits:** an Edit that replays the flow doesn't post again.
+  - **Time:** the post happens during the turn, so the chat waits for Teams (usually under a
+    second, at most 10 seconds). In a Teams outgoing-webhook conversation (5-second limit) that counts.
 - **REST call node:** calls a REST API and puts parts of its JSON answer into fields:
   ```json
   { "id": "get_rate", "type": "rest", "endpoint": "fx_rates", "method": "GET",
@@ -1437,6 +1467,38 @@ mentioned** (for example `#helpdesk`), add **Get user profile (V2)** with the me
 and set `upn` to its **User Principal Name**. The rest is the same, and the questions still go to
 the person privately.
 
+**Start it from the database (optional):** to have the database ask someone ("JDOE, please finish
+your trip clearance"), use the trigger **When a Teams webhook request is received** (Workflows in
+Teams, or Power Automate) instead of **Manually trigger a flow**:
+
+1. Copy the trigger's URL when you save the flow. It is a secret, like a channel's workflow URL.
+2. Replace steps 1 to 4 above with:
+   - **Initialize variable** `upn`, String: `triggerBody()?['user']`
+   - **Initialize variable** `flowId`, String: `triggerBody()?['flowId']`
+   - `sessionId`, `done` and `reply` as in steps 2 to 4.
+3. In the HTTP body, use `"flowId": "@{variables('flowId')}"`. Everything else is the same, and the
+   person gets the first question from the Flow bot in a private chat.
+4. Call it from PL/SQL (the schema needs a network ACL for the URL's host):
+   ```sql
+   declare
+     l_body json_object_t := json_object_t();
+     l_resp clob;
+   begin
+     l_body.put('user', 'jane.doe@example.com');
+     l_body.put('flowId', 'trip_booking');
+     apex_web_service.set_request_headers(p_name_01 => 'Content-Type', p_value_01 => 'application/json');
+     l_resp := apex_web_service.make_rest_request(p_url => '<trigger URL>', p_http_method => 'POST',
+                                                  p_body => l_body.to_clob);
+     if apex_web_service.g_status_code not in (200, 202) then
+       raise_application_error(-20000, 'Power Automate returned ' || apex_web_service.g_status_code);
+     end if;
+   end;
+   ```
+   Keep the URL in a table only the schema can read (like `FC_TEAMS_CHANNELS`), not in code.
+
+Only flows in the FC_AUTOMATE key's `flows` list run, and `user` decides who the flow runs as, so
+anyone who has the trigger URL can start any of those flows for anyone. Treat it like the key.
+
 ### How it behaves
 
 - **Each run is one conversation.** The card for each answer replaces the one before ("Got it."),
@@ -1478,6 +1540,175 @@ the person privately.
 - **JavaScript:** `tools/flowchat-teams.js` is the same handler for Node, and `tests/teams.test.js`
   tests it.
 
+## Windows desktop client
+
+`tools/windows-client/flowchat_client.py` lists the flows registered for the person signed in to
+Windows, exports the list, and runs a flow as a conversation in a console window. It uses the
+FC_AUTOMATE API (the same key, user mapping and flows as Power Automate) plus one more endpoint,
+`POST .../flowchat/automate/flows`, which lists a person's flows. Python 3.8 or later, standard
+library only (no `pip install`).
+
+**Who the person is.** The client sends the Windows sign-in name: the UPN
+(`jane.doe@corp.example.com`) on a PC joined to a domain or Microsoft Entra ID, else
+`DOMAIN\user` (`PCNAME\user` for a local account). `flowchat_client.py whoami` shows which.
+
+**Security: the key decides, not Windows.** ORDS can't check a Windows sign-in, so FlowChat trusts
+whatever name a client with a valid key sends. Anyone who can read the key can run the key's flows as
+anyone mapped to it. So:
+- give the desktop client **its own key** (`add_client`), limited to flows that are safe on that basis;
+- keep flows that change sensitive data on APEX pages (signed in) instead;
+- store the key encrypted (the client uses Windows DPAPI) and change it if a PC is lost.
+
+For a real proof of identity, the client would need to send a Microsoft Entra ID token that ORDS
+checks (a JWT profile); that isn't built yet.
+
+### 1. Database
+
+Re-run `23_fc_automate.sql` and `24_fc_automate_ords.sql`: they add `FC_AUTOMATE_USERS.FLOWS`,
+`fc_automate.list_flows` and the `flows` endpoint, and keep existing clients and users. Then:
+
+```sql
+set serveroutput on
+declare
+  l_key varchar2(100);
+begin
+  l_key := fc_automate.add_client(
+             p_client_id    => 'windows_desktop',
+             p_flows        => 'it_helpdesk,trip_booking',   -- the most any desktop user can run
+             p_default_flow => 'it_helpdesk',
+             p_user_mode    => 'TABLE');                     -- TABLE: only registered people, with their flows
+  dbms_output.put_line('API key: ' || l_key);
+
+  -- Register people: their Windows sign-in name, APEX user, and the flows registered for them
+  -- (null = every flow the key allows). Calling map_user again replaces both.
+  fc_automate.map_user('jane.doe@corp.example.com', 'JDOE', 'it_helpdesk,trip_booking');
+  fc_automate.map_user('CORP\bsmith',               'BSMITH', 'it_helpdesk');
+  commit;
+end;
+/
+```
+
+A person sees the flows that are published **and** in the key's `p_flows` **and** (TABLE mode) in
+their own list. With `p_user_mode` `LOCAL`, `CORP\jdoe` and `jdoe@corp.example.com` both run as
+`JDOE`, with no registration (everyone sees all the key's flows).
+
+The endpoint, for other clients:
+
+```
+POST https://<host>/ords/<alias>/flowchat/automate/flows
+X-FlowChat-Key: <key>
+{"user": "CORP\\bsmith"}
+-> 200 {"user": "corp\\bsmith", "appUser": "BSMITH", "defaultFlow": "it_helpdesk",
+        "flows": [{"flowId": "it_helpdesk", "name": "IT help desk", "description": null, "version": 4}]}
+   401 bad key, 403 not registered
+```
+
+### 2. On the PC
+
+```powershell
+py tools\windows-client\flowchat_client.py setup --url https://<host>/ords/<alias>/flowchat/automate
+```
+
+It asks for the key without showing it, saves both in `%APPDATA%\FlowChat\client.json` (key
+encrypted for that Windows user) and checks the connection. To set up every user of a PC at once,
+run it from an administrator prompt with `--all-users` (`%PROGRAMDATA%\FlowChat\client.json`,
+key encrypted for the machine). `FLOWCHAT_URL` and `FLOWCHAT_KEY` environment variables override both.
+
+| Command | What it does |
+|---|---|
+| `flowchat_client.py` (or `gui`) | A window with your flows: **Run** (opens a console), **Export…** (CSV or JSON), **Copy** (paste into Excel), **Settings…** |
+| `flowchat_client.py whoami` | The Windows name sent, and where the settings come from |
+| `flowchat_client.py flows` | Your flows; `--csv flows.csv` or `--json` to save them |
+| `flowchat_client.py run [flowId]` | The conversation in the console (asks which flow when none is given) |
+
+**In the console:** buttons are numbered (`[1] Next  [2] Back`). Type the answer, a choice's number,
+`:n` to press button *n* while answering, or `:q` to stop. Answers are checked as in Teams
+(required, length, numbers, dates as YYYY-MM-DD). File answers can't be given here.
+
+**One EXE for people without Python:**
+
+```powershell
+py -m pip install pyinstaller
+```
+```powershell
+py -m PyInstaller --onefile --noconsole --name FlowChat tools\windows-client\flowchat_client.py
+```
+
+`dist\FlowChat.exe` opens the window; **Run** opens its own console.
+
+**Try it without the database:** `node tools/automate-dev-server.js --key dev-key --map "<your whoami name>=JDOE:it_helpdesk"`
+serves both endpoints on `http://127.0.0.1:8790/flowchat/automate` with the sample flows.
+
+## Post to a Teams channel (Workflows webhook)
+
+`FC_CHANNEL` (`db/25_fc_channel.sql`) posts cards to Teams channels: from a flow with the **Post to
+Teams** step, or from your own PL/SQL. It uses the Teams workflow **Post to a channel when a webhook
+request is received**. It only posts: the card can have a button that opens a page, but nobody can
+answer it. For conversations in Teams, use the outgoing webhook or Power Automate sections above.
+
+**1. Create the workflow in Teams.** In the channel, **⋯ > Workflows**, choose **Post to a channel
+when a webhook request is received**, pick the team and channel, then **Add workflow**. Copy the URL
+it shows. Anyone who has that URL can post to the channel, so treat it as a secret. Posts show as
+"*your name* via Workflows", because the workflow runs under the account that created it.
+
+**2. Let the database call it.** As ADMIN, give the schema a network ACL for the URL's host (copy the
+host from the URL; it ends in `logic.azure.com` or `powerplatform.com`):
+
+```sql
+begin
+  dbms_network_acl_admin.append_host_ace(
+    host => '<host from the URL>',
+    ace  => xs$ace_type(privilege_list => xs$name_list('connect', 'resolve'),
+                        principal_name => '<your schema>', principal_type => xs_acl.ptype_db));
+end;
+/
+```
+
+On Autonomous Database HTTPS works as is. Elsewhere, the wallet APEX uses (Instance Settings >
+Wallet) needs Microsoft's root certificates.
+
+**3. Install and add the channel.**
+
+```sql
+@25_fc_channel.sql
+exec fc_channel.add_channel('it_alerts', '<workflow URL>', 'IT on-call channel');
+commit;
+exec fc_channel.send_test('it_alerts');   -- posts "FlowChat can post to this channel."
+```
+
+Channel names use lower case letters, digits, `_` and `-`. `add_channel` with the same name
+replaces the URL. To stop posting, set `FC_TEAMS_CHANNELS.ENABLED` to `N`. Don't grant anyone
+`SELECT` on the table.
+
+**4. Post from a flow.** Add a **Post to Teams** step in the designer (see the node above). The
+`it_helpdesk` sample posts every P1 ticket to `it_alerts` (steps `is_p1` and `alert_it`).
+
+**Or post from PL/SQL.** For example, after an approval:
+
+```sql
+declare
+  l_f json_object_t := json_object_t();
+begin
+  l_f.put('Trip', :P10_TRIP_NO);
+  l_f.put('Traveller', :P10_TRAVELLER);
+  l_f.put('Decision', 'Approved');
+  fc_channel.post(p_channel    => 'travel_desk',
+                  p_title      => 'Trip ' || :P10_TRIP_NO || ' approved',
+                  p_facts      => l_f,
+                  p_link       => 'https://<host>/ords/r/<app>/trip?no=' || :P10_TRIP_NO,
+                  p_link_label => 'Open the trip',
+                  p_style      => 'good');
+end;
+```
+
+`post` raises ORA-20070 when Teams refuses the card. Inside a transaction you don't want to lose
+(saving a ticket, say), catch it: a Teams outage shouldn't undo the work. `post_message` takes the
+JSON message and returns the problem instead of raising.
+
+**What's in a card:** a bold title (on a coloured band when `style` is set), the text, the facts as a
+two-column list and an optional **Open** button. Adaptive Card 1.4. Buttons that send an answer back
+(`Action.Submit`) don't work in cards posted this way, so FlowChat never adds them.
+
 ## Turn protocol
 
 The server and the widget exchange exactly one JSON shape. Any backend that produces it works with the widget.
@@ -1495,13 +1726,21 @@ The server and the widget exchange exactly one JSON shape. Any backend that prod
 
 ## Status and known limits
 
-- The JavaScript engine and widget are tested: 183 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/repeat-edit.test.js`, `tests/batch.test.js`, `tests/turns.test.js`, `tests/teams.test.js`, `tests/helpdesk.test.js`, `tests/cards.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
+- The JavaScript engine and widget are tested: 195 unit tests (`tests/engine.test.js`, `tests/redact.test.js`, `tests/note.test.js`, `tests/repeat-edit.test.js`, `tests/batch.test.js`, `tests/turns.test.js`, `tests/teams.test.js`, `tests/helpdesk.test.js`, `tests/cards.test.js`, `tests/channel.test.js`, `tests/workflow.test.js`, `tests/trip.test.js`,
   `tests/update.test.js`, `tests/verify.test.js`, `tests/lov.test.js`, `tests/mine.test.js`,
   `tests/appuser.test.js`, `tests/phase-e.test.js`, `tests/set.test.js`, `tests/menu.test.js`,
   `tests/email.test.js`, `tests/agent.test.js`, `tests/rest.test.js`), plus manual end-to-end runs of the demos.
 - **The REST call node's and REST tools' PL/SQL (`run_rest`, `rest_call`, `rest_tool` and the other `rest_*` helpers in `FC_ENGINE`,
   `17_rest_endpoints.sql`, `list_rest` in `FC_DESIGNER`) has not been compiled or called a real API
   yet.** It mirrors the tested JavaScript engine.
+- **`fc_automate.list_flows`, the per-person flows (`FC_AUTOMATE_USERS.FLOWS`, `map_user`'s `p_flows`), the
+  `DOMAIN\user` handling in LOCAL mode and the `flows` ORDS template have not been compiled yet.** They
+  mirror `tools/flowchat-cards.js` (`tests/cards.test.js`); the Windows client is tested against the
+  Node stand-in (`tests/windows_client_test.py`), not against ORDS.
+- **`FC_CHANNEL` (`25_fc_channel.sql`), `run_teams` in `FC_ENGINE` and the `teams` type in
+  `FC_DESIGNER`'s check have not been compiled or posted to a real channel yet.** They mirror
+  `channelCard` / `createTeamsPoster` in `tools/flowchat-cards.js` and the JavaScript engine, which
+  `tests/channel.test.js` covers.
 - **`FC_AUTOMATE` (Power Automate + Adaptive Cards) and its ORDS endpoint have not been compiled or
   called by Power Automate yet.** They mirror `tools/flowchat-cards.js`, which `tests/cards.test.js`
   covers.

@@ -8,6 +8,12 @@
 --   exec fc_teams.add_webhook('helpdesk', '<security token from Teams>', 'it_helpdesk');
 --   exec fc_teams.map_user('<Entra object id>', '<APEX user>');
 --   commit;
+--
+-- P1 tickets are also posted to the Teams channel "it_alerts" (the alert_it step). Install
+-- 25_fc_channel.sql and add the channel's workflow URL; without it the person is told the alert
+-- couldn't be sent, and the ticket is still logged:
+--   exec fc_channel.add_channel('it_alerts', '<workflow URL>');
+--   commit;
 set define off
 
 create table if not exists it_tickets (
@@ -551,8 +557,53 @@ begin
       "id": "save",
       "type": "submit",
       "connector": "it_create_ticket",
-      "onSuccess": "created",
+      "onSuccess": "is_p1",
       "onError": "review"
+    },
+    {
+      "id": "is_p1",
+      "type": "condition",
+      "branches": [
+        {
+          "when": {
+            "slot": "priority",
+            "op": "=",
+            "value": "P1"
+          },
+          "next": "alert_it"
+        }
+      ],
+      "else": "created"
+    },
+    {
+      "id": "alert_it",
+      "type": "teams",
+      "channel": "it_alerts",
+      "style": "attention",
+      "title": "P1 ticket {{ticket_no}}: {{title}}",
+      "text": "Logged by {{app_user}} in FlowChat. Everyone in the office is affected and nobody can work.",
+      "facts": [
+        {
+          "title": "Ticket",
+          "value": "{{ticket_no}}"
+        },
+        {
+          "title": "Area",
+          "value": "{{category}}"
+        },
+        {
+          "title": "Asset tag",
+          "value": "{{asset_tag}}"
+        },
+        {
+          "title": "Remote access OK",
+          "value": "{{remote_ok}}"
+        }
+      ],
+      "message": "I've also alerted the IT channel in Teams.",
+      "errorMessage": "Your ticket is logged, but I couldn't alert the IT channel in Teams. The service desk will still see it.",
+      "next": "created",
+      "onError": "created"
     },
     {
       "id": "created",

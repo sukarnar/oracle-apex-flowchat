@@ -186,5 +186,43 @@ function setup(extra) {
     assert.ok(/555 999 0000|Ana Doe/.test(JSON.stringify(r.body.card)));
   });
 
+  const catalog = [{ flowId: 'it_helpdesk', name: 'IT help desk', description: 'Log a ticket', version: 3 },
+                   { flowId: 'trip_booking', name: 'Book a trip', version: 1 },
+                   { flowId: 'loan_application', name: 'Personal loan application' }];
+
+  await test('listFlows: the published flows both the key and the person may run, sorted by name', async () => {
+    const s = setup({ catalog, clients: { a: { key: KEY, flows: ['it_helpdesk', 'trip_booking'], defaultFlow: 'it_helpdesk' } },
+                      users: { 'jane.doe@example.com': 'JDOE', 'corp\\bsmith': { appUser: 'BSMITH', flows: ['trip_booking'] } } });
+    let r = await s.h.listFlows(KEY, JSON.stringify({ user: 'Jane.Doe@example.com' }));
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.appUser, 'JDOE');
+    assert.deepStrictEqual(r.body.flows.map((f) => f.flowId), ['trip_booking', 'it_helpdesk']);   // Book a trip, IT help desk
+    assert.deepStrictEqual(r.body.flows[1], { flowId: 'it_helpdesk', name: 'IT help desk', description: 'Log a ticket', version: 3 });
+    assert.strictEqual(r.body.defaultFlow, 'it_helpdesk');
+    r = await s.h.listFlows(KEY, JSON.stringify({ user: 'CORP\\BSmith' }));                    // a Windows sign-in name
+    assert.deepStrictEqual([r.body.appUser, r.body.flows.map((f) => f.flowId), r.body.defaultFlow], ['BSMITH', ['trip_booking'], null]);
+    assert.strictEqual((await s.h.listFlows(KEY, JSON.stringify({ user: 'corp\\nobody' }))).status, 403);
+    assert.strictEqual((await s.h.listFlows('nope', '{}')).status, 401);
+    assert.strictEqual((await s.h.listFlows(KEY, 'not json')).status, 400);
+  });
+
+  await test('a flow not registered for the person is refused, even when the key allows it', async () => {
+    const s = setup({ clients: { a: { key: KEY, userMode: 'TABLE' } },
+                      users: { 'corp\\bsmith': { appUser: 'BSMITH', flows: ['trip_booking'] } } });
+    let r = await s.post(null, { user: 'CORP\\bsmith', flowId: 'it_helpdesk' });
+    assert.strictEqual(r.status, 403);
+    assert.ok(/not registered for your account/.test(r.body.error));
+    r = await s.post(null, { user: 'corp\\bsmith', flowId: 'trip_booking' });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.appUser, 'BSMITH');
+  });
+
+  await test('LOCAL mode takes the user from DOMAIN\\user as well as from user@domain', async () => {
+    const s = setup({ catalog, clients: { a: { key: KEY, userMode: 'LOCAL' } } });
+    const r = await s.h.listFlows(KEY, JSON.stringify({ user: 'CORP\\jdoe' }));
+    assert.strictEqual(r.body.appUser, 'JDOE');
+    assert.strictEqual(r.body.flows.length, 3);
+  });
+
   console.log(passed + ' passed');
 })();

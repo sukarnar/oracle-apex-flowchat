@@ -1,6 +1,6 @@
 -- Re-creates the FlowChat packages in dependency order WITHOUT touching tables or data.
 -- Use it after an upgrade or a compile fix:   sql user/pass@db @reinstall_packages.sql
---   FC_DATA  <-  FC_ENGINE  <-  FC_DESIGNER, FC_CLIENT  <-  FC_TEAMS, FC_AUTOMATE (only if installed)
+--   FC_DATA  <-  FC_ENGINE  <-  FC_DESIGNER, FC_CLIENT  <-  FC_TEAMS, FC_AUTOMATE, FC_CHANNEL (only if installed)
 set define off
 set serveroutput on
 
@@ -13,10 +13,10 @@ prompt == FC_DESIGNER
 @@09_fc_designer.sql
 prompt == FC_CLIENT
 @@19_fc_client.sql
-prompt == FC_TEAMS, FC_AUTOMATE: recompiled if installed (20_fc_teams.sql, 23_fc_automate.sql)
+prompt == FC_TEAMS, FC_AUTOMATE, FC_CHANNEL: recompiled if installed (20_fc_teams.sql, 23_fc_automate.sql, 25_fc_channel.sql)
 begin
   for p in (select object_name, object_type from user_objects
-             where object_name in ('FC_TEAMS', 'FC_AUTOMATE') and object_type in ('PACKAGE', 'PACKAGE BODY')
+             where object_name in ('FC_TEAMS', 'FC_AUTOMATE', 'FC_CHANNEL') and object_type in ('PACKAGE', 'PACKAGE BODY')
              order by object_name, object_type) loop
     execute immediate 'alter package ' || lower(p.object_name) || ' compile '
                       || case p.object_type when 'PACKAGE BODY' then 'body' else 'package' end;
@@ -31,11 +31,11 @@ column name format a20
 column text format a90
 select name, type, line, position, text
   from user_errors
- where name in ('FC_DATA', 'FC_ENGINE', 'FC_DESIGNER', 'FC_CLIENT', 'FC_TEAMS', 'FC_AUTOMATE', 'FC_DEMO_HELPDESK', 'FC_DEMO_CONNECTORS', 'FC_DEMO_VERIFY')
+ where name in ('FC_DATA', 'FC_ENGINE', 'FC_DESIGNER', 'FC_CLIENT', 'FC_TEAMS', 'FC_AUTOMATE', 'FC_CHANNEL', 'FC_DEMO_HELPDESK', 'FC_DEMO_CONNECTORS', 'FC_DEMO_VERIFY')
  order by name, type, sequence;
 
 prompt == Object status
 select object_name, object_type, status
   from user_objects
- where object_name in ('FC_DATA', 'FC_ENGINE', 'FC_DESIGNER', 'FC_CLIENT', 'FC_TEAMS', 'FC_AUTOMATE', 'FC_DEMO_HELPDESK', 'FC_DEMO_CONNECTORS', 'FC_DEMO_VERIFY')
+ where object_name in ('FC_DATA', 'FC_ENGINE', 'FC_DESIGNER', 'FC_CLIENT', 'FC_TEAMS', 'FC_AUTOMATE', 'FC_CHANNEL', 'FC_DEMO_HELPDESK', 'FC_DEMO_CONNECTORS', 'FC_DEMO_VERIFY')
  order by object_name, object_type;

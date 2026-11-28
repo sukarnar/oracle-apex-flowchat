@@ -1541,6 +1541,122 @@ create or replace package body fc_engine as
   end run_email;
 
   ------------------------------------------------------------------------------
+  -- teams: a card posted to a Teams channel by FC_CHANNEL (db/25_fc_channel.sql) or a connector
+  ------------------------------------------------------------------------------
+  -- Posts the node's card; returns the next node (onError, else next, when posting fails).
+  function run_teams (c in out nocopy t_ctx, p_node in json_object_t) return varchar2 is
+    l_id      varchar2(200)  := str(p_node, 'id');
+    l_v       json_object_t  := vals(c);
+    l_channel varchar2(4000) := one_line(interpolate(str(p_node, 'channel'), l_v));
+    l_title   varchar2(4000) := one_line(interpolate(str(p_node, 'title'), l_v));
+    l_text    varchar2(32767) := trim(interpolate(str(p_node, 'text'), l_v));
+    l_link    varchar2(4000) := one_line(interpolate(str(p_node, 'link'), l_v));
+    l_label   varchar2(4000) := nvl(one_line(interpolate(str(p_node, 'linkLabel'), l_v)), 'Open');
+    l_style   varchar2(30)   := str(p_node, 'style');
+    l_tmpl    json_array_t   := arr(p_node, 'facts');
+    l_facts   json_array_t   := json_array_t();
+    l_f       json_object_t;
+    l_ft      varchar2(4000);
+    l_fv      varchar2(32767);
+    l_msg     json_object_t  := json_object_t();
+    l_pay     json_object_t;
+    l_res     json_object_t;
+    l_ev      json_object_t;
+    l_clob    clob;
+    l_err     varchar2(4000);
+    l_problem varchar2(4000);
+  begin
+    if l_style is null or l_style not in ('default', 'emphasis', 'good', 'attention', 'warning', 'accent') then
+      l_style := 'default';
+    end if;
+    for i in 0 .. l_tmpl.get_size - 1 loop
+      if l_tmpl.get(i).is_object then
+        l_f  := treat(l_tmpl.get(i) as json_object_t);
+        l_ft := one_line(interpolate(str(l_f, 'title'), l_v));
+        l_fv := trim(interpolate(str(l_f, 'value'), l_v));
+        if l_ft is not null and l_fv is not null then   -- empty answers are left out
+          l_f := json_object_t();
+          l_f.put('title', l_ft);
+          l_f.put('value', l_fv);
+          l_facts.append(l_f);
+        end if;
+      end if;
+    end loop;
+
+    if l_channel is null then
+      l_problem := 'no channel';
+    elsif l_title is null and l_text is null then
+      l_problem := 'no title or text';
+    elsif l_facts.get_size > 20 then
+      l_problem := 'more than 20 facts';
+    elsif l_link is not null and not regexp_like(l_link, '^https://[^[:space:]]+$', 'i') then
+      l_problem := 'the link must be an https:// URL';
+    end if;
+
+    l_msg.put('channel', l_channel);
+    l_msg.put('title', l_title);
+    l_msg.put('text', l_text);
+    l_msg.put('facts', l_facts);
+    if l_link is not null then l_msg.put('link', l_link); else l_msg.put_null('link'); end if;
+    l_msg.put('linkLabel', l_label);
+    l_msg.put('style', l_style);
+
+    if l_problem is null then
+      begin
+        if str(p_node, 'connector') is not null then
+          l_pay := json_object_t.parse(payload(c, l_id));
+          l_pay.put('channel', l_channel);
+          l_pay.put('title', l_title);
+          l_pay.put('text', l_text);
+          l_pay.put('facts', l_facts);
+          if l_link is not null then l_pay.put('link', l_link); else l_pay.put_null('link'); end if;
+          l_pay.put('linkLabel', l_label);
+          l_pay.put('style', l_style);
+          l_res := conn(c, l_id, str(p_node, 'connector'), l_pay.to_clob);
+          if str(l_res, 'ok') = 'false' then l_problem := nvl(str(l_res, 'message'), 'the sender reported a failure'); end if;
+        else
+          -- Called dynamically so FC_ENGINE compiles without the optional FC_CHANNEL package.
+          l_clob := l_msg.to_clob;
+          begin
+            execute immediate 'begin :r := fc_channel.post_message(:m); end;' using out l_err, in l_clob;
+            l_problem := l_err;
+          exception when others then
+            if sqlcode = -6550 then
+              l_problem := 'Teams posting is not installed (run db/25_fc_channel.sql)';
+            else
+              raise;
+            end if;
+          end;
+        end if;
+      exception when others then
+        l_problem := substr(sqlerrm, 1, 4000);
+        apex_debug.error('FlowChat teams %s failed: %s', l_id, l_problem);
+      end;
+    end if;
+
+    if dbg_enabled(c) then
+      l_ev := json_object_t();
+      l_ev.put('event', 'teams');
+      l_ev.put('node', l_id);
+      l_ev.put('channel', l_channel);
+      l_ev.put('title', l_title);
+      if l_facts.get_size > 0 then l_ev.put('facts', l_facts.get_size); end if;
+      l_ev.put('sent', l_problem is null);
+      if l_problem is not null then l_ev.put('error', l_problem); end if;
+      dbg(c, l_id, l_ev);
+    end if;
+
+    if l_problem is not null then
+      add_msg(c, 'error', interpolate(nvl(str(p_node, 'errorMessage'), 'Sorry, I couldn''t post to Teams.'), vals(c)));
+      return nvl(str(p_node, 'onError'), str(p_node, 'next'));
+    end if;
+    if str(p_node, 'message') is not null then
+      add_msg(c, 'text', interpolate(str(p_node, 'message'), vals(c)));
+    end if;
+    return str(p_node, 'next');
+  end run_teams;
+
+  ------------------------------------------------------------------------------
   -- REST call node: calls an endpoint registered in FC_REST_ENDPOINTS (base URL, Web Credential,
   -- allowed methods). A flow names only the endpoint, a relative path, query, headers, a body
   -- template and a response mapping, so it never holds a host name or a secret.
@@ -4047,7 +4163,7 @@ create or replace package body fc_engine as
         l_id := str(l_n, 'verified');
       elsif l_type = 'bulkUpdate' then
         l_id := str(l_n, 'done');
-      elsif l_type in ('message', 'lookup', 'set', 'email', 'rest', 'workflow') then
+      elsif l_type in ('message', 'lookup', 'set', 'email', 'teams', 'rest', 'workflow') then
         l_id := str(l_n, 'next');
       else
         exit;
@@ -4129,6 +4245,14 @@ create or replace package body fc_engine as
             l_id := str(l_node, 'next');
           else
             l_id := run_email(c, l_node);
+          end if;
+
+        when 'teams' then
+          -- Replaying an edit never posts again.
+          if c.replay then
+            l_id := str(l_node, 'next');
+          else
+            l_id := run_teams(c, l_node);
           end if;
 
         when 'menu' then

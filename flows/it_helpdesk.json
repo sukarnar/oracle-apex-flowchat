@@ -5,8 +5,14 @@
   "debug": true,
   "start": "welcome",
   "bindings": {
-    "ticket_no": { "dom": "#ticket_no", "apex": "P40_TICKET_NO" },
-    "priority": { "dom": "#priority", "apex": "P40_PRIORITY" }
+    "ticket_no": {
+      "dom": "#ticket_no",
+      "apex": "P40_TICKET_NO"
+    },
+    "priority": {
+      "dom": "#priority",
+      "apex": "P40_PRIORITY"
+    }
   },
   "nodes": [
     {
@@ -19,9 +25,21 @@
       "id": "init",
       "type": "set",
       "assign": [
-        { "slot": "open_tickets", "value": 0, "onlyIfEmpty": true },
-        { "slot": "ticket_list", "value": "", "onlyIfEmpty": true },
-        { "slot": "close_ticket_no", "value": "", "onlyIfEmpty": true }
+        {
+          "slot": "open_tickets",
+          "value": 0,
+          "onlyIfEmpty": true
+        },
+        {
+          "slot": "ticket_list",
+          "value": "",
+          "onlyIfEmpty": true
+        },
+        {
+          "slot": "close_ticket_no",
+          "value": "",
+          "onlyIfEmpty": true
+        }
       ],
       "next": "load_summary"
     },
@@ -35,7 +53,14 @@
       "id": "has_open",
       "type": "condition",
       "branches": [
-        { "when": { "slot": "open_tickets", "op": ">", "value": 0 }, "next": "choose" }
+        {
+          "when": {
+            "slot": "open_tickets",
+            "op": ">",
+            "value": 0
+          },
+          "next": "choose"
+        }
       ],
       "else": "new_intro"
     },
@@ -45,9 +70,21 @@
       "slot": "action",
       "prompt": "You have {{open_tickets}} open ticket(s). What would you like to do?",
       "options": [
-        { "value": "NEW", "label": "Report a new problem", "next": "new_intro" },
-        { "value": "LIST", "label": "Show my open tickets", "next": "show_list" },
-        { "value": "CLOSE", "label": "Close a ticket that's fixed", "next": "pick_close" }
+        {
+          "value": "NEW",
+          "label": "Report a new problem",
+          "next": "new_intro"
+        },
+        {
+          "value": "LIST",
+          "label": "Show my open tickets",
+          "next": "show_list"
+        },
+        {
+          "value": "CLOSE",
+          "label": "Close a ticket that's fixed",
+          "next": "pick_close"
+        }
       ]
     },
     {
@@ -77,7 +114,11 @@
       "label": "What fixed it",
       "inSummary": false,
       "prompt": "What fixed it? It helps the next person with the same problem. (SKIP if you'd rather not say.)",
-      "input": { "kind": "text", "required": false, "maxLength": 400 },
+      "input": {
+        "kind": "text",
+        "required": false,
+        "maxLength": 400
+      },
       "next": "do_close"
     },
     {
@@ -113,12 +154,30 @@
         "kind": "choice",
         "display": "buttons",
         "options": [
-          { "value": "HARDWARE", "label": "Laptop or desktop" },
-          { "value": "SOFTWARE", "label": "An app or software" },
-          { "value": "NETWORK", "label": "Network, Wi-Fi or VPN" },
-          { "value": "ACCOUNT", "label": "Sign-in or access" },
-          { "value": "PRINTER", "label": "Printer" },
-          { "value": "OTHER", "label": "Something else" }
+          {
+            "value": "HARDWARE",
+            "label": "Laptop or desktop"
+          },
+          {
+            "value": "SOFTWARE",
+            "label": "An app or software"
+          },
+          {
+            "value": "NETWORK",
+            "label": "Network, Wi-Fi or VPN"
+          },
+          {
+            "value": "ACCOUNT",
+            "label": "Sign-in or access"
+          },
+          {
+            "value": "PRINTER",
+            "label": "Printer"
+          },
+          {
+            "value": "OTHER",
+            "label": "Something else"
+          }
         ]
       },
       "next": "title"
@@ -129,7 +188,11 @@
       "slot": "title",
       "label": "Problem",
       "prompt": "In one line, what's wrong?",
-      "input": { "kind": "text", "minLength": 5, "maxLength": 80 },
+      "input": {
+        "kind": "text",
+        "minLength": 5,
+        "maxLength": 80
+      },
       "next": "details"
     },
     {
@@ -140,14 +203,25 @@
       "prompt": "Anything else we should know, like an error message or when it started? (SKIP if not.)",
       "note": "Everyone in this channel can read your answers. Never post a password or a one-time code here.",
       "noteStyle": "warning",
-      "input": { "kind": "text", "required": false, "maxLength": 1000 },
+      "input": {
+        "kind": "text",
+        "required": false,
+        "maxLength": 1000
+      },
       "next": "is_hardware"
     },
     {
       "id": "is_hardware",
       "type": "condition",
       "branches": [
-        { "when": { "slot": "category", "op": "=", "value": "HARDWARE" }, "next": "asset_tag" }
+        {
+          "when": {
+            "slot": "category",
+            "op": "=",
+            "value": "HARDWARE"
+          },
+          "next": "asset_tag"
+        }
       ],
       "else": "clear_asset"
     },
@@ -159,13 +233,22 @@
       "prompt": "What's the computer's asset tag? (SKIP if you can't find it.)",
       "note": "It's on a sticker under the laptop or on the back of the desktop, and starts with AT-.",
       "noteStyle": "tip",
-      "input": { "kind": "text", "required": false, "maxLength": 20 },
+      "input": {
+        "kind": "text",
+        "required": false,
+        "maxLength": 20
+      },
       "next": "impact"
     },
     {
       "id": "clear_asset",
       "type": "set",
-      "assign": [ { "slot": "asset_tag", "clear": true } ],
+      "assign": [
+        {
+          "slot": "asset_tag",
+          "clear": true
+        }
+      ],
       "next": "impact"
     },
     {
@@ -178,9 +261,18 @@
         "kind": "choice",
         "display": "buttons",
         "options": [
-          { "value": "ME", "label": "Just me" },
-          { "value": "TEAM", "label": "My team" },
-          { "value": "SITE", "label": "Everyone in the office" }
+          {
+            "value": "ME",
+            "label": "Just me"
+          },
+          {
+            "value": "TEAM",
+            "label": "My team"
+          },
+          {
+            "value": "SITE",
+            "label": "Everyone in the office"
+          }
         ]
       },
       "next": "urgency"
@@ -195,9 +287,18 @@
         "kind": "choice",
         "display": "buttons",
         "options": [
-          { "value": "LOW", "label": "A little: it's annoying" },
-          { "value": "NORMAL", "label": "Some: I can work around it" },
-          { "value": "HIGH", "label": "A lot: I can't do my job" }
+          {
+            "value": "LOW",
+            "label": "A little: it's annoying"
+          },
+          {
+            "value": "NORMAL",
+            "label": "Some: I can work around it"
+          },
+          {
+            "value": "HIGH",
+            "label": "A lot: I can't do my job"
+          }
         ]
       },
       "next": "is_major"
@@ -207,10 +308,20 @@
       "type": "condition",
       "branches": [
         {
-          "when": { "any": [
-            { "slot": "impact", "op": "=", "value": "SITE" },
-            { "slot": "urgency", "op": "=", "value": "HIGH" }
-          ] },
+          "when": {
+            "any": [
+              {
+                "slot": "impact",
+                "op": "=",
+                "value": "SITE"
+              },
+              {
+                "slot": "urgency",
+                "op": "=",
+                "value": "HIGH"
+              }
+            ]
+          },
           "next": "major_note"
         }
       ],
@@ -228,7 +339,9 @@
       "slot": "remote_ok",
       "label": "Remote access OK",
       "prompt": "If it helps, may an engineer connect to your computer remotely? They'll always ask you first.",
-      "input": { "kind": "yesno" },
+      "input": {
+        "kind": "yesno"
+      },
       "next": "review"
     },
     {
@@ -242,8 +355,53 @@
       "id": "save",
       "type": "submit",
       "connector": "it_create_ticket",
-      "onSuccess": "created",
+      "onSuccess": "is_p1",
       "onError": "review"
+    },
+    {
+      "id": "is_p1",
+      "type": "condition",
+      "branches": [
+        {
+          "when": {
+            "slot": "priority",
+            "op": "=",
+            "value": "P1"
+          },
+          "next": "alert_it"
+        }
+      ],
+      "else": "created"
+    },
+    {
+      "id": "alert_it",
+      "type": "teams",
+      "channel": "it_alerts",
+      "style": "attention",
+      "title": "P1 ticket {{ticket_no}}: {{title}}",
+      "text": "Logged by {{app_user}} in FlowChat. Everyone in the office is affected and nobody can work.",
+      "facts": [
+        {
+          "title": "Ticket",
+          "value": "{{ticket_no}}"
+        },
+        {
+          "title": "Area",
+          "value": "{{category}}"
+        },
+        {
+          "title": "Asset tag",
+          "value": "{{asset_tag}}"
+        },
+        {
+          "title": "Remote access OK",
+          "value": "{{remote_ok}}"
+        }
+      ],
+      "message": "I've also alerted the IT channel in Teams.",
+      "errorMessage": "Your ticket is logged, but I couldn't alert the IT channel in Teams. The service desk will still see it.",
+      "next": "created",
+      "onError": "created"
     },
     {
       "id": "created",

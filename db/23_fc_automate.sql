@@ -10,9 +10,15 @@
 --                        endpoint: the SHA-256 of its API key, the FlowChat flows it may run, and how
 --                        a person's Microsoft 365 sign-in name (UPN, e.g. jane.doe@example.com)
 --                        becomes the APEX user. Add rows with fc_automate.add_client.
---   FC_AUTOMATE_USERS    UPN -> APEX user, for clients with user_mode TABLE (fc_automate.map_user).
+--   FC_AUTOMATE_USERS    sign-in name -> APEX user, for clients with user_mode TABLE, and optionally the
+--                        flows registered for that person (fc_automate.map_user). A sign-in name is a
+--                        UPN (jane.doe@example.com) or, from the Windows client, DOMAIN\user.
 --
--- Needs EXECUTE on SYS.DBMS_CRYPTO (already a FlowChat prerequisite). Safe to re-run.
+-- The same API also serves the Windows desktop client (tools/windows-client): POST .../flows lists the
+-- flows a person may run (fc_automate.list_flows).
+--
+-- Needs EXECUTE on SYS.DBMS_CRYPTO (already a FlowChat prerequisite). Safe to re-run: an older
+-- FC_AUTOMATE_USERS gets the FLOWS column.
 set define off
 
 declare
@@ -51,6 +57,7 @@ begin
       create table fc_automate_users (
         upn        varchar2(320) not null,
         app_user   varchar2(255) not null,
+        flows      varchar2(4000),
         enabled    varchar2(1)   default 'Y' not null,
         created_at timestamp with time zone default systimestamp not null,
         constraint fc_automate_users_pk primary key (upn),
@@ -58,6 +65,12 @@ begin
       )]';
     execute immediate q'[comment on table fc_automate_users is 'FlowChat: Microsoft 365 sign-in names (UPN, lower case) and the APEX user each one runs flows as']';
   end if;
+
+  select count(*) into l_n from user_tab_columns where table_name = 'FC_AUTOMATE_USERS' and column_name = 'FLOWS';
+  if l_n = 0 then
+    execute immediate 'alter table fc_automate_users add (flows varchar2(4000))';
+  end if;
+  execute immediate q'[comment on column fc_automate_users.flows is 'Comma-separated flow ids registered for this person; null = every flow the client key allows']';
 end;
 /
 
@@ -92,8 +105,22 @@ create or replace package fc_automate authid definer as
                        p_user_mode    in varchar2 default 'TABLE',
                        p_description  in varchar2 default null) return varchar2;
 
-  -- Links a Microsoft 365 sign-in name (UPN / email) to an APEX user, for user_mode TABLE.
-  procedure map_user (p_upn in varchar2, p_app_user in varchar2);
+  -- Links a sign-in name (UPN / email, or DOMAIN\user from the Windows client) to an APEX user, for
+  -- user_mode TABLE. p_flows: comma-separated flow ids registered for the person; null = every flow
+  -- the client key allows. Calling it again replaces both.
+  procedure map_user (p_upn in varchar2, p_app_user in varchar2, p_flows in varchar2 default null);
+
+  -- Lists the published flows a person may run with this key (the client's flows, and in TABLE mode
+  -- the person's registered flows). p_body: {"user": "jane.doe@example.com"}. p_status: 200, 400,
+  -- 401 (bad key) or 403 (the person isn't linked). p_response on 200:
+  --   {"user", "appUser", "defaultFlow", "flows": [{"flowId", "name", "description", "version"}]}
+  procedure list_flows (p_api_key  in  varchar2,
+                        p_body     in  clob,
+                        p_status   out number,
+                        p_response out clob);
+
+  -- The ORDS handler for POST .../flowchat/automate/flows (24_fc_automate_ords.sql).
+  procedure ords_list_flows (p_api_key in varchar2, p_body in clob);
 
   -- A FlowChat turn (FC_ENGINE's JSON) as an Adaptive Card (1.4).
   function build_card (p_turn_json in clob) return clob;
@@ -464,18 +491,38 @@ create or replace package body fc_automate as
       return l_user;
     end if;
     if p_client.user_mode = 'UPN' then return upper(l_upn); end if;
-    if p_client.user_mode = 'LOCAL' then return upper(regexp_substr(l_upn, '^[^@]+')); end if;
+    if p_client.user_mode = 'LOCAL' then
+      -- DOMAIN\jdoe or jdoe@example.com -> JDOE
+      return upper(regexp_substr(regexp_replace(l_upn, '^.*\\', ''), '^[^@]+'));
+    end if;
     select app_user into l_user from fc_automate_users where upn = l_upn and enabled = 'Y';
     return l_user;
   exception when no_data_found then
     return null;
   end app_user_for;
 
+  function in_list (p_list in varchar2, p_flow_id in varchar2) return boolean is
+  begin
+    return p_list is null
+        or instr(',' || replace(lower(p_list), ' ') || ',', ',' || lower(p_flow_id) || ',') > 0;
+  end in_list;
+
   function flow_allowed (p_client in fc_automate_clients%rowtype, p_flow_id in varchar2) return boolean is
   begin
-    return p_client.flows is null
-        or instr(',' || replace(lower(p_client.flows), ' ') || ',', ',' || lower(p_flow_id) || ',') > 0;
+    return in_list(p_client.flows, p_flow_id);
   end flow_allowed;
+
+  -- The flows registered for the person (user_mode TABLE only); null = every flow the key allows.
+  function user_flows (p_client in fc_automate_clients%rowtype, p_upn in varchar2) return varchar2 is
+    l_flows fc_automate_users.flows%type;
+    l_upn   varchar2(320) := lower(trim(p_upn));
+  begin
+    if p_client.user_resolver is not null or p_client.user_mode <> 'TABLE' then return null; end if;
+    select flows into l_flows from fc_automate_users where upn = l_upn and enabled = 'Y';
+    return l_flows;
+  exception when no_data_found then
+    return null;
+  end user_flows;
 
   function error_body (p_text in varchar2) return clob is
     l json_object_t := json_object_t();
@@ -569,6 +616,9 @@ create or replace package body fc_automate as
         if not flow_allowed(l_client, l_flow) then
           p_status := 403; p_response := error_body('This flow is not allowed for this key.'); return;
         end if;
+        if not in_list(user_flows(l_client, str(l_b, 'user')), l_flow) then
+          p_status := 403; p_response := error_body('This flow is not registered for your account.'); return;
+        end if;
         l_ctx_obj := ob(l_b, 'context');
         if l_ctx_obj is not null then l_ctx := l_ctx_obj.to_clob; end if;
         t := fc_client.start_flow(l_flow, l_ctx, null, l_user);
@@ -585,6 +635,9 @@ create or replace package body fc_automate as
         if not flow_allowed(l_client, l_flow) then
           p_status := 403; p_response := error_body('This flow is not allowed for this key.'); return;
         end if;
+        if not in_list(user_flows(l_client, str(l_b, 'user')), l_flow) then
+          p_status := 403; p_response := error_body('This flow is not registered for your account.'); return;
+        end if;
         l_reply := ob(l_b, 'reply');
         if l_reply is null then l_reply := json_object_t(); end if;
         t := fc_client.send(l_sid, input_object(l_reply).to_clob, l_user);
@@ -600,22 +653,105 @@ create or replace package body fc_automate as
     end;
   end handle;
 
+  procedure write_json (p_status in number, p_resp in clob) is
+    l_len pls_integer := nvl(dbms_lob.getlength(p_resp), 0);
+    l_pos pls_integer := 1;
+  begin
+    owa_util.status_line(p_status, null, false);
+    owa_util.mime_header('application/json', false, 'utf-8');
+    owa_util.http_header_close;
+    while l_pos <= l_len loop
+      htp.prn(dbms_lob.substr(p_resp, 8000, l_pos));
+      l_pos := l_pos + 8000;
+    end loop;
+  end write_json;
+
   procedure ords_handle (p_api_key in varchar2, p_body in clob) is
     l_status number;
     l_resp   clob;
-    l_len    pls_integer;
-    l_pos    pls_integer := 1;
   begin
     handle(p_api_key, p_body, l_status, l_resp);
-    owa_util.status_line(l_status, null, false);
-    owa_util.mime_header('application/json', false, 'utf-8');
-    owa_util.http_header_close;
-    l_len := nvl(dbms_lob.getlength(l_resp), 0);
-    while l_pos <= l_len loop
-      htp.prn(dbms_lob.substr(l_resp, 8000, l_pos));
-      l_pos := l_pos + 8000;
-    end loop;
+    write_json(l_status, l_resp);
   end ords_handle;
+
+  procedure list_flows (p_api_key  in  varchar2,
+                        p_body     in  clob,
+                        p_status   out number,
+                        p_response out clob) is
+    l_client fc_automate_clients%rowtype;
+    l_b      json_object_t;
+    l_hash   varchar2(64);
+    l_upn    varchar2(320);
+    l_user   varchar2(255);
+    l_uflows varchar2(4000);
+    l_out    json_object_t := json_object_t();
+    l_flows  json_array_t  := json_array_t();
+    l_f      json_object_t;
+  begin
+    p_status := 200;
+    if p_api_key is null then
+      p_status := 401; p_response := error_body('The API key is not valid.'); return;
+    end if;
+    l_hash := sha256(p_api_key);   -- a private function can't be called inside SQL
+    begin
+      select * into l_client from fc_automate_clients where key_hash = l_hash and enabled = 'Y';
+    exception when no_data_found then
+      p_status := 401; p_response := error_body('The API key is not valid.'); return;
+    end;
+    begin
+      l_b := json_object_t.parse(nvl(p_body, '{}'));
+    exception when others then
+      p_status := 400; p_response := error_body('The body is not JSON.'); return;
+    end;
+
+    l_upn  := lower(trim(substr(str(l_b, 'user'), 1, 320)));
+    l_user := app_user_for(l_client, l_upn);
+    if l_user is null then
+      p_status := 403;
+      p_response := error_body('Your account ' || nvl(l_upn, '(none)')
+                               || ' is not linked to a FlowChat user. Ask an administrator to register it.');
+      return;
+    end if;
+    l_uflows := user_flows(l_client, l_upn);
+
+    for r in (select f.flow_id, nvl(f.name, f.flow_id) name, f.description, max(v.version) version
+                from fc_flows f
+                join fc_flow_versions v on v.flow_id = f.flow_id and v.status = 'PUBLISHED'
+               group by f.flow_id, f.name, f.description
+               order by lower(nvl(f.name, f.flow_id))) loop
+      if flow_allowed(l_client, r.flow_id) and in_list(l_uflows, r.flow_id) then
+        l_f := json_object_t();
+        l_f.put('flowId', r.flow_id);
+        l_f.put('name', r.name);
+        l_f.put('description', r.description);
+        l_f.put('version', r.version);
+        l_flows.append(l_f);
+      end if;
+    end loop;
+
+    l_out.put('user', l_upn);
+    l_out.put('appUser', l_user);
+    if l_client.default_flow is not null and flow_allowed(l_client, l_client.default_flow)
+       and in_list(l_uflows, l_client.default_flow) then
+      l_out.put('defaultFlow', l_client.default_flow);
+    else
+      l_out.put_null('defaultFlow');
+    end if;
+    l_out.put('flows', l_flows);
+    p_response := l_out.to_clob;
+  exception when others then
+    log_error(l_client.client_id, sqlerrm || chr(10) || dbms_utility.format_error_backtrace);
+    p_status := 500;
+    p_response := error_body('Sorry, the flows could not be listed.');
+  end list_flows;
+
+  procedure ords_list_flows (p_api_key in varchar2, p_body in clob) is
+    l_status number;
+    l_resp   clob;
+  begin
+    list_flows(p_api_key, p_body, l_status, l_resp);
+    write_json(l_status, l_resp);
+  end ords_list_flows;
 
   function add_client (p_client_id    in varchar2,
                        p_flows        in varchar2 default null,
@@ -636,13 +772,14 @@ create or replace package body fc_automate as
     return l_key;
   end add_client;
 
-  procedure map_user (p_upn in varchar2, p_app_user in varchar2) is
+  procedure map_user (p_upn in varchar2, p_app_user in varchar2, p_flows in varchar2 default null) is
+    l_flows varchar2(4000) := replace(trim(p_flows), ' ');
   begin
     merge into fc_automate_users u
     using (select lower(trim(p_upn)) upn from dual) s
        on (u.upn = s.upn)
-     when matched then update set app_user = p_app_user, enabled = 'Y'
-     when not matched then insert (upn, app_user) values (s.upn, p_app_user);
+     when matched then update set app_user = p_app_user, flows = l_flows, enabled = 'Y'
+     when not matched then insert (upn, app_user, flows) values (s.upn, p_app_user, l_flows);
   end map_user;
 
 end fc_automate;

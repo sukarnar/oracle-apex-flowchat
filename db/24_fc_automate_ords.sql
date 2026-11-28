@@ -3,6 +3,10 @@
 --   POST {schema-alias}/flowchat/automate/turn
 --     header X-FlowChat-Key: <the key fc_automate.add_client returned>
 --     body   {"flowId", "user", "sessionId", "reply", "context"}
+--   POST {schema-alias}/flowchat/automate/flows
+--     header X-FlowChat-Key, body {"user"}: the flows the person may run (the Windows client)
+--
+-- Safe to re-run: define_module replaces the module with everything below.
 --
 -- The module has no ORDS privilege: every request must carry a client's API key instead (401
 -- without one). The key can run its flows as any person it names in "user", so keep it in the
@@ -32,6 +36,26 @@ begin
   ords.define_parameter(
     p_module_name        => 'flowchat_automate',
     p_pattern            => 'turn',
+    p_method             => 'POST',
+    p_name               => 'X-FlowChat-Key',
+    p_bind_variable_name => 'flowchat_key',
+    p_source_type        => 'HEADER',
+    p_param_type         => 'STRING',
+    p_access_method      => 'IN');
+
+  -- POST .../flowchat/automate/flows  {"user": "..."}: the flows this person may run (Windows client).
+  -- POST, not GET, so the person's sign-in name isn't in the URL (and in web server logs).
+  ords.define_template(p_module_name => 'flowchat_automate', p_pattern => 'flows');
+  ords.define_handler(
+    p_module_name => 'flowchat_automate',
+    p_pattern     => 'flows',
+    p_method      => 'POST',
+    p_source_type => ords.source_type_plsql,
+    p_source      => 'begin fc_automate.ords_list_flows(:flowchat_key, :body_text); end;');
+
+  ords.define_parameter(
+    p_module_name        => 'flowchat_automate',
+    p_pattern            => 'flows',
     p_method             => 'POST',
     p_name               => 'X-FlowChat-Key',
     p_bind_variable_name => 'flowchat_key',

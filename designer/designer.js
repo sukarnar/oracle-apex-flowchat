@@ -137,6 +137,8 @@
                  make: (id) => ({ id, type: 'agent', provider: '', goal: '', outputs: [] }) },
     email:     { label: 'Email',     color: '#ea580c', desc: 'Send an email built from the answers (APEX_MAIL, or a connector).',
                  make: (id) => ({ id, type: 'email', to: '', from: '', subject: '', body: '' }) },
+    teams:     { label: 'Post to Teams', color: '#5b5fc7', desc: 'Post a card to a Teams channel (FC_TEAMS_CHANNELS). One way: nobody answers it.',
+                 make: (id) => ({ id, type: 'teams', channel: '', title: '', text: '' }) },
     rest:      { label: 'REST call', color: '#4f46e5', desc: 'Call a REST API registered in FC_REST_ENDPOINTS and put parts of its JSON answer into fields.',
                  make: (id) => ({ id, type: 'rest', endpoint: '', method: 'GET', path: '/', map: {} }) },
     workflow:  { label: 'Workflow',  color: '#0d9488', desc: 'Start an APEX workflow (an approval or back-office process) with parameters from the answers.',
@@ -336,6 +338,7 @@
       case 'lookup': return [{ key: 'next', label: 'next' }, { key: 'onNotFound', label: 'not found', optional: true }];
       case 'submit': return [{ key: 'onSuccess', label: 'success' }, { key: 'onError', label: 'error', optional: true }];
       case 'email': return [{ key: 'next', label: 'sent' }, { key: 'onError', label: 'error', optional: true }];
+      case 'teams': return [{ key: 'next', label: 'posted' }, { key: 'onError', label: 'error', optional: true }];
       case 'workflow': return [{ key: 'next', label: 'started' }, { key: 'onError', label: 'error', optional: true }];
       case 'rest': return [{ key: 'next', label: 'ok' }, { key: 'onNotFound', label: '404', optional: true }, { key: 'onError', label: 'error', optional: true }];
       case 'agent': return [{ key: 'next', label: 'finished' }]
@@ -515,6 +518,7 @@
       if ((n.type === 'lookup' || n.type === 'submit') && n.connector) map[n.connector] = map[n.connector] || n.type;
       if (n.type === 'verify' && n.connector) map[n.connector] = map[n.connector] || 'sender';
       if (n.type === 'email' && n.connector) map[n.connector] = map[n.connector] || 'mailer';
+      if (n.type === 'teams' && n.connector) map[n.connector] = map[n.connector] || 'poster';
       if (n.type === 'ask') (n.validators || []).forEach((v) => {
         if (v.type === 'server' && v.connector) map[v.connector] = map[v.connector] || 'validator';
       });
@@ -946,6 +950,16 @@
           (n.attachments || []).forEach((a) => { if (files.indexOf(a) < 0) add('error', 'Attachment "' + a + '" is not a file answer.', n.id); });
           break;
         }
+        case 'teams': {
+          if (!String(n.channel || '').trim()) add('error', 'Post to Teams has no channel.', n.id);
+          else if (!/\{\{/.test(n.channel) && !/^[a-z0-9_-]+$/.test(n.channel)) add('error', 'Channel names use lower case letters, digits, _ and - (as in FC_TEAMS_CHANNELS).', n.id);
+          if (!String(n.title || '').trim() && !String(n.text || '').trim()) add('error', 'Post to Teams needs a title or text.', n.id);
+          if ((n.facts || []).length > 20) add('error', 'A card can show at most 20 facts.', n.id);
+          (n.facts || []).forEach((f) => { if (!String(f.title || '').trim()) add('warning', 'A fact has no label.', n.id); placeholders(f.title, n.id); placeholders(f.value, n.id); });
+          if (n.link && !/^(https:\/\/|\{\{)/i.test(String(n.link).trim())) add('error', 'The link must start with https://.', n.id);
+          ['channel', 'title', 'text', 'link', 'linkLabel', 'message', 'errorMessage'].forEach((k) => placeholders(n[k], n.id));
+          break;
+        }
         case 'workflow': {
           if (!String(n.workflow || '').trim()) add('error', 'Workflow has no static ID.', n.id);
           if (n.applicationId !== undefined && !/^\d+$/.test(String(n.applicationId))) add('error', 'Application ID must be a number.', n.id);
@@ -1203,6 +1217,7 @@
       case 'lookup': case 'submit': return n.connector ? 'Calls ' + n.connector : '';
       case 'agent': return n.goal ? (n.provider ? '[' + n.provider + '] ' : '') + n.goal : 'No task yet';
       case 'email': return n.to ? 'To ' + n.to + (n.subject ? ': ' + n.subject : '') : 'No recipient yet';
+      case 'teams': return n.channel ? 'Post to ' + n.channel + (n.title ? ': ' + n.title : '') : 'No channel yet';
       case 'workflow': return n.workflow ? 'Start ' + n.workflow + (Object.keys(n.parameters || {}).length ? ' (' + Object.keys(n.parameters).join(', ') + ')' : '') +
         (n.resultSlot ? ' → ' + n.resultSlot : '') : 'No workflow yet';
       case 'rest': return n.endpoint ? (n.method || 'GET') + ' ' + n.endpoint + (n.path && n.path !== '/' ? ' ' + n.path : '') +
@@ -1582,7 +1597,7 @@
     );
     const editors = { message: textEditor, end: textEditor, ask: askEditor, condition: condEditor, lookup: connEditor, submit: connEditor,
                       summary: summaryEditor, verify: verifyEditor, findRecord: findEditor, changeFields: changeEditor, saveChanges: saveEditor,
-                      repeat: repeatEditor, bulkUpdate: bulkEditor, set: setEditor, menu: menuEditor, email: emailEditor, rest: restEditor, agent: agentEditor, workflow: workflowEditor };
+                      repeat: repeatEditor, bulkUpdate: bulkEditor, set: setEditor, menu: menuEditor, email: emailEditor, teams: teamsEditor, rest: restEditor, agent: agentEditor, workflow: workflowEditor };
     body.append(editors[n.type](n));
     if (n.type !== 'condition' && n.type !== 'menu' && n.type !== 'agent' && n.type !== 'end') {
       body.append(h('h4', { class: 'sub', text: 'Connections' }));
@@ -1592,7 +1607,7 @@
         : n.type === 'bulkUpdate' && bulkTitles[p.key] ? bulkTitles[p.key] : PORT_TITLES[p.key], targetSelect(n, p.key),
         p.key === 'onNotFound' ? (n.type === 'rest' ? 'Optional. Used when the API answers 404 (not found); without it a 404 is an error.'
           : 'Optional. Used when the connector returns found: false.') :
-        p.key === 'onError' ? (n.type === 'email' ? 'Optional. Without it the flow shows the error and carries on to the next step.'
+        p.key === 'onError' ? (n.type === 'email' || n.type === 'teams' ? 'Optional. Without it the flow shows the error and carries on to the next step.'
           : n.type === 'rest' ? 'Optional. Used for any other status, a timeout or a refused call. Without it the conversation ends as failed.'
           : n.type === 'workflow' ? 'Optional. Used when the workflow can\'t start (unknown static ID, a missing required parameter, an error raised by the workflow). Without it the conversation ends as failed.'
           : 'Optional. Without it a failed submit ends the conversation.') : PORT_HINTS[p.key] || null)));
@@ -2320,6 +2335,43 @@
     return wrap;
   }
 
+  // ---- Post to Teams (FC_CHANNEL)
+  const TEAMS_STYLES = [['default', 'Plain'], ['attention', 'Red (attention)'], ['warning', 'Amber (warning)'], ['good', 'Green (good)'],
+                        ['accent', 'Blue (accent)'], ['emphasis', 'Grey (emphasis)']];
+  function teamsEditor(n) {
+    const wrap = h('div');
+    const tpl = (label, key, ph, hint, multi) => {
+      const el = bound(() => n[key], (v) => setOrDelete(n, key, v), { key: n.id + '.t' + key, placeholder: ph, multiline: !!multi, rows: multi ? 4 : null });
+      wrap.append(F(label, el, hint), slotChips(el));
+    };
+    wrap.append(F('Channel', bound(() => n.channel, (v) => setOrDelete(n, 'channel', v.trim().toLowerCase()), { key: n.id + '.tch', placeholder: 'it_alerts' }),
+      'A name in FC_TEAMS_CHANNELS (fc_channel.add_channel). The workflow URL stays in the database, never in the flow.'));
+    tpl('Title', 'title', 'New request {{reference}}');
+    wrap.append(F('Colour', sel(TEAMS_STYLES, n.style || 'default', (v) => mutate(() => { if (v === 'default') delete n.style; else n.style = v; }, { panel: true }))));
+    tpl('Text (optional)', 'text', 'Raised by {{app_user}}.', 'Teams shows simple Markdown (**bold**, lists). Links typed in answers are not made clickable.', true);
+    const facts = n.facts || [];
+    const box = h('div', { class: 'card' }, h('div', { class: 'card-h', text: 'Facts (label: value)' }),
+      h('p', { class: 'hint', text: 'Shown as a two-column list. A fact whose value is empty is left out.' }));
+    facts.forEach((f, i) => {
+      box.append(h('div', { class: 'grid2' },
+        F('Label', bound(() => f.title, (v) => { f.title = v; }, { key: n.id + '.tf' + i + 't', placeholder: 'Reference' })),
+        h('div', null, F('Value', bound(() => f.value, (v) => { f.value = v; }, { key: n.id + '.tf' + i + 'v', placeholder: '{{reference}}' })),
+          h('button', { class: 'lnk', text: 'Remove', onclick: () => mutate(() => { facts.splice(i, 1); if (!facts.length) delete n.facts; }, { panel: true }) }))));
+    });
+    box.append(h('button', { class: 'lnk', text: '+ Add fact', onclick: () => mutate(() => { n.facts = facts; facts.push({ title: '', value: '' }); }, { panel: true }) }));
+    wrap.append(box);
+    wrap.append(h('div', { class: 'grid2' },
+      F('Button link (optional)', bound(() => n.link, (v) => setOrDelete(n, 'link', v.trim()), { key: n.id + '.tlink', placeholder: 'https://…/r/app/request?id={{reference}}' })),
+      F('Button text', bound(() => n.linkLabel, (v) => setOrDelete(n, 'linkLabel', v), { key: n.id + '.tlbl', placeholder: 'Open' }))));
+    wrap.append(F('Post through connector (optional)', connectorInput(() => n.connector, (v) => setOrDelete(n, 'connector', v.trim()), n.id + '.tconn'),
+      'Leave empty to post with FC_CHANNEL. A connector receives {"channel", "title", "text", "facts", "link", "linkLabel", "style"} and returns {"ok": true} or {"ok": false, "message": "…"}.'));
+    wrap.append(h('h4', { class: 'sub', text: 'Chat messages' }));
+    wrap.append(F('After posting (optional)', bound(() => n.message, (v) => setOrDelete(n, 'message', v), { key: n.id + '.tmsg', placeholder: "I've let the team know in Teams." })));
+    wrap.append(F('If posting fails', bound(() => n.errorMessage, (v) => setOrDelete(n, 'errorMessage', v), { key: n.id + '.terr', placeholder: "Sorry, I couldn't post to Teams." })));
+    wrap.append(h('p', { class: 'hint', text: 'Not posted again when the user edits an answer and the flow replays. In Test, nothing is posted: the card is shown instead.' }));
+    return wrap;
+  }
+
   // ---- REST call
   const REST_BLOCKED = /^(authorization|cookie|host|content-length|transfer-encoding|connection|proxy-.*|x-forwarded-.*)$/i;
   // name -> value rows over an object property (query, headers, response mapping)
@@ -3007,7 +3059,8 @@
     lookup: [['Not found', { found: false }], ['Found', { found: true, slots: {}, message: 'I found a matching record.' }]],
     submit: [['Success', { ok: true, slots: { reference: 'TEST-0001' } }], ['Failure', { ok: false, message: 'Test failure from the mock.' }]],
     sender: [['Sent', { ok: true }], ['Sending fails', { ok: false, message: "Sorry, I couldn't send the code." }]],
-    mailer: [['Sent', { ok: true }], ['Sending fails', { ok: false, message: "Sorry, I couldn't send the email." }]]
+    mailer: [['Sent', { ok: true }], ['Sending fails', { ok: false, message: "Sorry, I couldn't send the email." }]],
+    poster: [['Posted', { ok: true }], ['Posting fails', { ok: false, message: "Sorry, I couldn't post to Teams." }]]
   };
   // Agent test doubles: the Test tab never calls a real model. Each agent replays a script of steps,
   // {"tool": name, "args": {...}} or {"reply": "text"}; its tools return the JSON mocks below.
@@ -3325,6 +3378,7 @@
         // Verify: nothing is really sent in a test, so show the code to whoever is testing.
         if (uses[id] === 'sender' && res.ok !== false) toast('Test code for ' + p.to + ': ' + p.code, 12000);
         if (uses[id] === 'mailer' && res.ok !== false) showTestEmail(p);
+        if (uses[id] === 'poster' && res.ok !== false) showTestPost(p);
         return res;
       };
     });
@@ -3338,7 +3392,7 @@
     const appUser = (window.apex && apex.env && apex.env.APP_USER) || 'TEST_USER';
     testDebug = [];
     testEngine = FlowChatEngine.createEngine({ flows: [flow], connectors, dataSources: buildTestSources(), lovs: buildTestLovs(), appUser,
-      sendEmail: (m) => { showTestEmail(m); return { ok: true }; }, rest: testRest, startWorkflow: testWorkflow,
+      sendEmail: (m) => { showTestEmail(m); return { ok: true }; }, postToTeams: (m) => { showTestPost(m); return { ok: true }; }, rest: testRest, startWorkflow: testWorkflow,
       aiProviders: ai.providers, aiTools: ai.tools, aiSkills: ai.skills,
       onDebug: flow.debug ? (e) => { testDebug.push(e); } : null });
     const chat = $('simChat');
@@ -3363,6 +3417,17 @@
       row('Reply-to', m.replyTo), row('Subject', m.subject),
       row('Attachments', (m.attachments || []).map((a) => a.name).join(', ')),
       h('pre', { class: 'mono', style: 'white-space:pre-wrap;margin-top:8px', text: m.body || '' })].filter(Boolean));
+    d.foot.append(h('button', { class: 'btn', text: 'Close', onclick: d.close }));
+  }
+
+  // Nothing is posted in a test: show the card that would go to the channel.
+  function showTestPost(m) {
+    toast('Test Teams post (not sent) to ' + m.channel + ': ' + (m.title || ''), 8000);
+    const d = modal('Teams post (not sent)', { width: '520px' });
+    const row = (k, v) => (v ? h('div', null, h('b', { text: k + ': ' }), v) : null);
+    d.body.append(...[row('Channel', m.channel), row('Title', m.title), row('Colour', m.style !== 'default' ? m.style : ''),
+      m.text ? h('pre', { class: 'mono', style: 'white-space:pre-wrap;margin:8px 0', text: m.text }) : null]
+      .concat((m.facts || []).map((f) => row(f.title, f.value)), [row('Button', m.link ? (m.linkLabel || 'Open') + ' → ' + m.link : '')]).filter(Boolean));
     d.foot.append(h('button', { class: 'btn', text: 'Close', onclick: d.close }));
   }
 

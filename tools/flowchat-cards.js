@@ -159,16 +159,35 @@ function cardInput(data) {
 
 // The endpoint (POST {flowId, user, sessionId, reply}, header X-FlowChat-Key), as FC_AUTOMATE.HANDLE.
 //   clients: {name: {key, flows: ['it_helpdesk'] | null (any), defaultFlow, userMode: 'TABLE'|'UPN'|'LOCAL', enabled}}
-//   users:   {'jane.doe@example.com': 'JDOE'}  (userMode TABLE), or resolveUser(upn, client)
+//   users:   (userMode TABLE) {'jane.doe@example.com': 'JDOE'}, or with the flows registered for the
+//            person: {'corp\\jdoe': {appUser: 'JDOE', flows: ['it_helpdesk']}} (flows null = every
+//            flow the key allows). Or resolveUser(upn, client).
+//   catalog: [{flowId, name, description, version}]: the published flows, for listFlows.
+// A "upn" is a sign-in name: jane.doe@example.com, or DOMAIN\user from a Windows client.
 function hashKey(k) { return crypto.createHash('sha256').update(String(k), 'utf8').digest('hex'); }
+function userEntry(upn, opts) {
+  const e = (opts.users || {})[upn];
+  if (e === undefined || e === null) return null;
+  return typeof e === 'string' ? { appUser: e, flows: null } : e;
+}
 function appUserFor(client, upn, opts) {
   const u = String(upn || '').trim().toLowerCase();
   if (!u) return null;
   if (opts.resolveUser) return opts.resolveUser(u, client) || null;
   const mode = (client.userMode || 'TABLE').toUpperCase();
   if (mode === 'UPN') return u.toUpperCase();
-  if (mode === 'LOCAL') return u.split('@')[0].toUpperCase() || null;
-  return (opts.users || {})[u] || null;
+  if (mode === 'LOCAL') return u.replace(/^.*\\/, '').split('@')[0].toUpperCase() || null;   // DOMAIN\jdoe or jdoe@x -> JDOE
+  const e = userEntry(u, opts);
+  return e && e.enabled !== false ? e.appUser || null : null;
+}
+// The flows registered for the person (userMode TABLE only); null = every flow the key allows.
+function userFlows(client, upn, opts) {
+  if (opts.resolveUser || (client.userMode || 'TABLE').toUpperCase() !== 'TABLE') return null;
+  const e = userEntry(String(upn || '').trim().toLowerCase(), opts);
+  return e && e.flows && e.flows.length ? e.flows : null;
+}
+function inList(list, id) {
+  return !list || list.some((x) => String(x).trim().toLowerCase() === String(id).toLowerCase());
 }
 
 function createAutomateHandler(opts) {
@@ -204,7 +223,8 @@ function createAutomateHandler(opts) {
       if (!sid) {
         const flowId = b.flowId || client.defaultFlow;
         if (!flowId) return result(400, { error: 'No flowId.' });
-        if (client.flows && client.flows.indexOf(flowId) < 0) return result(403, { error: 'This flow is not allowed for this key.' });
+        if (!inList(client.flows, flowId)) return result(403, { error: 'This flow is not allowed for this key.' });
+        if (!inList(userFlows(client, b.user, opts), flowId)) return result(403, { error: 'This flow is not registered for your account.' });
         const turn = await engine.start(flowId, b.context && typeof b.context === 'object' ? b.context : {});
         owners.set(turn.sessionId, { appUser: appUser, flowId: flowId });
         return out(turn, appUser);
@@ -212,13 +232,84 @@ function createAutomateHandler(opts) {
       const own = owners.get(sid);
       if (!own) return doneWith('That conversation has ended. Please start again.');
       if (own.appUser !== appUser) return result(403, { error: 'This conversation belongs to another user.' });
-      if (client.flows && client.flows.indexOf(own.flowId) < 0) return result(403, { error: 'This flow is not allowed for this key.' });
+      if (!inList(client.flows, own.flowId)) return result(403, { error: 'This flow is not allowed for this key.' });
+      if (!inList(userFlows(client, b.user, opts), own.flowId)) return result(403, { error: 'This flow is not registered for your account.' });
       return out(await engine.input(sid, cardInput(b.reply)), appUser);
     } catch (e) {
       return doneWith('Sorry, something went wrong. Please try again.');
     } finally { current = null; }
   }
-  return { handle: handle };
+
+  // POST {user} -> {user, appUser, defaultFlow, flows: [{flowId, name, description, version}]}, as
+  // FC_AUTOMATE.LIST_FLOWS: the published flows both the key and the person may run.
+  async function listFlows(apiKey, body) {
+    const client = apiKey ? keys[hashKey(apiKey)] : null;
+    if (!client || client.enabled === false) return result(401, { error: 'The API key is not valid.' });
+    let b;
+    try { b = typeof body === 'string' ? JSON.parse(body) : (body || {}); }
+    catch (e) { return result(400, { error: 'The body is not JSON.' }); }
+    const upn = String(b.user || '').trim().toLowerCase();
+    const appUser = appUserFor(client, upn, opts);
+    if (!appUser) return result(403, { error: 'Your account ' + (upn || '(none)') + ' is not linked to a FlowChat user. Ask an administrator to register it.' });
+    const uf = userFlows(client, upn, opts);
+    const ok = (id) => inList(client.flows, id) && inList(uf, id);
+    const flows = (opts.catalog || []).filter((f) => f && f.flowId && ok(f.flowId))
+      .map((f) => ({ flowId: f.flowId, name: f.name || f.flowId, description: f.description || null, version: f.version || null }))
+      .sort((x, y) => x.name.localeCompare(y.name));
+    return result(200, { user: upn, appUser: appUser,
+                         defaultFlow: client.defaultFlow && ok(client.defaultFlow) ? client.defaultFlow : null, flows: flows });
+  }
+  return { handle: handle, listFlows: listFlows };
 }
 
-module.exports = { buildCard, cardInput, createAutomateHandler, hashKey };
+// ---- Posting to a channel: Teams Workflows "Post to a channel when a webhook request is received".
+// The reference for FC_CHANNEL (db/25_fc_channel.sql). One way only: the card can open links
+// (Action.OpenUrl) but nothing waits for a reply, so it has no Action.Submit buttons.
+const CHANNEL_STYLES = ['emphasis', 'good', 'attention', 'warning', 'accent'];
+// "[text](url)" in an answer would become a link in a post made under the workflow owner's name.
+function noLinks(s) { return String(s == null ? '' : s).replace(/\]\s*\(/g, '] ('); }
+function cut(s, n) { s = String(s == null ? '' : s); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+
+// msg = {title, text, facts: [{title, value}], link, linkLabel, style}
+function channelCard(msg) {
+  msg = msg || {};
+  const body = [];
+  const title = cut(noLinks(msg.title), 200);
+  if (title) {
+    const tb = text(title, { weight: 'Bolder', size: 'Medium' });
+    body.push(CHANNEL_STYLES.indexOf(msg.style) >= 0 ? { type: 'Container', style: msg.style, bleed: true, items: [tb] } : tb);
+  }
+  if (msg.text) body.push(text(cut(noLinks(msg.text), 4000)));
+  const facts = (msg.facts || []).filter((f) => f && f.title && f.value !== undefined && f.value !== null && f.value !== '')
+    .slice(0, 20).map((f) => ({ title: cut(noLinks(f.title), 100), value: cut(noLinks(f.value), 1000) }));
+  if (facts.length) body.push({ type: 'FactSet', facts: facts });
+  const actions = msg.link ? [{ type: 'Action.OpenUrl', title: cut(msg.linkLabel || 'Open', 50), url: msg.link }] : [];
+  return { type: 'AdaptiveCard', version: CARD_VERSION, body: body, actions: actions };
+}
+// The request body the Workflows webhook expects.
+function channelPayload(msg) {
+  return { type: 'message',
+           attachments: [{ contentType: 'application/vnd.microsoft.card.adaptive', contentUrl: null, content: channelCard(msg) }] };
+}
+// options.postToTeams for the engine: opts.channels = {name: workflow URL} (secrets: keep them out of flows).
+function createTeamsPoster(opts) {
+  opts = opts || {};
+  const doFetch = opts.fetch || (typeof fetch === 'function' ? fetch : null);
+  return async function postToTeams(msg) {
+    const url = (opts.channels || {})[String(msg.channel || '').toLowerCase()];
+    if (!url) return { ok: false, message: 'unknown Teams channel "' + msg.channel + '"' };
+    if (!doFetch) return { ok: false, message: 'no fetch()' };
+    const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), opts.timeoutMs || 10000) : null;
+    try {
+      const r = await doFetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                     body: JSON.stringify(channelPayload(msg)), signal: ctl ? ctl.signal : undefined });
+      if (r.status === 200 || r.status === 202) return { ok: true };
+      return { ok: false, message: 'Teams workflow returned HTTP ' + r.status };
+    } catch (e) {
+      return { ok: false, message: (e && e.message) || String(e) };
+    } finally { if (timer) clearTimeout(timer); }
+  };
+}
+
+module.exports = { buildCard, cardInput, createAutomateHandler, hashKey, channelCard, channelPayload, createTeamsPoster };
